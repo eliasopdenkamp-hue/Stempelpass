@@ -88,7 +88,7 @@ function scrubEnv(port: number): Record<string, string> {
     'VERCEL_OIDC_TOKEN', 'APPLE_TEAM_IDENTIFIER', 'APPLE_PASS_TYPE_IDENTIFIER', 'APPLE_PRIVATE_KEY',
     'TIGER_PUBLIC_KEY', 'TIGER_SECRET_KEY', 'TIGER_PROJECT_ID',
     'EMAIL_SMTP_HOST', 'EMAIL_SMTP_PORT', 'EMAIL_SMTP_USER', 'EMAIL_SMTP_PASSWORD', 'EMAIL_FROM',
-    'VERCEL', 'PORT',
+    'VERCEL', 'PORT', 'PILOT_READY',
   ]);
   const env: Record<string, string> = { PATH: process.env.PATH ?? '/usr/bin:/bin' };
   for (const [k, v] of Object.entries(process.env)) {

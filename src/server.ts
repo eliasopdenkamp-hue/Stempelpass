@@ -29,6 +29,20 @@ let pool:DbPool|undefined; let repository:CardRepository|undefined;
 const mfaStore = process.env.MFA_ENCRYPTION_KEY ? new EncryptedMfaSecretStore() : undefined;
 let initializationError: unknown;
 let dbReady = false;
+/**
+ * Honest pilot-readiness declaration (default off, like RUN_MIGRATIONS_ON_START).
+ *
+ * The request path cannot verify — without a blocking database query, which
+ * GET /health must never issue — that the out-of-band schema steps
+ * (`bun run db:migrate`, dedicated app role, `bun run rls-verify`) have
+ * actually been completed against the production database. So the operator
+ * declares it: set PILOT_READY=1 in the deployment environment ONLY after
+ * those steps succeeded. Without it, GET /health stays HTTP 200 (liveness —
+ * the function is up and answering) but honestly reports
+ * `{"status":"not_ready"}` — "function reachable" and "schema/pilot ready"
+ * are distinct states.
+ */
+let pilotReady = process.env.PILOT_READY === '1';
 
 /**
  * Database readiness gate (Vercel-504 fix).
@@ -64,7 +78,10 @@ if (configured) {
   } else {
     // Default: schema is applied by `bun run db:migrate` before the pilot; the
     // request path is never blocked by DDL, so a cold start cannot be held
-    // hostage by a slow or sleeping database.
+    // hostage by a slow or sleeping database. dbReady=true here only means "do
+    // not wait in the request path" (DB-backed routes fail fast with classified
+    // errors); it says nothing about schema/pilot readiness, which the operator
+    // declares separately via PILOT_READY.
     dbReady = true;
   }
 }
@@ -88,7 +105,7 @@ function error(e:unknown,id:string){const {code,status,detail}=classifyError(e);
 function cookie(req:Request,name:string){return req.headers.get('cookie')?.split(';').map(x=>x.trim()).find(x=>x.startsWith(`${name}=`))?.slice(name.length+1)}
 async function auth(req:Request,tenantId:string,mutating=true){if(!pool||!repository)throw new Error('DATABASE_REQUIRED');const token=cookie(req,'__Host-sp_session');if(!token)throw new Error('UNAUTHENTICATED');const db=await pool.connect();try{await db.query('begin');await db.query("select set_config('app.tenant_id', $1, true)",[tenantId]);const resolved=await db.query<{user_id:string}>('select user_id from public.resolve_session_user($1)',[hashSessionToken(token)]);if(!resolved.rows[0]?.user_id)throw new Error('UNAUTHENTICATED');await db.query("select set_config('app.user_id', $1, true)",[resolved.rows[0].user_id]);const rows=await db.query<{id:string,user_id:string,csrf_token_hash:string,tenant_id:string,role:string;membership_id:string;mfa_required:boolean;mfa_verified:boolean}>('select s.id,s.user_id,s.csrf_token_hash,s.mfa_verified,m.id as membership_id,m.tenant_id,m.role,(u.mfa_required or m.mfa_required) as mfa_required from sessions s join users u on u.id=s.user_id join tenant_memberships m on m.user_id=s.user_id and m.status=$2 where s.token_hash=$1 and s.revoked_at is null and s.expires_at>now() and m.tenant_id=$3 and u.status=$4',[hashSessionToken(token),'active',tenantId,'active']);const s=rows.rows[0];if(!s)throw new Error('UNAUTHENTICATED');if(s.mfa_required&&!s.mfa_verified)throw new Error('MFA_REQUIRED');if(mutating&&!csrfValid(req,s.csrf_token_hash))throw new Error('CSRF_INVALID');assertTenant(tenantId,s.tenant_id);const actor={userId:s.user_id,role:s.role as any,sessionId:s.id,membershipId:s.membership_id,token,mfaVerified:s.mfa_verified};await db.query('commit');return actor;}catch(e){try{await db.query('rollback');}catch{}throw e;}finally{db.release();}}
 async function rotate(a:{userId:string;token:string;mfaVerified:boolean}){if(!pool||!repository)throw new Error('DATABASE_REQUIRED');const db=await pool.connect();try{await db.query('begin');await db.query("select set_config('app.user_id', $1, true)",[a.userId]);await db.query('update sessions set revoked_at=now() where token_hash=$1',[hashSessionToken(a.token)]);const raw=randomToken(),csrf=randomToken();await db.query("insert into sessions(user_id,token_hash,csrf_token_hash,mfa_verified,expires_at) values($1,$2,$3,$4,now()+interval '12 hours')",[a.userId,hashSessionToken(raw),hashSessionToken(csrf),a.mfaVerified]);await db.query('commit');return {csrf,header:{'Set-Cookie':`__Host-sp_session=${raw}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=43200`,'x-csrf-token':hashSessionToken(csrf)}}}catch(e){try{await db.query('rollback');}catch{}throw e;}finally{db.release();}}
-async function handleRequest(req: Request): Promise<Response> {const id=crypto.randomUUID();const headers=corsHeaders(req);if(req.method==='OPTIONS')return new Response(null,{status:204,headers});try{const u=new URL(req.url),parts=u.pathname.split('/').filter(Boolean);if(req.method==='GET'&&u.pathname==='/health')return publicHealthResponse(configured&&!initializationError&&dbReady,headers);await waitForReadiness();
+async function handleRequest(req: Request): Promise<Response> {const id=crypto.randomUUID();const headers=corsHeaders(req);if(req.method==='OPTIONS')return new Response(null,{status:204,headers});try{const u=new URL(req.url),parts=u.pathname.split('/').filter(Boolean);if(req.method==='GET'&&u.pathname==='/health')return publicHealthResponse(configured&&!initializationError&&dbReady&&pilotReady,headers);await waitForReadiness();
 if(parts[0]==='api'&&parts[1]==='auth'&&parts[2]==='login'&&req.method==='POST'){if(!pool)throw new Error('DATABASE_REQUIRED');const ipKey=clientIpKey(req);if(!loginIpLimiter.allow(ipKey))throw new Error('RATE_LIMITED');const body=await req.json() as {email?:string,password?:string,mfaCode?:string};if(!body.email||!body.password)throw new Error('CREDENTIALS_REQUIRED');const accountKey=loginAccountKey(body.email);if(!loginAccountLimiter.allow(accountKey))throw new Error('RATE_LIMITED');const db=await pool.connect();try{await db.query('begin');const user=(await db.query<{id:string,password_hash:string,mfa_required:boolean,mfa_enabled:boolean,mfa_secret_ciphertext:string|null}>('select id,password_hash,mfa_required,mfa_enabled,mfa_secret_ciphertext from users where lower(email)=lower($1) and status=$2',[body.email,'active'])).rows[0];const passwordOk=user?.password_hash?await verifyPassword(body.password,user.password_hash):await verifyPasswordAgainstDummy(body.password);if(!user||!passwordOk)throw new Error('INVALID_CREDENTIALS');const mfaRow=(await db.query<{required:boolean|null}>('select public.membership_mfa_required($1) as required',[user.id])).rows[0];const required=requireVerifiedMfaBootstrap(mfaRow);if(required){if(!mfaStore||!user.mfa_secret_ciphertext)throw new Error('MFA_NOT_CONFIGURED');let secret:string;try{secret=await mfaStore.decrypt(user.mfa_secret_ciphertext);}catch{throw new Error('MFA_SECRET_DECRYPT_FAILED');}if(!body.mfaCode||!verifyTotp(secret,body.mfaCode))throw new Error('MFA_INVALID');}await db.query("select set_config('app.user_id', $1, true)",[user.id]);await db.query('update sessions set revoked_at=now() where user_id=$1 and revoked_at is null',[user.id]);const raw=randomToken(),csrf=randomToken();await db.query("insert into sessions(user_id,token_hash,csrf_token_hash,mfa_verified,expires_at) values($1,$2,$3,$4,now()+interval '12 hours')",[user.id,hashSessionToken(raw),hashSessionToken(csrf),required]);await db.query('commit');return json(toLoginResponse(hashSessionToken(csrf),required),200,id,{'Set-Cookie':`__Host-sp_session=${raw}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=43200`});}catch(e){try{await db.query('rollback');}catch{}const reason=loginFailureReason(e);if(reason){console.warn(`login_failed request_id=${id} reason=${reason} account=${accountKey} ip=${ipKey}`);throw new Error('INVALID_CREDENTIALS');}throw e;}finally{db.release();}}
 if(parts[0]==='api'&&!configured)throw new Error('CONFIGURATION_REQUIRED');
 // Public resolution requires the tenant in the URL; a token alone can never select across tenants.
@@ -129,19 +146,20 @@ export function withTestDependencies(next: {
   pool?: DbPool | undefined;
   repository?: CardRepository | undefined;
 }): () => void {
-  const previous = { configured, pool, repository, dbReady, initializationError };
+  const previous = { configured, pool, repository, dbReady, initializationError, pilotReady };
   if (next.configured !== undefined) configured = next.configured;
   pool = next.pool;
   repository = next.repository;
   // The seam injects an already-ready runtime (a scripted fake pool): bypass
   // the module-scope readiness gate so requests hit the fake pool directly.
-  if (next.pool !== undefined) dbReady = true;
+  if (next.pool !== undefined) { dbReady = true; pilotReady = true; }
   return () => {
     configured = previous.configured;
     pool = previous.pool;
     repository = previous.repository;
     dbReady = previous.dbReady;
     initializationError = previous.initializationError;
+    pilotReady = previous.pilotReady;
   };
 }
 

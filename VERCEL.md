@@ -79,6 +79,37 @@ Other optional integrations are documented in `.env.example` and
 `GOOGLE_WALLET_SETUP.md`. Vercel environment variables should be added separately
 for Preview and Production. Never put secrets in `vercel.json`.
 
+## Pilot readiness — operator sequence
+
+`GET /health` always answers HTTP 200 while the function is up (liveness), but
+`{"status":"ready"}` is only honest after the schema/pilot steps below really
+happened against the **production** database. The request path cannot verify
+them without a blocking query (which `/health` must never issue), so readiness
+is an explicit operator declaration. Order matters:
+
+1. **Set the production environment** in Vercel: `DATABASE_URL` (EU Neon,
+   `sslmode=require`), `SESSION_SECRET` (≥ 32 chars), `FRONTEND_ORIGIN` (exact
+   published origin, no trailing slash) and the Google Wallet variables
+   (`GOOGLE_ISSUER_ID` + keyless `GOOGLE_EXTERNAL_ACCOUNT_JSON`, see below).
+   **Do NOT set `RUN_MIGRATIONS_ON_START`** — migrations must never run in the
+   Vercel request/cold-start path. Do NOT set `PILOT_READY` yet.
+2. **Apply the schema once, out-of-band** against the production database:
+   ```sh
+   DATABASE_URL='postgresql://.../db?sslmode=require' bun run db:migrate
+   ```
+   Exit `0` = applied. Never run this from the Vercel request path.
+3. **Create the dedicated app role** (owner-side, per `RLS_AUTH_P1.md`) and
+   verify RLS/role isolation read-only:
+   ```sh
+   RLS_VERIFY_DATABASE_URL='postgresql://<app-role>@.../db?sslmode=require' bun run rls-verify
+   ```
+   Exit `0` = pass. Until the app role exists, RLS enforcement cannot be
+   exercised by the live API (documented blocker, `RLS_AUTH_P1.md`).
+4. **Declare pilot readiness**: set `PILOT_READY=1` in the production
+   environment (redeploy applies it). `/health` then reports
+   `{"status":"ready"}`; before that it honestly reports `{"status":"not_ready"}`
+   even though the function is reachable.
+
 ## Runtime notes / limitations
 
 Vercel functions are stateless and may be reused between requests. The module-level
@@ -96,12 +127,16 @@ The CLI reads the connection string exclusively from `DATABASE_URL` (never baked
 in, never printed), applies pending migrations under the F3 advisory lock and
 exits nonzero on any failure. The server starts instantly without touching the
 database: requests fail fast with a classified error if the database is
-unreachable, and `GET /health` honestly reports `not_ready` until the schema is
-in place. To opt a single long-running Bun process into migrations-on-start,
-set `RUN_MIGRATIONS_ON_START=1`; requests then wait at most
-`DB_READINESS_TIMEOUT_MS` (default 3000) for the background migration before
-returning `503 DATABASE_UNAVAILABLE` — a hung or sleeping database can no
-longer hold the invocation until the platform timeout (504).
+unreachable. `GET /health` is the honest pilot signal: it is **always HTTP 200
+while the function is up** (liveness), and its `status` field reports `ready`
+only after the operator declares the schema/pilot steps done via `PILOT_READY=1`
+(see below) — without that declaration it reports `not_ready` even though the
+function is reachable. The endpoint never queries the database. To opt a single
+long-running Bun process into migrations-on-start, set `RUN_MIGRATIONS_ON_START=1`;
+requests then wait at most `DB_READINESS_TIMEOUT_MS` (default 3000) for the
+background migration before returning `503 DATABASE_UNAVAILABLE` — a hung or
+sleeping database can no longer hold the invocation until the platform
+timeout (504).
 
 The Bun local server remains available with `bun run dev`/`bun run start`. The
 Vercel adapter is the supported serverless boundary; do not claim a public API URL

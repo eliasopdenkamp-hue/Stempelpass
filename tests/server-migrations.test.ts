@@ -4,14 +4,19 @@
  * Pins the Vercel-504 fix in src/server.ts:
  *   1. DEFAULT: migrations never run in the request/cold-start path. A server
  *      booted with DATABASE_URL (but WITHOUT RUN_MIGRATIONS_ON_START) must not
- *      attempt a migration at all: /health is `ready` immediately and
- *      DB-backed routes fail fast with a classified error (no hang, no 504).
- *   2. OPT-IN: with RUN_MIGRATIONS_ON_START=1 the migration runs in the
+ *      attempt a migration at all: DB-backed routes fail fast with a classified
+ *      error (no hang, no 504), and /health stays HTTP 200 (liveness) but
+ *      honestly reports `not_ready` until the operator sets PILOT_READY=1.
+ *   2. PILOT_READY=1 (default path): /health reports `ready` without any
+ *      database query — proven by an unreachable database that still answers
+ *      `ready` instantly. Schema/pilot readiness is an operator declaration
+ *      (db:migrate + app role + rls-verify done), not a runtime probe.
+ *   3. OPT-IN: with RUN_MIGRATIONS_ON_START=1 the migration runs in the
  *      background, and requests wait at most DB_READINESS_TIMEOUT_MS before
  *      getting a classified DATABASE_UNAVAILABLE (503). A hung database (a
  *      black-hole TCP server that accepts but never answers the PostgreSQL
  *      handshake) must produce a fast 503, never an infinite hang.
- *   3. The new migration CLI (src/migrate.ts, `bun run db:migrate`) exits
+ *   4. The new migration CLI (src/migrate.ts, `bun run db:migrate`) exits
  *      nonzero on failure and never prints the connection URL.
  *
  * The server subprocess tests use unreachable/black-hole databases only —
@@ -57,6 +62,7 @@ const BLOCKED_ENV = new Set([
   'TIGER_PUBLIC_KEY', 'TIGER_SECRET_KEY', 'TIGER_PROJECT_ID',
   'EMAIL_SMTP_HOST', 'EMAIL_SMTP_PORT', 'EMAIL_SMTP_USER', 'EMAIL_SMTP_PASSWORD', 'EMAIL_FROM',
   'COMMUNICATION_HASH_SECRET', 'VERCEL', 'PORT', 'RUN_MIGRATIONS_ON_START', 'DB_READINESS_TIMEOUT_MS',
+  'PILOT_READY',
 ]);
 
 function baseEnv(): Record<string, string> {
@@ -128,7 +134,7 @@ async function runMigrateCli(extra: Record<string, string>): Promise<{ code: num
 // (1) Default: migrations are OFF the request/cold-start path
 // ---------------------------------------------------------------------------
 
-test('default: no RUN_MIGRATIONS_ON_START → no migration attempt, /health ready, DB errors classified fast', async () => {
+test('default: no RUN_MIGRATIONS_ON_START → no migration attempt, /health honestly not_ready until PILOT_READY, DB errors classified fast', async () => {
   const dbPort = await freePort(); // nothing listens → connection refused, immediate
   const { base, child, logs } = await spawnServer({
     ...CONFIGURED_ENV,
@@ -136,9 +142,12 @@ test('default: no RUN_MIGRATIONS_ON_START → no migration attempt, /health read
   });
   try {
     // Boot is healthy even though the database is unreachable: the request path
-    // no longer depends on schema DDL, so no migration was started.
+    // no longer depends on schema DDL, so no migration was started. The
+    // function is up (HTTP 200 = liveness), but without the operator's
+    // PILOT_READY=1 declaration — set only after `bun run db:migrate` + app
+    // role + `bun run rls-verify` — readiness is honestly `not_ready`.
     const health = await (await fetch(`${base}/health`)).text();
-    expect(health).toBe('{"status":"ready"}');
+    expect(health).toBe('{"status":"not_ready"}');
 
     // A route that touches the database fails fast with a classified
     // INTERNAL_ERROR (connection refused) — no readiness gate hang, no 504.
@@ -156,6 +165,28 @@ test('default: no RUN_MIGRATIONS_ON_START → no migration attempt, /health read
     // Crucially: the unreachable database produced NO migration_failed log —
     // the migration runner was never invoked on the request path.
     expect(logs()).not.toContain('migration_failed');
+  } finally {
+    child.kill();
+  }
+}, 20_000);
+
+test('default + PILOT_READY=1 → /health ready instantly, no database query (unreachable DB still answers)', async () => {
+  const dbPort = await freePort(); // nothing listens → any DB probe would fail
+  const { base, child } = await spawnServer({
+    ...CONFIGURED_ENV,
+    DATABASE_URL: `postgres://user:pass@127.0.0.1:${dbPort}/db?sslmode=require`,
+    PILOT_READY: '1',
+  });
+  try {
+    // The operator declared the schema/pilot steps done. GET /health must not
+    // block on the database: it answers `ready` instantly although the DB is
+    // unreachable — proving the endpoint performs no database query and the
+    // distinction is "function reachable" (HTTP 200) vs "schema/pilot ready"
+    // (status field, operator-declared).
+    const started = Date.now();
+    const health = await (await fetch(`${base}/health`)).text();
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(health).toBe('{"status":"ready"}');
   } finally {
     child.kill();
   }

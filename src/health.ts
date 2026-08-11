@@ -1,6 +1,18 @@
 /**
  * Public liveness/readiness endpoint (GET /health).
  *
+ * Always HTTP 200 while the function is up and answering — that is the
+ * liveness signal ("function erreichbar"). The single `status` field is the
+ * honest readiness signal: `ready` only when configuration is complete, no
+ * initialization error occurred, the opt-in background migration (if
+ * RUN_MIGRATIONS_ON_START=1) has finished, AND the operator declared the
+ * schema/pilot steps done by setting PILOT_READY=1 (see src/server.ts).
+ * Without that declaration the function is reachable but honestly reports
+ * `not_ready`. GET /health NEVER queries the database: the out-of-band steps
+ * (`bun run db:migrate`, app role, `bun run rls-verify`) cannot be verified
+ * without a blocking query, so readiness is an operator declaration, not a
+ * runtime probe.
+ *
  * Security P2: the response is deliberately generic. It exposes exactly one
  * stable field (`status`) and never internal configuration details — no
  * database/session configuration flags, no wallet credential modes, no

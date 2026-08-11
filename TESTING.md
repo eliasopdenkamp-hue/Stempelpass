@@ -9,12 +9,17 @@ request-id-free, byte-stable endpoint:
 { "status": "ready" }
 ```
 
-Always HTTP 200 while the process is up (liveness). The `status` field is the
-readiness signal: `ready` when configuration is complete and the database path
-is usable (migrations are NOT part of the request path by default — schema is
-applied out-of-band via `bun run db:migrate`; with the opt-in
-`RUN_MIGRATIONS_ON_START=1`, readiness additionally requires the background
-migration to have succeeded), `not_ready` otherwise. Monitoring should
+Always HTTP 200 while the process is up (liveness — "function erreichbar"). The
+`status` field is the honest readiness signal: `ready` only when configuration
+is complete, no initialization error occurred, the opt-in background migration
+(if `RUN_MIGRATIONS_ON_START=1`) has succeeded, **and the operator declared the
+out-of-band schema/pilot steps done via `PILOT_READY=1`** — migrations are NOT
+part of the request path by default (schema is applied out-of-band via
+`bun run db:migrate`, then the app role + `bun run rls-verify`; see VERCEL.md
+"Pilot readiness — operator sequence"). The endpoint NEVER queries the
+database: readiness is an operator declaration, not a runtime probe, so a
+configured function without `PILOT_READY=1` reports `not_ready` even though it
+is up. `not_ready` in every other case. Monitoring should
 alert on the `status` field, never on response body details — there are none:
 no database/session configuration flags, no wallet credential modes, no
 configuration error codes (`DATABASE_URL_REQUIRED`, `SESSION_SECRET_TOO_SHORT`,
@@ -122,14 +127,17 @@ readiness and otherwise fail fast with the classified `503 DATABASE_UNAVAILABLE`
 instead of hanging until the platform kills the invocation (504). `GET /health`
 honestly reports `not_ready` while the opt-in migration is pending or failed.
 
-`tests/server-migrations.test.ts` (9 tests, no database) pins all of this with
+`tests/server-migrations.test.ts` (10 tests, no database) pins all of this with
 unreachable/black-hole databases only — nothing is ever migrated against a real
 PostgreSQL instance:
 
-- Default (DATABASE_URL set, no `RUN_MIGRATIONS_ON_START`): the server boots
-  instantly, `/health` is `ready` even though the DB is unreachable, no
-  `migration_failed` log appears (no migration attempted), and DB-backed routes
-  fail fast with a classified error.
+- Default (DATABASE_URL set, no `RUN_MIGRATIONS_ON_START`, no `PILOT_READY`):
+  the server boots instantly, `/health` is HTTP 200 but honestly
+  `not_ready` (no migration attempted, no `migration_failed` log), and
+  DB-backed routes fail fast with a classified error.
+- Default + `PILOT_READY=1`: `/health` is `ready` **instantly even with an
+  unreachable database** — proving the endpoint performs no database query;
+  readiness is the operator's declaration, not a runtime probe.
 - Opt-in + unreachable DB: `/health` is `not_ready`, requests get
   `503 DATABASE_UNAVAILABLE` fast, `migration_failed` is logged.
 - Opt-in + hung DB (black-hole TCP server): the bounded readiness timeout
