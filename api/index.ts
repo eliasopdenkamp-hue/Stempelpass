@@ -47,7 +47,11 @@ export default async function handler(vercelReq: VercelRequestLike): Promise<Res
   const incoming = vercelReq.body ?? vercelReq.rawBody;
   if (incoming !== undefined && incoming !== null) {
     if (typeof incoming === 'string') body = incoming;
-    else if (incoming instanceof Uint8Array) body = incoming;
+    // `incoming` narrows to Uint8Array<ArrayBufferLike>, which is not assignable
+    // to BodyInit (TS 5.7+ typed arrays). The ArrayLike constructor copies into
+    // a fresh Uint8Array<ArrayBuffer>, which is BodyInit-compatible and matches
+    // the Buffer path below. Buffers subclass Uint8Array, so they land here too.
+    else if (incoming instanceof Uint8Array) body = new Uint8Array(incoming);
     else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(incoming)) body = new Uint8Array(incoming);
     else body = JSON.stringify(incoming); // JSON was pre-parsed by the runtime
     // The re-serialized body length may differ from the original header.
