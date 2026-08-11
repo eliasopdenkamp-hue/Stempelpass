@@ -208,6 +208,43 @@ class FakeRlsDb implements RlsDb {
   async end() {}
 }
 
+/**
+ * Models the real postgres.js `begin()` semantics that previously caused the
+ * misclassification: the driver runs BEGIN, executes the callback, and on ANY
+ * error inside the transaction rolls back and rethrows. When the old code
+ * swallowed a query error and returned a fail report, the transaction stayed
+ * aborted and the driver's COMMIT failed — surfacing as `connect`. This fake
+ * propagates callback errors out of `begin()` (with a rollback marker) like
+ * the real driver, so the classification contract is tested under the exact
+ * failure shape that happens in production.
+ */
+class PostgresLikeRlsDb implements RlsDb {
+  queries: string[] = [];
+  constructor(private readonly handlers: Record<string, { rows?: unknown[]; error?: string }>) {}
+  async begin<T>(_mode: string, fn: (tx: RlsTx) => Promise<T>): Promise<T> {
+    const tx: RlsTx = {
+      unsafe: async (sql, _params) => {
+        this.queries.push(sql);
+        for (const key of Object.keys(this.handlers)) {
+          if (sql.includes(key)) {
+            const h = this.handlers[key];
+            if (h.error) throw new Error(h.error);
+            return { rows: (h.rows ?? []) as never[] };
+          }
+        }
+        throw new Error('unexpected query');
+      },
+    };
+    try {
+      return await fn(tx);
+    } catch (e) {
+      this.queries.push('rollback'); // driver rolls back before rethrowing
+      throw e;
+    }
+  }
+  async end() {}
+}
+
 const healthyHandlers = {
   'from pg_roles': { rows: [okAttrs] },
   'join pg_roles r': { rows: [] }, // no owned tables
@@ -252,7 +289,48 @@ describe('verifyRls (scripted RlsDb)', () => {
     expect(r.roleClass).toBe('unverified');
     expect(JSON.stringify(r)).not.toContain('secret-db');
     expect(JSON.stringify(r)).not.toContain('terminated');
-    expect(r.errors.some(e => e.startsWith('query:'))).toBe(true);
+    expect(r.errors).toEqual(['query:role-attributes']);
+  });
+
+  test('query failure keeps query:<name> even when begin() rejects like the real driver', async () => {
+    // postgres.js rolls the aborted transaction back and rethrows the callback
+    // error out of begin() — the shape that previously collapsed to `connect`.
+    const db = new PostgresLikeRlsDb({
+      ...healthyHandlers,
+      'from pg_roles': { error: 'psql: FATAL: password authentication failed for user "x"' },
+    });
+    const r = await verifyRls({ url: 'postgresql://u:p@secret-host.example/p', db });
+    expect(r.ok).toBe(false);
+    expect(r.roleClass).toBe('unverified');
+    expect(r.errors).toEqual(['query:role-attributes']);
+    expect(db.queries.at(-1)).toBe('rollback'); // driver rolled back before rethrowing
+    const json = JSON.stringify(r);
+    expect(json).not.toContain('secret-host');
+    expect(json).not.toContain('password authentication');
+    expect(json).not.toContain('u:p@');
+  });
+
+  test('a later failing query is named precisely (query:grants)', async () => {
+    const db = new PostgresLikeRlsDb({
+      ...healthyHandlers,
+      'has_table_privilege': { error: 'permission denied for relation cards' },
+    });
+    const r = await verifyRls({ url: 'postgresql://u:p@host/db', db });
+    expect(r.ok).toBe(false);
+    expect(r.errors).toEqual(['query:grants']);
+    expect(JSON.stringify(r)).not.toContain('permission denied');
+  });
+
+  test('named-role query failure is classified against the named-role step', async () => {
+    const db = new PostgresLikeRlsDb({
+      ...healthyHandlers,
+      'has_schema_privilege': { error: 'permission denied for schema app' },
+    });
+    const r = await verifyRls({ url: 'postgresql://u:p@host/db', roleName: 'sp_app', db });
+    expect(r.mode).toBe('named-role');
+    expect(r.errors).toEqual(['query:schema-privileges']);
+    expect(JSON.stringify(r)).not.toContain('permission denied');
+    expect(JSON.stringify(r)).not.toContain('sp_app');
   });
 
   test('invalid schema/role inputs fail before any query', async () => {

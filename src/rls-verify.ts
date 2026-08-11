@@ -25,7 +25,10 @@
  *     values. `current_user` is never printed, role names are never printed,
  *     and the connection URL (which may embed a password) is never logged or
  *     returned. Driver error messages are replaced with short classified codes
- *     (`query:<step>` / `connect`) — never raw error text.
+ *     (`query:<step>` / `connect`) — never raw error text. A failure inside a
+ *     verification query is reported as `query:<name>` even though the driver
+ *     rolls the transaction back and rejects `begin()`; only failures to open
+ *     the connection or start the transaction are reported as `connect`.
  *   - No workaround mode: if the provided connection cannot verify the checks
  *     (e.g. no separate non-owner app role exists), the tool reports
  *     `ok:false` / `roleClass:"unverified"` and exits non-zero; it never
@@ -310,6 +313,25 @@ export interface RlsDb {
   end(): Promise<void>;
 }
 
+/**
+ * Classified failure for a single verification query. Carries ONLY the short
+ * classified code (`query:<name>`); the driver message, SQL text and params
+ * never leave this module. `verifyRls` throws this from inside the read-only
+ * transaction so the driver rolls back and rethrows it — the outer `begin()`
+ * catch can then distinguish a check-query failure from a connection failure
+ * without ever printing driver error text. (Returning a fail report instead
+ * would leave the transaction aborted; the driver's COMMIT would then fail and
+ * be misclassified as `connect`.)
+ */
+export class RlsQueryFailure extends Error {
+  readonly code: string;
+  constructor(name: string) {
+    super('query:' + name);
+    this.name = 'RlsQueryFailure';
+    this.code = 'query:' + name;
+  }
+}
+
 /** Dedicated short-lived connection: read-only, one slot, never shared. */
 export function createRlsDb(url: string): RlsDb {
   const sql = postgres(url, {
@@ -359,7 +381,12 @@ export async function verifyRls(opts: VerifyRlsOptions): Promise<RlsVerifyReport
         try {
           results[q.name] = await tx.unsafe<Record<string, unknown>>(q.sql, q.params);
         } catch {
-          return failReport(mode, [`query:${q.name}`]);
+          // Throw the classified code so the outer catch below can tell a
+          // check-query failure from a connection/begin failure. The driver
+          // rolls the transaction back and rethrows this error; returning a
+          // fail report here would instead leave the transaction aborted and
+          // the driver's COMMIT failure would surface as `connect`.
+          throw new RlsQueryFailure(q.name);
         }
       }
       const bool = (v: unknown) => v === true;
@@ -381,7 +408,14 @@ export async function verifyRls(opts: VerifyRlsOptions): Promise<RlsVerifyReport
         errors: [],
       });
     });
-  } catch {
+  } catch (e) {
+    // `connect` only for connection/begin failures. A verification-query
+    // failure reaches this catch as a classified RlsQueryFailure (the driver
+    // rolled back and rethrew it) and keeps its `query:<name>` code; everything
+    // else (connection refused, auth failure, BEGIN failure, aborted COMMIT)
+    // collapses to `connect`. No driver message, URL, role or PII is ever
+    // included in the report.
+    if (e instanceof RlsQueryFailure) return failReport(mode, [e.code]);
     return failReport(mode, ['connect']);
   } finally {
     if (!opts.db) await db.end().catch(() => undefined);
