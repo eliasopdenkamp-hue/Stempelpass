@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "functions": {
+    "api/index.ts": {
+      "regions": ["fra1"]
+    }
+  },
+  "rewrites": [{ "source": "/(.*)", "destination": "/api/index" }]
+}

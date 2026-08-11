@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Environment — never commit real secrets; only .env.example is tracked
+.env
+.env.*
+!.env.example
+
+# Vercel local artifacts
+.vercel/
+
+# Build output
+dist/
+out/
+
+# Logs
+*.log
+npm-debug.log*
+bun-debug.log*
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

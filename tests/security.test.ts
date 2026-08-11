@@ -1,0 +1,5 @@
+import { test, expect } from 'bun:test';
+import { hashPassword, verifyPassword, signSession, verifySession, RateLimiter, csrfValid } from '../src/security';
+test('password hashing uses verifiable encoded hash', async () => { const hash = await hashPassword('a sufficiently long password'); expect(hash).not.toContain('a sufficiently'); expect(await verifyPassword('a sufficiently long password', hash)).toBe(true); expect(await verifyPassword('wrong password here', hash)).toBe(false); });
+test('signed sessions reject tampering and expire', async () => { const token = await signSession({ userId:'u', expiresAt:Date.now()+10000, csrfToken:'c' }, 'x'.repeat(32)); expect((await verifySession(token,'x'.repeat(32)))?.userId).toBe('u'); expect(await verifySession(token+'x','x'.repeat(32))).toBeNull(); });
+test('csrf and rate limit primitives', () => { const r = new RateLimiter(2, 1000); expect(r.allow('x', 0)).toBe(true); expect(r.allow('x', 1)).toBe(true); expect(r.allow('x', 2)).toBe(false); expect(r.allow('x', 1001)).toBe(true); expect(csrfValid(new Request('https://x', { method:'POST', headers:{'x-csrf-token':'ok'} }), 'ok')).toBe(true); });

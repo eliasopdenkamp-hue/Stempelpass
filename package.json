@@ -1,0 +1,24 @@
+{
+  "name": "stempelpass-backend-skeleton",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/server.ts",
+    "start": "bun run src/server.ts",
+    "build": "bun run typecheck",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "bun run src/migrate.ts",
+    "rls-verify": "bun run src/rls-verify.ts",
+    "production-preflight": "bun run src/production-preflight.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@types/nodemailer": "^8.0.1",
+    "nodemailer": "^9.0.4",
+    "postgres": "^3.4.9"
+  }
+}
