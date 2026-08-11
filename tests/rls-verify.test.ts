@@ -3,8 +3,16 @@
  *
  * The classifier (`classifyRlsReport`) and the query builders are pure and are
  * exercised directly. `verifyRls` runs against a scripted in-memory `RlsDb`
- * (never a real connection), proving the execution path, the anonymization
- * contract and the read-only guard without touching any PostgreSQL instance.
+ * (never a real connection), proving the explicit read-only transaction
+ * protocol (`BEGIN READ ONLY` → checks → `COMMIT`, `ROLLBACK` on failure),
+ * the anonymization contract and the classification of the concrete Neon
+ * failure causes:
+ *
+ *   - a verification query failing inside the read-only transaction reports
+ *     `query:<name>` and rolls back (previously the driver's COMMIT on the
+ *     aborted transaction collapsed this to `connect`);
+ *   - failing to open the read-only transaction (connection-level) reports
+ *     `connect` and never runs a check.
  */
 
 import { describe, expect, test } from 'bun:test';
@@ -14,11 +22,12 @@ import {
   buildAsRoleQueries,
   buildNamedRoleQueries,
   classifyRlsReport,
+  createRlsDb,
   resolveRlsEnv,
+  rlsConnectionOptions,
   verifyRls,
   type RlsDb,
   type RlsRawInput,
-  type RlsTx,
   type RlsVerifyReport,
 } from '../src/rls-verify';
 
@@ -186,66 +195,33 @@ describe('classifyRlsReport', () => {
 // Execution path (scripted RlsDb, no real connection)
 // ---------------------------------------------------------------------------
 
-class FakeRlsDb implements RlsDb {
-  queries: string[] = [];
-  constructor(private readonly handlers: Record<string, { rows?: unknown[]; error?: string }>) {}
-  async begin<T>(_mode: string, fn: (tx: RlsTx) => Promise<T>): Promise<T> {
-    const tx: RlsTx = {
-      unsafe: async (sql, _params) => {
-        this.queries.push(sql);
-        for (const key of Object.keys(this.handlers)) {
-          if (sql.includes(key)) {
-            const h = this.handlers[key];
-            if (h.error) throw new Error(h.error);
-            return { rows: (h.rows ?? []) as never[] };
-          }
-        }
-        throw new Error('unexpected query');
-      },
-    };
-    return fn(tx);
-  }
-  async end() {}
-}
-
 /**
- * Models the real postgres.js `begin()` semantics that previously caused the
- * misclassification: the driver runs BEGIN, executes the callback, and on ANY
- * error inside the transaction rolls back and rethrows. When the old code
- * swallowed a query error and returned a fail report, the transaction stayed
- * aborted and the driver's COMMIT failed — surfacing as `connect`. This fake
- * propagates callback errors out of `begin()` (with a rollback marker) like
- * the real driver, so the classification contract is tested under the exact
- * failure shape that happens in production.
+ * Scripted in-memory connection. `query` records every statement and matches
+ * canned handlers by SQL substring; a handler with `error` throws (the real
+ * driver would reject with a PostgresError — here with a fake message that
+ * must never leak into a report).
  */
-class PostgresLikeRlsDb implements RlsDb {
-  queries: string[] = [];
+class FakeRlsDb implements RlsDb {
+  statements: string[] = [];
   constructor(private readonly handlers: Record<string, { rows?: unknown[]; error?: string }>) {}
-  async begin<T>(_mode: string, fn: (tx: RlsTx) => Promise<T>): Promise<T> {
-    const tx: RlsTx = {
-      unsafe: async (sql, _params) => {
-        this.queries.push(sql);
-        for (const key of Object.keys(this.handlers)) {
-          if (sql.includes(key)) {
-            const h = this.handlers[key];
-            if (h.error) throw new Error(h.error);
-            return { rows: (h.rows ?? []) as never[] };
-          }
-        }
-        throw new Error('unexpected query');
-      },
-    };
-    try {
-      return await fn(tx);
-    } catch (e) {
-      this.queries.push('rollback'); // driver rolls back before rethrowing
-      throw e;
+  async query<T>(sql: string, _params?: unknown[]): Promise<{ rows: T[] }> {
+    this.statements.push(sql);
+    for (const key of Object.keys(this.handlers)) {
+      if (sql.includes(key)) {
+        const h = this.handlers[key];
+        if (h.error) throw new Error(h.error);
+        return { rows: (h.rows ?? []) as T[] };
+      }
     }
+    throw new Error('unexpected statement');
   }
   async end() {}
 }
 
 const healthyHandlers = {
+  'BEGIN READ ONLY': { rows: [] },
+  'COMMIT': { rows: [] },
+  'ROLLBACK': { rows: [] },
   'from pg_roles': { rows: [okAttrs] },
   'join pg_roles r': { rows: [] }, // no owned tables
   'relrowsecurity': { rows: TENANT_SENSITIVE_TABLES.map(t => ({ table_name: t, rls_enabled: true, rls_forced: false })) },
@@ -257,7 +233,7 @@ const healthyHandlers = {
 };
 
 describe('verifyRls (scripted RlsDb)', () => {
-  test('healthy as-role run passes and is fully anonymized', async () => {
+  test('healthy as-role run passes, is fully anonymized and uses the explicit tx protocol', async () => {
     const db = new FakeRlsDb(healthyHandlers);
     const url = 'postgresql://user:super-secret-pw@db.internal:5432/prod?sslmode=require';
     const r = await verifyRls({ url, db });
@@ -267,62 +243,59 @@ describe('verifyRls (scripted RlsDb)', () => {
     expect(json).not.toContain('db.internal');
     expect(json).not.toContain('user:');
     expect(json).not.toContain('current_user');
-    expect(db.queries.every(q => q.trim().toLowerCase().startsWith('select '))).toBe(true);
+    // Explicit transaction protocol: BEGIN READ ONLY first, COMMIT last, and
+    // every statement in between is a bare SELECT.
+    expect(db.statements[0]).toBe('BEGIN READ ONLY');
+    expect(db.statements.at(-1)).toBe('COMMIT');
+    expect(db.statements).not.toContain('ROLLBACK');
+    for (const s of db.statements.slice(1, -1)) expect(s.trim().toLowerCase().startsWith('select ')).toBe(true);
+    expect(db.statements.length).toBe(8); // BEGIN + 6 checks + COMMIT
   });
 
   test('named-role mode skips row_security_active and binds the role name', async () => {
-    const db = new FakeRlsDb({
-      ...healthyHandlers,
-      'from pg_roles': { rows: [okAttrs] },
-    });
+    const db = new FakeRlsDb({ ...healthyHandlers });
     const r = await verifyRls({ url: 'postgresql://admin@db/p', roleName: 'sp_app', db });
     expect(r.mode).toBe('named-role');
     expect(r.checks.rlsActiveForRole).toBe(null);
-    expect(db.queries.some(q => q.includes('row_security_active'))).toBe(false);
-    for (const q of db.queries) expect(q).not.toContain('sp_app'); // role only as bind param
+    expect(db.statements.some(s => s.includes('row_security_active'))).toBe(false);
+    for (const s of db.statements) expect(s).not.toContain('sp_app'); // role only as bind param
   });
 
-  test('a failing catalog query maps to a classified error, never a driver message', async () => {
-    const db = new FakeRlsDb({ ...healthyHandlers, 'from pg_roles': { error: 'connection terminated user=postgres host=secret-db' } });
+  test('concrete cause: a failing check query reports query:<name>, rolls back, never commits', async () => {
+    // This is the Neon failure shape: a verification query fails inside the
+    // read-only transaction. The explicit tx rolls back (ROLLBACK) and the
+    // classified code survives — previously the driver tried COMMIT on the
+    // aborted transaction (25P02) and everything collapsed to `connect`.
+    const db = new FakeRlsDb({
+      ...healthyHandlers,
+      'from pg_roles': { error: 'connection terminated user=postgres host=secret-db' },
+    });
     const r = await verifyRls({ url: 'postgresql://x@y/p', db });
     expect(r.ok).toBe(false);
     expect(r.roleClass).toBe('unverified');
+    expect(r.errors).toEqual(['query:role-attributes']);
+    expect(db.statements[0]).toBe('BEGIN READ ONLY');
+    expect(db.statements).toContain('ROLLBACK');
+    expect(db.statements).not.toContain('COMMIT');
     expect(JSON.stringify(r)).not.toContain('secret-db');
     expect(JSON.stringify(r)).not.toContain('terminated');
-    expect(r.errors).toEqual(['query:role-attributes']);
-  });
-
-  test('query failure keeps query:<name> even when begin() rejects like the real driver', async () => {
-    // postgres.js rolls the aborted transaction back and rethrows the callback
-    // error out of begin() — the shape that previously collapsed to `connect`.
-    const db = new PostgresLikeRlsDb({
-      ...healthyHandlers,
-      'from pg_roles': { error: 'psql: FATAL: password authentication failed for user "x"' },
-    });
-    const r = await verifyRls({ url: 'postgresql://u:p@secret-host.example/p', db });
-    expect(r.ok).toBe(false);
-    expect(r.roleClass).toBe('unverified');
-    expect(r.errors).toEqual(['query:role-attributes']);
-    expect(db.queries.at(-1)).toBe('rollback'); // driver rolled back before rethrowing
-    const json = JSON.stringify(r);
-    expect(json).not.toContain('secret-host');
-    expect(json).not.toContain('password authentication');
-    expect(json).not.toContain('u:p@');
   });
 
   test('a later failing query is named precisely (query:grants)', async () => {
-    const db = new PostgresLikeRlsDb({
+    const db = new FakeRlsDb({
       ...healthyHandlers,
       'has_table_privilege': { error: 'permission denied for relation cards' },
     });
     const r = await verifyRls({ url: 'postgresql://u:p@host/db', db });
     expect(r.ok).toBe(false);
     expect(r.errors).toEqual(['query:grants']);
+    expect(db.statements).toContain('ROLLBACK');
+    expect(db.statements).not.toContain('COMMIT');
     expect(JSON.stringify(r)).not.toContain('permission denied');
   });
 
   test('named-role query failure is classified against the named-role step', async () => {
-    const db = new PostgresLikeRlsDb({
+    const db = new FakeRlsDb({
       ...healthyHandlers,
       'has_schema_privilege': { error: 'permission denied for schema app' },
     });
@@ -333,22 +306,78 @@ describe('verifyRls (scripted RlsDb)', () => {
     expect(JSON.stringify(r)).not.toContain('sp_app');
   });
 
-  test('invalid schema/role inputs fail before any query', async () => {
+  test('concrete cause: BEGIN READ ONLY failing reports connect and never runs a check', async () => {
+    // The owner-facing Neon symptom: the read-only transaction cannot be
+    // opened (proxy drop, cold start timeout, auth/TLS failure). It must be
+    // reported as `connect` — and no check query may run.
+    const db = new FakeRlsDb({
+      ...healthyHandlers,
+      'BEGIN READ ONLY': { error: 'FATAL: password authentication failed for user "sp" host=neon-proxy' },
+    });
+    const r = await verifyRls({ url: 'postgresql://u:p@secret-host.example/p', db });
+    expect(r.ok).toBe(false);
+    expect(r.roleClass).toBe('unverified');
+    expect(r.errors).toEqual(['connect']);
+    expect(db.statements).toEqual(['BEGIN READ ONLY']);
+    const json = JSON.stringify(r);
+    expect(json).not.toContain('secret-host');
+    expect(json).not.toContain('password authentication');
+    expect(json).not.toContain('u:p@');
+  });
+
+  test('COMMIT failing (connection died at the end) reports connect', async () => {
+    const db = new FakeRlsDb({
+      ...healthyHandlers,
+      'COMMIT': { error: 'socket hang up' },
+    });
+    const r = await verifyRls({ url: 'postgresql://u:p@host/db', db });
+    expect(r.ok).toBe(false);
+    expect(r.errors).toEqual(['connect']);
+    expect(JSON.stringify(r)).not.toContain('hang up');
+  });
+
+  test('invalid schema/role inputs fail before any statement', async () => {
     const db = new FakeRlsDb(healthyHandlers);
     expect((await verifyRls({ url: 'u', schema: 'bad schema;', db })).errors).toEqual(['invalid-schema']);
     expect((await verifyRls({ url: 'u', roleName: 'bad role', db })).errors).toEqual(['invalid-role']);
-    expect(db.queries.length).toBe(0);
+    expect(db.statements.length).toBe(0);
   });
 
-  test('an unhandled begin() failure is classified as connect', async () => {
-    const db = {
-      begin: async () => { throw new Error('could not connect to db.internal'); },
-      end: async () => {},
-    };
-    const r = await verifyRls({ url: 'postgresql://u:p@db.internal/x', db });
-    expect(r.ok).toBe(false);
-    expect(r.errors).toEqual(['connect']);
-    expect(JSON.stringify(r)).not.toContain('db.internal');
+  test('an end() failure is swallowed (best-effort close)', async () => {
+    const db = new FakeRlsDb(healthyHandlers);
+    db.end = async () => { throw new Error('close failed'); };
+    const r = await verifyRls({ url: 'postgresql://u:p@host/db', db });
+    expect(r.ok).toBe(true);
+    expect(JSON.stringify(r)).not.toContain('close failed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Connection hardening (Neon)
+// ---------------------------------------------------------------------------
+
+describe('rlsConnectionOptions (Neon hardening)', () => {
+  test('dedicated single slot with a generous connect timeout for cold starts', () => {
+    const o = rlsConnectionOptions();
+    expect(o.max).toBe(1);
+    expect(o.connect_timeout).toBeGreaterThanOrEqual(30);
+    expect(o.prepare).toBe(false);
+    // idle_timeout deliberately omitted → postgres.js default null (never
+    // self-closes mid-transaction); max_lifetime disabled.
+    expect('idle_timeout' in o).toBe(false);
+    expect(o.max_lifetime).toBeNull();
+  });
+
+  test('session is pinned read-only (default_transaction_read_only)', () => {
+    const o = rlsConnectionOptions();
+    expect(o.connection.default_transaction_read_only).toBe(true);
+  });
+
+  test('createRlsDb exposes query/end and never the URL', () => {
+    const db = createRlsDb('postgresql://u:secret@host/db?sslmode=require');
+    expect(typeof db.query).toBe('function');
+    expect(typeof db.end).toBe('function');
+    expect(String(db).includes('secret')).toBe(false);
   });
 });
 

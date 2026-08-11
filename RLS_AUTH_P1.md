@@ -64,10 +64,19 @@ fehlgeschlagen), `2` = nicht ausgeführt (Opt-in-Umgebungsvariable fehlt).
 - Opt-in ist `RLS_VERIFY_DATABASE_URL`; es gibt **keinen** Fallback auf
   `DATABASE_URL`, ohne die Variable bricht das Tool mit Exit 2 ab.
 - Read-only: eigene kurzlebige Verbindung (max 1), Transaktion läuft als
-  `BEGIN READ ONLY`; jede Anweisung ist ein reines SELECT auf Katalogsichten
-  (`pg_roles`, `pg_class`, `pg_namespace`, `has_table_privilege`/
-  `has_schema_privilege`/`row_security_active`). Keine Datentabelle wird
-  gelesen, nichts wird geschrieben, kein DDL, die Verbindung wird geschlossen.
+  **explizites** `BEGIN READ ONLY` (plain SQL, bewusst **nicht** der
+  `sql.begin('read only', …)`-Helfer des Treibers — postgres.js führt nach dem
+  Callback selbst COMMIT aus; ein fehlgeschlagener Check-Query ließ die
+  Transaktion serverseitig abgebrochen zurück, der Treiber-COMMIT schlug dann
+  mit 25P02 fehl und alles wurde fälschlich als `connect` gemeldet, obwohl die
+  Rolle sich direkt anmelden konnte — genau der Neon-Befund). Zusätzlich wird
+  `default_transaction_read_only=on` auf Session-Ebene gepinnt und
+  `connect_timeout=30` (Neon-Autosuspend-Cold-Starts). Jede Anweisung ist ein
+  reines SELECT auf Katalogsichten (`pg_roles`, `pg_class`, `pg_namespace`,
+  `has_table_privilege`/`has_schema_privilege`/`row_security_active`). Keine
+  Datentabelle wird gelesen, nichts wird geschrieben, kein DDL; bei
+  Check-Fehlern wird explizit ROLLBACK ausgeführt, die Verbindung wird immer
+  geschlossen.
 - Anonymisiert: ausgegeben werden nur Booleans und klassifizierte Werte.
   `current_user` wird nie ausgegeben, Rollennamen nur als Bind-Parameter,
   die Verbindungs-URL (ggf. mit Passwort) wird nie geloggt oder zurückgegeben;
@@ -93,7 +102,7 @@ ist eine separate Nicht-Owner-/Nicht-BYPASSRLS-App-Rolle samt Verbindungsdaten
 nötig, die in diesem Workspace **nicht** vorhanden ist (TEST_DATABASE_URL ist
 die Neon-Verwaltungsverbindung, keine App-Rolle). Deshalb wurde bewusst **kein**
 unsicherer Workaround implementiert; Tool und Unit-Tests
-(`tests/rls-verify.test.ts`, 27 Nicht-DB-Tests) sind fertig und der
+(`tests/rls-verify.test.ts`, 32 Nicht-DB-Tests) sind fertig und der
 produktive Lauf ist der erste Schritt des Pilot-/Deployment-Prozesses, sobald
 die App-Rolle angelegt ist (siehe `PILOT_ONBOARDING.md`/`TESTING.md`).
 

@@ -15,9 +15,13 @@
  * Safety contract (do not weaken):
  *   - Explicit opt-in: the CLI reads ONLY `RLS_VERIFY_DATABASE_URL`; there is
  *     no fallback to `DATABASE_URL` and running without it exits with code 2.
- *   - Read-only: the dedicated short-lived connection opens a `read only`
- *     transaction and pins `default_transaction_read_only=on`; every statement
- *     is a bare SELECT against catalog/system views (`pg_roles`, `pg_class`,
+ *   - Read-only: the dedicated short-lived connection (max 1, never shared)
+ *     opens an explicit `BEGIN READ ONLY` transaction — plain standard SQL,
+ *     deliberately NOT the driver's `sql.begin('read only', ...)` helper (see
+ *     `createRlsDb`/`verifyRls` below for why that helper misbehaves on
+ *     Neon/proxied PostgreSQL) — and additionally pins
+ *     `default_transaction_read_only=on` at session level. Every statement is
+ *     a bare SELECT against catalog/system views (`pg_roles`, `pg_class`,
  *     `pg_namespace`, `information_schema`-style privilege helpers). No data
  *     table is read, nothing is written, no DDL is issued, and the connection
  *     is closed afterwards.
@@ -26,9 +30,11 @@
  *     and the connection URL (which may embed a password) is never logged or
  *     returned. Driver error messages are replaced with short classified codes
  *     (`query:<step>` / `connect`) — never raw error text. A failure inside a
- *     verification query is reported as `query:<name>` even though the driver
- *     rolls the transaction back and rejects `begin()`; only failures to open
- *     the connection or start the transaction are reported as `connect`.
+ *     verification query is reported as `query:<name>`: the explicit
+ *     transaction is rolled back (ROLLBACK) and the classified error is
+ *     rethrown so the outer catch keeps the precise step. Only failures to
+ *     open the connection, to start the read-only transaction, or to commit it
+ *     are reported as `connect`.
  *   - No workaround mode: if the provided connection cannot verify the checks
  *     (e.g. no separate non-owner app role exists), the tool reports
  *     `ok:false` / `roleClass:"unverified"` and exits non-zero; it never
@@ -307,9 +313,14 @@ export function classifyRlsReport(input: RlsRawInput): RlsVerifyReport {
 // Execution
 // ---------------------------------------------------------------------------
 
-export interface RlsTx { unsafe<T>(sql: string, params?: unknown[]): Promise<{ rows: T[] }> }
+/**
+ * A single statement on the dedicated short-lived connection. `query` must
+ * execute the statement and return `{ rows }`; it must never log or expose
+ * driver error text (the caller only uses throw/not-throw for classification).
+ */
 export interface RlsDb {
-  begin<T>(mode: 'read only', fn: (tx: RlsTx) => Promise<T>): Promise<T>;
+  query<T>(sql: string, params?: unknown[]): Promise<{ rows: T[] }>;
+  /** Close the dedicated connection. */
   end(): Promise<void>;
 }
 
@@ -317,11 +328,11 @@ export interface RlsDb {
  * Classified failure for a single verification query. Carries ONLY the short
  * classified code (`query:<name>`); the driver message, SQL text and params
  * never leave this module. `verifyRls` throws this from inside the read-only
- * transaction so the driver rolls back and rethrows it — the outer `begin()`
- * catch can then distinguish a check-query failure from a connection failure
- * without ever printing driver error text. (Returning a fail report instead
- * would leave the transaction aborted; the driver's COMMIT would then fail and
- * be misclassified as `connect`.)
+ * transaction; the transaction is rolled back explicitly (ROLLBACK) and the
+ * error is rethrown, so the outer catch can distinguish a check-query failure
+ * from a connection/BEGIN failure without ever printing driver error text.
+ * (Returning a fail report instead would leave the transaction open and the
+ * ROLLBACK/COMMIT path ambiguous.)
  */
 export class RlsQueryFailure extends Error {
   readonly code: string;
@@ -332,20 +343,39 @@ export class RlsQueryFailure extends Error {
   }
 }
 
+/**
+ * Connection options for the dedicated RLS-verify connection. `idle_timeout`
+ * is deliberately omitted (postgres.js default `null`): the connection must
+ * never self-close mid-transaction; it is closed explicitly via `end()`.
+ */
+export interface RlsConnectionOptions {
+  max: number;
+  connect_timeout: number;
+  max_lifetime: number | null;
+  prepare: boolean;
+  connection: { default_transaction_read_only: boolean };
+}
+
+/** Neon-hardened options for the dedicated RLS-verify connection. */
+export function rlsConnectionOptions(): RlsConnectionOptions {
+  return {
+    max: 1,                       // dedicated connection, never shared
+    connect_timeout: 30,          // Neon autosuspend cold starts need headroom
+    max_lifetime: null,
+    prepare: false,               // plain protocol, no named prepared statements (pooler-safe)
+    connection: { default_transaction_read_only: true }, // session-level write pin
+  };
+}
+
 /** Dedicated short-lived connection: read-only, one slot, never shared. */
 export function createRlsDb(url: string): RlsDb {
-  const sql = postgres(url, {
-    max: 1,
-    connect_timeout: 10,
-    idle_timeout: 5,
-    prepare: false,
-  });
+  const sql = postgres(url, rlsConnectionOptions());
   return {
-    // postgres.js `begin('read only', fn)` issues `BEGIN READ ONLY` on this
-    // dedicated connection, so every statement in `fn` is write-protected. Its
-    // TransactionSql `unsafe` is structurally compatible with RlsTx; the casts
-    // only narrow the types.
-    begin: (mode, fn) => sql.begin(mode, tx => fn(tx as unknown as RlsTx)) as Promise<never>,
+    // Executes each statement on the pool's single connection; `max: 1`
+    // guarantees BEGIN / checks / COMMIT / ROLLBACK all run on the SAME
+    // physical connection, so the explicit transaction below is safe.
+    query: <T>(q: string, params?: unknown[]) =>
+      sql.unsafe<T[]>(q, (params ?? []) as never[]).then(rows => ({ rows })),
     end: () => sql.end({ timeout: 5 }),
   };
 }
@@ -371,50 +401,75 @@ export async function verifyRls(opts: VerifyRlsOptions): Promise<RlsVerifyReport
 
   const db = opts.db ?? createRlsDb(opts.url);
   try {
+    // Explicit read-only transaction on the dedicated connection: plain
+    // standard SQL (`BEGIN READ ONLY`), supported by Neon and every
+    // PostgreSQL. Deliberately NOT the driver's `sql.begin('read only', fn)`:
+    // that helper COMMITs after the callback, and when a verification query
+    // fails the transaction is aborted server-side — the driver's COMMIT then
+    // fails (25P02) and surfaces as `connect`, indistinguishable from a real
+    // connection failure even though the role can log in fine (exactly the
+    // Neon report). Running BEGIN/COMMIT/ROLLBACK ourselves classifies
+    // precisely: connection/BEGIN/COMMIT failures are `connect`, check-query
+    // failures are `query:<name>`.
+    try {
+      await db.query('BEGIN READ ONLY');
+    } catch {
+      // Connection could not be established or the read-only transaction
+      // could not be opened — a connectivity-level failure, never a check
+      // failure. No driver message, URL or role is included.
+      return failReport(mode, ['connect']);
+    }
+
     const queries = mode === 'named-role'
       ? buildNamedRoleQueries(opts.roleName!, schema)
       : buildAsRoleQueries(schema);
-    return await db.begin('read only', async tx => {
-      const results: Record<string, { rows: Array<Record<string, unknown>> }> = {};
-      for (const q of queries) {
-        if (!/^select\s/i.test(q.sql.trim())) return failReport(mode, ['read-only-violation']);
-        try {
-          results[q.name] = await tx.unsafe<Record<string, unknown>>(q.sql, q.params);
-        } catch {
-          // Throw the classified code so the outer catch below can tell a
-          // check-query failure from a connection/begin failure. The driver
-          // rolls the transaction back and rethrows this error; returning a
-          // fail report here would instead leave the transaction aborted and
-          // the driver's COMMIT failure would surface as `connect`.
-          throw new RlsQueryFailure(q.name);
-        }
+    const results: Record<string, { rows: Array<Record<string, unknown>> }> = {};
+    for (const q of queries) {
+      if (!/^select\s/i.test(q.sql.trim())) return failReport(mode, ['read-only-violation']);
+      try {
+        results[q.name] = await db.query<Record<string, unknown>>(q.sql, q.params);
+      } catch {
+        // Classified code only; the ROLLBACK in the outer catch closes the
+        // aborted transaction cleanly and the error is rethrown so the outer
+        // catch keeps `query:<name>`.
+        throw new RlsQueryFailure(q.name);
       }
-      const bool = (v: unknown) => v === true;
-      const str = (v: unknown) => String(v ?? '');
-      return classifyRlsReport({
-        mode,
-        roleAttrs: (results['role-attributes']?.rows[0] as never) ?? null,
-        ownedTables: (results['table-ownership']?.rows ?? []).map(r => str(r.table_name)),
-        rlsRows: (results['rls-flags']?.rows ?? []).map(r => ({
-          table_name: str(r.table_name), rls_enabled: bool(r.rls_enabled), rls_forced: bool(r.rls_forced),
-        })),
-        grantRows: (results['grants']?.rows ?? []).map(r => ({
-          table_name: str(r.table_name), sel: bool(r.sel), ins: bool(r.ins), upd: bool(r.upd), del: bool(r.del),
-        })),
-        schemaRow: results['schema-privileges']?.rows[0] as never ?? null,
-        rowSecurityRows: results['row-security-active']
-          ? (results['row-security-active'].rows ?? []).map(r => ({ table_name: str(r.table_name), active: bool(r.active) }))
-          : null,
-        errors: [],
-      });
+    }
+    const bool = (v: unknown) => v === true;
+    const str = (v: unknown) => String(v ?? '');
+    const report = classifyRlsReport({
+      mode,
+      roleAttrs: (results['role-attributes']?.rows[0] as never) ?? null,
+      ownedTables: (results['table-ownership']?.rows ?? []).map(r => str(r.table_name)),
+      rlsRows: (results['rls-flags']?.rows ?? []).map(r => ({
+        table_name: str(r.table_name), rls_enabled: bool(r.rls_enabled), rls_forced: bool(r.rls_forced),
+      })),
+      grantRows: (results['grants']?.rows ?? []).map(r => ({
+        table_name: str(r.table_name), sel: bool(r.sel), ins: bool(r.ins), upd: bool(r.upd), del: bool(r.del),
+      })),
+      schemaRow: results['schema-privileges']?.rows[0] as never ?? null,
+      rowSecurityRows: results['row-security-active']
+        ? (results['row-security-active'].rows ?? []).map(r => ({ table_name: str(r.table_name), active: bool(r.active) }))
+        : null,
+      errors: [],
     });
+    try {
+      await db.query('COMMIT');
+    } catch {
+      // A read-only transaction of bare SELECTs can only fail COMMIT if the
+      // connection died — a connectivity-level failure.
+      return failReport(mode, ['connect']);
+    }
+    return report;
   } catch (e) {
-    // `connect` only for connection/begin failures. A verification-query
-    // failure reaches this catch as a classified RlsQueryFailure (the driver
-    // rolled back and rethrew it) and keeps its `query:<name>` code; everything
-    // else (connection refused, auth failure, BEGIN failure, aborted COMMIT)
-    // collapses to `connect`. No driver message, URL, role or PII is ever
-    // included in the report.
+    // Best-effort rollback. A read-only transaction of bare SELECTs rolls
+    // back cleanly even after a check-query failure (aborted transaction);
+    // if the connection itself is gone the ROLLBACK fails silently.
+    await db.query('ROLLBACK').catch(() => undefined);
+    // `query:<name>` only for verification-query failures; everything else
+    // (connection refused, auth failure, BEGIN failure, COMMIT failure,
+    // dropped connection) collapses to `connect`. No driver message, URL,
+    // role or PII is ever included in the report.
     if (e instanceof RlsQueryFailure) return failReport(mode, [e.code]);
     return failReport(mode, ['connect']);
   } finally {
