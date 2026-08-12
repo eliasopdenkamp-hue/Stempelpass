@@ -166,6 +166,65 @@ test('stamp without a client idempotency key never replays and stores a fresh un
   expect(pool.queries.some(q => q.sql.includes('from stamp_events'))).toBe(false);
 });
 
+test('publicCard aliases every cards column snake_case→camelCase (no select *) so ruleId/stampCount reach the follow-up queries', async () => {
+  const pool = new FakePool([
+    [], // begin
+    [], // set_config
+    [{ id: 'card-1', tenantId: TENANT, customerId: CUSTOMER, publicTokenHash: 'a'.repeat(64), status: 'active', stampCount: 3, revision: 2, ruleId: RULE, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' }], // cards select -> camelCase row
+    [{ cardTitle: 'Café', cardText: 'Treuekarte', primaryColor: '#123456', secondaryColor: '#ffffff', version: 1 }], // branding select
+    [{ id: RULE, tenantId: TENANT, name: 'Regel', stampsRequired: 11, rewardTitle: '1 Monat gratis', rewardDescription: '', active: true, version: 1 }], // rule select
+    [{ id: 'reward-1', status: 'issued', issuedAt: null, redeemedAt: null }], // rewards select
+    [], // commit
+  ]);
+  const repo = new CardRepository(pool);
+  const result = await repo.publicCard(TENANT, 'a'.repeat(64));
+  expect(result).not.toBeNull();
+  // The cards query must enumerate the columns with camelCase aliases — a future
+  // `select *` returns snake_case keys and breaks ruleId/stampCount (UNDEFINED_VALUE).
+  const cardsSelect = pool.queries.find(q => q.sql.includes('from cards'));
+  expect(cardsSelect?.sql).toContain('tenant_id as "tenantId"');
+  expect(cardsSelect?.sql).toContain('customer_id as "customerId"');
+  expect(cardsSelect?.sql).toContain('public_token_hash as "publicTokenHash"');
+  expect(cardsSelect?.sql).toContain('stamp_count as "stampCount"');
+  expect(cardsSelect?.sql).toContain('rule_id as "ruleId"');
+  expect(cardsSelect?.sql).toContain('created_at as "createdAt"');
+  expect(cardsSelect?.sql).toContain('updated_at as "updatedAt"');
+  expect(cardsSelect?.sql).not.toMatch(/select \*/);
+  // The rule lookup is driven by the aliased ruleId — proving the wiring works.
+  const ruleSelect = pool.queries.find(q => q.sql.includes('from stamp_rules'));
+  expect(ruleSelect?.params).toEqual([RULE, TENANT]);
+  expect(result?.card.stampCount).toBe(3);
+  expect(result?.card.ruleId).toBe(RULE);
+  expect(result?.rule?.stampsRequired).toBe(11);
+  expect(result?.reward?.status).toBe('issued');
+  expect(pool.queries.some(q => q.sql === 'commit')).toBe(true);
+});
+
+test('findByPublicTokenHash aliases every cards column snake_case→camelCase (no select *)', async () => {
+  const pool = new FakePool([
+    [], // begin
+    [], // set_config
+    [{ id: 'card-1', tenantId: TENANT, customerId: CUSTOMER, publicTokenHash: 'a'.repeat(64), status: 'active', stampCount: 0, revision: 1, ruleId: RULE, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' }], // cards select -> camelCase row
+    [], // commit
+  ]);
+  const repo = new CardRepository(pool);
+  const card = await repo.findByPublicTokenHash(TENANT, 'a'.repeat(64));
+  expect(card).not.toBeNull();
+  const cardsSelect = pool.queries.find(q => q.sql.includes('from cards'));
+  expect(cardsSelect?.sql).toContain('tenant_id as "tenantId"');
+  expect(cardsSelect?.sql).toContain('customer_id as "customerId"');
+  expect(cardsSelect?.sql).toContain('public_token_hash as "publicTokenHash"');
+  expect(cardsSelect?.sql).toContain('stamp_count as "stampCount"');
+  expect(cardsSelect?.sql).toContain('rule_id as "ruleId"');
+  expect(cardsSelect?.sql).toContain('created_at as "createdAt"');
+  expect(cardsSelect?.sql).toContain('updated_at as "updatedAt"');
+  expect(cardsSelect?.sql).not.toMatch(/select \*/);
+  expect(cardsSelect?.params).toEqual([TENANT, 'a'.repeat(64), 'active']);
+  expect(card?.ruleId).toBe(RULE);
+  expect(card?.stampCount).toBe(0);
+  expect(pool.queries.some(q => q.sql === 'commit')).toBe(true);
+});
+
 test('redeem returns only rewardId and status, never the full reward row', async () => {
   const pool = new FakePool([
     [], // begin
