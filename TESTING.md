@@ -175,9 +175,9 @@ in `src/rls-verify.ts`:
 - `resolveRlsEnv` pins the explicit opt-in: only `RLS_VERIFY_DATABASE_URL`
   (no `DATABASE_URL` fallback); missing/blank → `RLS_VERIFY_DATABASE_URL_REQUIRED`.
 
-`tests/migrations.test.ts` (12 tests, no database) pins the migration path the
+`tests/migrations.test.ts` (13 tests, no database) pins the migration path the
 runner in `src/db.ts` applies: exactly `001_init.sql` …
-`010_membership_mfa_resolver.sql`, runner-compatible filenames
+`011_card_soft_delete.sql`, runner-compatible filenames
 (`^\d{3}_[a-z0-9_]+\.sql`), contiguous unique numeric prefixes, that 007
 constrains a table/column created by earlier migrations, and that 008 defines
 the minimal-privilege resolver function (SECURITY DEFINER, fixed
@@ -203,7 +203,10 @@ contract and fail-closed behavior (exactly `select
 public.membership_mfa_required($1) as required`, never a raw
 `tenant_memberships` read or `bool_or`; missing row / NULL →
 `MFA_BOOTSTRAP_UNVERIFIED` → `INVALID_CREDENTIALS`; `required=true` takes
-the MFA gate) live in `tests/http-contract.test.ts`. Run:
+the MFA gate) live in `tests/http-contract.test.ts`. 011 is pinned to the
+soft-delete column only: exactly `alter table cards add column
+deleted_at timestamptz;` (analog `customers.deleted_at` from 001), with no
+index, policy, function, grant or FORCE change. Run:
 
 ```sh
 bun test tests/rls-verify.test.ts tests/migrations.test.ts tests/entry-point-rls.test.ts tests/sessions-rls.test.ts
@@ -263,6 +266,45 @@ modifies anything. Full contract and the current blocker (no separate
 non-owner app role exists in this workspace yet → no end-to-end run, no unsafe
 workaround) are documented in `RLS_AUTH_P1.md` Teil C.
 
+## DSGVO delete routes and cleanup CLI (`db:cleanup`)
+
+The soft-delete flows (BACKUP_RUNBOOK.md §3, migration 011) are covered DB-free:
+
+- **Repository** (`tests/repository.test.ts`): `deleteCard` soft-deletes exactly
+  one card (`status='inactive'`, `deleted_at=now()`, guarded by
+  `deleted_at is null`, returns only the id, never a destructive DELETE);
+  `deleteCustomer` runs cards-then-customer (FK order) in one tenant
+  transaction and documents the `unique(tenant_id, external_ref)` no-reuse
+  decision; `deleteTenant` soft-deletes cards → customers → `tenants.status=
+  'inactive'` (no hard deletes, audit/users/sessions untouched);
+  `cleanupExpiredSessions(tenantId|null)` deletes expired sessions
+  (`revoked_at is null and expires_at <= now()`), tenant-restricted with
+  tenant context when a tenant id is given, global operator sweep when null;
+  `publicCard`/`findByPublicTokenHash` never find soft-deleted cards
+  (`deleted_at is null` filter).
+- **Routes** (`tests/http-contract.test.ts`): `DELETE
+  /api/tenants/:tenantId/cards/:cardId` and `.../customers/:customerId` are
+  owner+admin only, `DELETE /api/tenants/:tenantId` is owner only; all
+  mutating (CSRF required), all return the minimal `{deleted:true,id}` ack —
+  never full rows; staff → 403 FORBIDDEN, no session → 401, wrong CSRF →
+  400 CSRF_INVALID, already-deleted → 404 CARD_NOT_FOUND/CUSTOMER_NOT_FOUND/
+  TENANT_NOT_FOUND.
+- **Cleanup CLI** (`tests/cleanup.test.ts`, `bun run db:cleanup`,
+  `src/cleanup.ts`): `VERCEL=1` hard block (`CLEANUP_NOT_ALLOWED_ON_VERCEL`),
+  `CLEANUP_TENANT_ID` UUID validation, the operator-role guard
+  (`CLEANUP_ROLE_NOT_OPERATOR` when the connected role is not the
+  table-owning role — the app runtime role can never run it), the retention
+  constants (`CARD_INACTIVITY_RETENTION = '12 months'`,
+  `AUDIT_RETENTION = '24 months'` — Default-Entwurf, Owner-Freigabe offen),
+  card-only inactivity soft-delete by default and customers only with
+  `CLEANUP_DELETE_INACTIVE_CUSTOMERS=1` (FK order), audit rows counted but
+  NEVER deleted (append-only), anonymized stdout, advisory lock `742003`,
+  rollback + exit 1 on failure. Run:
+
+```sh
+bun test tests/cleanup.test.ts tests/repository.test.ts tests/http-contract.test.ts tests/migrations.test.ts tests/production-preflight.test.ts tests/server-migrations.test.ts
+```
+
 ## Production preflight (`bun run production-preflight`)
 
 `src/production-preflight.ts` is a static, read-only, **DB-free** gate to run
@@ -294,7 +336,7 @@ What it checks (booleans/classified values only, never env values):
 | | Credential mode: keyless external-account (env JSON or `GOOGLE_APPLICATION_CREDENTIALS` file) or service-account fallback (JSON, split email+key, or ADC file) | `GOOGLE_CREDENTIALS_REQUIRED`, `GOOGLE_EXTERNAL_ACCOUNT_JSON_INVALID`, `GOOGLE_EXTERNAL_ACCOUNT_IMPERSONATION_REQUIRED`, `GOOGLE_APPLICATION_CREDENTIALS_UNREADABLE`, `GOOGLE_APPLICATION_CREDENTIALS_INVALID`, `GOOGLE_SERVICE_ACCOUNT_JSON_INVALID` |
 | MFA | Only when `MFA_ENCRYPTION_KEY` is set: must be 64-hex or 32-byte base64 (mirrors `src/mfa.ts`) | `MFA_ENCRYPTION_KEY_INVALID` |
 | Communication | Only when all five `EMAIL_SMTP_*` values are set: `COMMUNICATION_HASH_SECRET` ≥ 32 chars | `COMMUNICATION_HASH_SECRET_REQUIRED` |
-| Migrations | Exact `001_init.sql` … `010_membership_mfa_resolver.sql` set, contiguous, runner-compatible names (filesystem only) | `MIGRATIONS_DIR_UNREADABLE`, `MIGRATIONS_INCOMPLETE` |
+| Migrations | Exact `001_init.sql` … `011_card_soft_delete.sql` set, contiguous, runner-compatible names (filesystem only) | `MIGRATIONS_DIR_UNREADABLE`, `MIGRATIONS_INCOMPLETE` |
 | Vercel/Node | `api/index.ts` exists and imports `fetchHandler` from `../src/server.js` (ESM-resolvable — Node cannot load `.ts` or extensionless specifiers from the compiled function package); `vercel.json` with NO `functions.runtime` (platform rejects it; Node 24.x is project-managed), `fra1`, rewrite to `/api/index`; `package.json` with `start` and `build` scripts | `ENTRY_POINT_MISSING`, `ENTRY_POINT_INVALID`, `VERCEL_CONFIG_MISSING`, `VERCEL_CONFIG_INVALID`, `VERCEL_RUNTIME_INLINE_REJECTED`, `VERCEL_REGION_INVALID`, `VERCEL_REWRITE_MISSING`, `PACKAGE_JSON_MISSING`, `PACKAGE_JSON_INVALID`, `START_SCRIPT_MISSING`, `BUILD_SCRIPT_MISSING` |
 
 Safety contract (pinned by `tests/production-preflight.test.ts`, 40 tests, no

@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "db:migrate": "bun run src/migrate.ts",
     "db:seed-pilot": "bun run src/seed-pilot.ts",
+    "db:cleanup": "bun run src/cleanup.ts",
     "rls-verify": "bun run src/rls-verify.ts",
     "production-preflight": "bun run src/production-preflight.ts"
   },

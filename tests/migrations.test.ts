@@ -27,6 +27,7 @@ const EXPECTED = [
   '008_entry_point_resolver.sql',
   '009_sessions_rls_and_audit_split.sql',
   '010_membership_mfa_resolver.sql',
+  '011_card_soft_delete.sql',
 ];
 
 test('migration files: exact expected set, runner-compatible names, stable order', async () => {
@@ -259,6 +260,26 @@ test('010 only creates the resolver function — no table/policy/FORCE changes',
   // No GRANT/REVOKE other than the function-level EXECUTE controls.
   expect(stmts).not.toMatch(/grant select|grant insert|grant update|grant delete|grant all on table/i);
   expect(stmts).not.toMatch(/revoke all on table/i);
+});
+
+test('011 adds cards.deleted_at only — soft-delete column, no other schema change', async () => {
+  const m001 = await readFile(join(MIGRATIONS_DIR, '001_init.sql'), 'utf8');
+  const m011 = await readFile(join(MIGRATIONS_DIR, '011_card_soft_delete.sql'), 'utf8');
+  // cards exists (001) and had no deleted_at before 011.
+  expect(m001).toMatch(/create table cards/);
+  expect(m001).toMatch(/create table customers[\s\S]*deleted_at timestamptz/);
+  expect(m001).not.toMatch(/create table cards[\s\S]*deleted_at/);
+  // 011 adds the soft-delete column (analog customers.deleted_at).
+  expect(m011).toMatch(/alter table cards add column deleted_at timestamptz/);
+  // Statements only: exactly ONE schema change, nothing else (no index,
+  // no policy, no function, no GRANT/REVOKE, no FORCE RLS).
+  const stmts = m011.replace(/^--.*$/gm, '').trim();
+  expect(stmts).toMatch(/^alter table cards add column deleted_at timestamptz;$/);
+  expect(m011).not.toMatch(/create index/i);
+  expect(m011).not.toMatch(/create policy/i);
+  expect(m011).not.toMatch(/create or replace function/i);
+  expect(m011).not.toMatch(/grant|revoke/i);
+  expect(m011).not.toMatch(/force row level security/i);
 });
 
 /* ------------------------------------------------------------------ *

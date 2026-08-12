@@ -10,6 +10,8 @@ export interface RewardView { id: string; status: 'issued' | 'redeemed'; }
 export type CreatedCard = Pick<Card, 'id' | 'ruleId' | 'stampCount' | 'revision'>;
 /** Strictly minimized redeem result; never a full rewards row. */
 export interface RedeemResult { rewardId: string; status: 'issued' | 'redeemed'; }
+/** Minimal soft-delete acknowledgement: only the deleted entity id, never a full row. */
+export interface DeleteResult { id: string; }
 /**
  * Strictly minimized stamp result. The normal and the idempotency-replay path
  * share this exact shape: {card:{id,stampCount,revision}}, an optional
@@ -52,8 +54,8 @@ export class CardRepository {
     try { await db.query('begin'); await db.query("select set_config('app.user_id', $1, true)",[userId]); const value=await work(db); await db.query('commit'); return value; }
     catch(e){ try { await db.query('rollback'); } catch {} throw e; } finally { db.release(); }
   }
-  async findByPublicTokenHash(tenantId:string, hash:string):Promise<Card|null> { return this.transaction(tenantId,async db=>(await db.query<Card>('select id, tenant_id as "tenantId", customer_id as "customerId", public_token_hash as "publicTokenHash", status, stamp_count as "stampCount", revision, rule_id as "ruleId", created_at as "createdAt", updated_at as "updatedAt" from cards where tenant_id=$1 and public_token_hash=$2 and status=$3',[tenantId,hash,'active'])).rows[0]??null); }
-  async publicCard(tenantId:string, hash:string):Promise<{card:Card;branding:Branding|null;rule:StampRule|null;reward:PublicReward|null}|null> { return this.transaction(tenantId,async db=>{ const c=(await db.query<Card>('select id, tenant_id as "tenantId", customer_id as "customerId", public_token_hash as "publicTokenHash", status, stamp_count as "stampCount", revision, rule_id as "ruleId", created_at as "createdAt", updated_at as "updatedAt" from cards where tenant_id=$1 and public_token_hash=$2 and status=$3',[tenantId,hash,'active'])).rows[0]; if(!c) return null; const branding=(await db.query<Branding>('select card_title as "cardTitle",card_text as "cardText",primary_color as "primaryColor",secondary_color as "secondaryColor",version from tenant_branding where tenant_id=$1',[tenantId])).rows[0] ?? null; const rule=(await db.query<StampRule>('select id,tenant_id as "tenantId",name,stamps_required as "stampsRequired",reward_title as "rewardTitle",reward_description as "rewardDescription",active,version from stamp_rules where id=$1 and tenant_id=$2',[c.ruleId,tenantId])).rows[0] ?? null; const reward=(await db.query<PublicReward>('select id, status, issued_at as "issuedAt", redeemed_at as "redeemedAt" from rewards where tenant_id=$1 and card_id=$2 and status=$3',[tenantId,c.id,'issued'])).rows[0] ?? null; return {card:c,branding,rule,reward}; }); }
+  async findByPublicTokenHash(tenantId:string, hash:string):Promise<Card|null> { return this.transaction(tenantId,async db=>(await db.query<Card>('select id, tenant_id as "tenantId", customer_id as "customerId", public_token_hash as "publicTokenHash", status, stamp_count as "stampCount", revision, rule_id as "ruleId", created_at as "createdAt", updated_at as "updatedAt" from cards where tenant_id=$1 and public_token_hash=$2 and status=$3 and deleted_at is null',[tenantId,hash,'active'])).rows[0]??null); }
+  async publicCard(tenantId:string, hash:string):Promise<{card:Card;branding:Branding|null;rule:StampRule|null;reward:PublicReward|null}|null> { return this.transaction(tenantId,async db=>{ const c=(await db.query<Card>('select id, tenant_id as "tenantId", customer_id as "customerId", public_token_hash as "publicTokenHash", status, stamp_count as "stampCount", revision, rule_id as "ruleId", created_at as "createdAt", updated_at as "updatedAt" from cards where tenant_id=$1 and public_token_hash=$2 and status=$3 and deleted_at is null',[tenantId,hash,'active'])).rows[0]; if(!c) return null; const branding=(await db.query<Branding>('select card_title as "cardTitle",card_text as "cardText",primary_color as "primaryColor",secondary_color as "secondaryColor",version from tenant_branding where tenant_id=$1',[tenantId])).rows[0] ?? null; const rule=(await db.query<StampRule>('select id,tenant_id as "tenantId",name,stamps_required as "stampsRequired",reward_title as "rewardTitle",reward_description as "rewardDescription",active,version from stamp_rules where id=$1 and tenant_id=$2',[c.ruleId,tenantId])).rows[0] ?? null; const reward=(await db.query<PublicReward>('select id, status, issued_at as "issuedAt", redeemed_at as "redeemedAt" from rewards where tenant_id=$1 and card_id=$2 and status=$3',[tenantId,c.id,'issued'])).rows[0] ?? null; return {card:c,branding,rule,reward}; }); }
   async createCard(tenantId:string, customerId:string, ruleId:string, tokenHash:string):Promise<CreatedCard>{ if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(customerId)) throw new Error('CUSTOMER_NOT_FOUND'); if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(ruleId)) throw new Error('RULE_NOT_FOUND'); return this.transaction(tenantId,async db=>{ const t=await db.query<{customer_limit:number}>('select customer_limit from tenants where id=$1 and status=$2 for update',[tenantId,'active']); if(!t.rows[0]) throw new Error('TENANT_NOT_FOUND'); const customer=await db.query('select id from customers where id=$1 and tenant_id=$2 and status=$3 and deleted_at is null',[customerId,tenantId,'active']); if(!customer.rows[0]) throw new Error('CUSTOMER_NOT_FOUND'); const used=await db.query<{count:string}>('select count(distinct customer_id) from cards where tenant_id=$1 and status=$2',[tenantId,'active']); if(Number(used.rows[0]?.count??0)>=t.rows[0].customer_limit) throw new Error('CUSTOMER_LIMIT_REACHED'); const rule=await db.query('select id from stamp_rules where id=$1 and tenant_id=$2 and active=true',[ruleId,tenantId]); if(!rule.rows[0]) throw new Error('RULE_NOT_FOUND'); const card=await db.query<CreatedCard>('insert into cards(tenant_id,customer_id,rule_id,public_token_hash) values($1,$2,$3,$4) returning id, rule_id as "ruleId", stamp_count as "stampCount", revision',[tenantId,customerId,ruleId,tokenHash]); return card.rows[0]; }); }
   async capacity(tenantId:string){return this.transaction(tenantId,async db=>{const t=await db.query<{plan_code:string,customer_limit:number}>('select plan_code,customer_limit from tenants where id=$1',[tenantId]);if(!t.rows[0])throw new Error('TENANT_NOT_FOUND');const used=await db.query<{count:string}>('select count(distinct customer_id) from cards where tenant_id=$1 and status=$2',[tenantId,'active']);const n=Number(used.rows[0]?.count??0);return {plan:t.rows[0].plan_code,limit:t.rows[0].customer_limit,used:n,remaining:Math.max(0,t.rows[0].customer_limit-n)};});}
   async configurePilot(tenantId:string, actorUserId:string, input:{planCode:'up_to_500'|'up_to_1000';cardTitle:string;cardText:string;primaryColor:string;secondaryColor:string;iconAssetId?:string;logoAssetId?:string;stampsRequired:number;rewardTitle:string;rewardDescription:string}) {
@@ -106,6 +108,48 @@ export class CardRepository {
   async revokeSessions(userId:string,exceptHash?:string){return this.userTransaction(userId,async db=>{await db.query('update sessions set revoked_at=now() where user_id=$1 and revoked_at is null and ($2 is null or token_hash<>$2)',[userId,exceptHash??null]);})}
   /** Revoke one session by token hash (logout/rotation). Runs under app.user_id RLS context. */
   async revokeSession(userId:string,tokenHash:string){return this.userTransaction(userId,async db=>{await db.query('update sessions set revoked_at=now() where token_hash=$1',[tokenHash]);})}
+  /**
+   * Soft-delete a card (DSGVO Art. 17, BACKUP_RUNBOOK.md §3.2): the card is
+   * hidden everywhere (status='inactive' + deleted_at) but NEVER hard-deleted —
+   * stamp_events/rewards stay as append-only history. The public lookups
+   * (publicCard / findByPublicTokenHash) filter `deleted_at is null`, so a
+   * deleted card's public URL and wallet JSON resolve to 404. Already-deleted
+   * or foreign cards yield CARD_NOT_FOUND (single UPDATE guarded by
+   * `deleted_at is null`), never a destructive delete.
+   */
+  async deleteCard(tenantId:string, cardId:string):Promise<DeleteResult>{return this.transaction(tenantId,async db=>{const r=await db.query<{id:string}>("update cards set status='inactive',deleted_at=now(),updated_at=now() where tenant_id=$1 and id=$2 and deleted_at is null returning id",[tenantId,cardId]);if(!r.rows[0])throw new Error('CARD_NOT_FOUND');return {id:r.rows[0].id};});}
+  /**
+   * Soft-delete a customer and all of its active cards (DSGVO Art. 17,
+   * BACKUP_RUNBOOK.md §3.3). FK-Reihenfolge: zuerst die Karten des Kunden
+   * (Kinder), dann die Kundenzeile (Eltern) — alles in einer Tenant-
+   * Transaktion. Keine hard deletes.
+   *
+   * Entscheidung aus dem Runbook (§3.3, offener Punkt §5 Nr. 10), hier als
+   * Kommentar festgehalten: unique(tenant_id, external_ref) bleibt bestehen —
+   * eine soft-gelöschte Zeile behält ihr external_ref und wird NICHT
+   * wiederverwendet (kein Leeren des Felds, kein partieller Unique-Index).
+   */
+  async deleteCustomer(tenantId:string, customerId:string):Promise<DeleteResult>{return this.transaction(tenantId,async db=>{await db.query("update cards set status='inactive',deleted_at=now(),updated_at=now() where tenant_id=$1 and customer_id=$2 and deleted_at is null",[tenantId,customerId]);const r=await db.query<{id:string}>("update customers set status='inactive',deleted_at=now(),updated_at=now() where tenant_id=$1 and id=$2 and deleted_at is null returning id",[tenantId,customerId]);if(!r.rows[0])throw new Error('CUSTOMER_NOT_FOUND');return {id:r.rows[0].id};});}
+  /**
+   * Deactivate a tenant (Vertragsende, BACKUP_RUNBOOK.md §3.4): FK-Reihenfolge
+   * Karten → Kunden soft-deleten, dann tenants.status='inactive'. Keine hard
+   * deletes: stamp_events/rewards bleiben als Belege, audit_log ist append-only
+   * und wird nie gelöscht, users sind global (tenant-übergreifend) und werden
+   * nie mitgelöscht. Die App-Route erlaubt nur owner.
+   */
+  async deleteTenant(tenantId:string):Promise<DeleteResult>{return this.transaction(tenantId,async db=>{await db.query("update cards set status='inactive',deleted_at=now(),updated_at=now() where tenant_id=$1 and deleted_at is null",[tenantId]);await db.query("update customers set status='inactive',deleted_at=now(),updated_at=now() where tenant_id=$1 and deleted_at is null",[tenantId]);const r=await db.query<{id:string}>("update tenants set status='inactive',updated_at=now() where id=$1 and status='active' returning id",[tenantId]);if(!r.rows[0])throw new Error('TENANT_NOT_FOUND');return {id:r.rows[0].id};});}
+  /**
+   * Delete expired sessions (`revoked_at is null and expires_at <= now()`),
+   * returning how many were deleted. Operator-only by design: the sessions RLS
+   * (migration 009) is user-scoped, so a tenant context never sees rows of
+   * other users — the normal caller is the cleanup CLI (src/cleanup.ts)
+   * running as the table-owning operator role, which bypasses RLS. When
+   * tenantId is provided the delete is additionally restricted to that
+   * tenant's sessions (sessions.tenant_id is nullable and the login/rotate
+   * paths currently leave it unset, so the global run is the usual operator
+   * sweep); null = all tenants.
+   */
+  async cleanupExpiredSessions(tenantId:string|null):Promise<number>{const db=await this.pool.connect();try{await db.query('begin');if(tenantId)await db.query("select set_config('app.tenant_id', $1, true)",[tenantId]);const r=tenantId?await db.query<{id:string}>('delete from sessions where tenant_id=$1 and revoked_at is null and expires_at<=now() returning id',[tenantId]):await db.query<{id:string}>('delete from sessions where revoked_at is null and expires_at<=now() returning id');await db.query('commit');return r.rows.length;}catch(e){try{await db.query('rollback');}catch{}throw e;}finally{db.release();}}
 }
 export interface AuditEvent { tenantId?:string;actorUserId?:string;action:string;entityType:string;entityId?:string;metadata?:Record<string,unknown> }
 export async function appendAudit(db:DbClient,event:AuditEvent){await db.query('insert into audit_log(tenant_id,actor_user_id,action,entity_type,entity_id,metadata) values($1,$2,$3,$4,$5,$6)',[event.tenantId??null,event.actorUserId??null,event.action,event.entityType,event.entityId??null,JSON.stringify(event.metadata??{})]);}

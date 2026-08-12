@@ -324,3 +324,184 @@ test('configurePilot rejects an invalid configuration before any DB access', asy
   })).rejects.toThrow('INVALID_PILOT_CONFIGURATION');
   expect(pool.queries).toHaveLength(0);
 });
+
+// ---------------------------------------------------------------------------
+// DSGVO soft-delete flows (BACKUP_RUNBOOK.md §3.2–§3.5, migration 011)
+// ---------------------------------------------------------------------------
+const CARD_ID = '77777777-7777-4777-8777-777777777777';
+
+test('deleteCard soft-deletes exactly one card: status inactive + deleted_at, guarded by deleted_at is null', async () => {
+  const pool = new FakePool([
+    [], // begin
+    [], // set_config app.tenant_id
+    [{ id: CARD_ID }], // update cards returning id
+    [], // commit
+  ]);
+  const repo = new CardRepository(pool);
+  const result = await repo.deleteCard(TENANT, CARD_ID);
+  expect(result).toEqual({ id: CARD_ID });
+  expectNoInternalFields(result);
+  const update = pool.queries.find(q => q.sql.startsWith('update cards'));
+  expect(update?.sql).toContain("status='inactive'");
+  expect(update?.sql).toContain('deleted_at=now()');
+  expect(update?.sql).toContain('deleted_at is null');
+  expect(update?.sql).toContain('returning id');
+  expect(update?.params).toEqual([TENANT, CARD_ID]);
+  expect(update?.sql).not.toContain('delete from cards');
+  expect(pool.queries.some(q => q.sql === 'commit')).toBe(true);
+});
+
+test('deleteCard on an already-deleted or foreign card yields CARD_NOT_FOUND (never a destructive delete)', async () => {
+  const pool = new FakePool([
+    [], // begin
+    [], // set_config
+    [], // update cards -> no row (already deleted / other tenant)
+  ]);
+  const repo = new CardRepository(pool);
+  await expect(repo.deleteCard(TENANT, CARD_ID)).rejects.toThrow('CARD_NOT_FOUND');
+  expect(pool.queries.some(q => q.sql.startsWith('delete from cards'))).toBe(false);
+  expect(pool.queries.some(q => q.sql === 'rollback')).toBe(true);
+});
+
+test('deleteCustomer soft-deletes the customer AND its cards, FK order cards-first, in one tenant transaction', async () => {
+  const pool = new FakePool([
+    [], // begin
+    [], // set_config app.tenant_id
+    [], // update cards (children) of the customer
+    [{ id: CUSTOMER }], // update customers returning id
+    [], // commit
+  ]);
+  const repo = new CardRepository(pool);
+  const result = await repo.deleteCustomer(TENANT, CUSTOMER);
+  expect(result).toEqual({ id: CUSTOMER });
+  const updates = pool.queries.filter(q => q.sql.startsWith('update'));
+  expect(updates.length).toBe(2);
+  // FK-Reihenfolge: Karten (Kinder) vor Kunden (Eltern).
+  expect(updates[0]?.sql.startsWith('update cards')).toBe(true);
+  expect(updates[1]?.sql.startsWith('update customers')).toBe(true);
+  expect(updates[0]?.params).toEqual([TENANT, CUSTOMER]);
+  expect(updates[0]?.sql).toContain('customer_id=$2');
+  expect(updates[0]?.sql).toContain('deleted_at is null');
+  expect(updates[1]?.params).toEqual([TENANT, CUSTOMER]);
+  expect(updates[1]?.sql).toContain("status='inactive'");
+  expect(updates[1]?.sql).toContain('deleted_at is null');
+  expect(updates[1]?.sql).toContain('returning id');
+  // Kein Hard-Delete, kein Reuse-Versuch auf external_ref (Entscheidung §3.3).
+  expect(pool.queries.some(q => q.sql.startsWith('delete from customers'))).toBe(false);
+  expect(pool.queries.some(q => q.sql.includes('external_ref'))).toBe(false);
+  expect(pool.queries.some(q => q.sql === 'commit')).toBe(true);
+});
+
+test('deleteCustomer on a missing/already-deleted customer yields CUSTOMER_NOT_FOUND and rolls back the card update', async () => {
+  const pool = new FakePool([
+    [], // begin
+    [], // set_config
+    [], // update cards (children) -> matched nothing anyway
+    [], // update customers -> no row
+  ]);
+  const repo = new CardRepository(pool);
+  await expect(repo.deleteCustomer(TENANT, CUSTOMER)).rejects.toThrow('CUSTOMER_NOT_FOUND');
+  expect(pool.queries.some(q => q.sql === 'rollback')).toBe(true);
+  expect(pool.queries.some(q => q.sql === 'commit')).toBe(false);
+});
+
+test('deleteTenant soft-deletes cards, then customers, then deactivates the tenant (no hard deletes)', async () => {
+  const pool = new FakePool([
+    [], // begin
+    [], // set_config app.tenant_id
+    [], // update cards of the tenant
+    [], // update customers of the tenant
+    [{ id: TENANT }], // update tenants returning id
+    [], // commit
+  ]);
+  const repo = new CardRepository(pool);
+  const result = await repo.deleteTenant(TENANT);
+  expect(result).toEqual({ id: TENANT });
+  const updates = pool.queries.filter(q => q.sql.startsWith('update'));
+  expect(updates.length).toBe(3);
+  expect(updates[0]?.sql.startsWith('update cards')).toBe(true);
+  expect(updates[0]?.sql).not.toContain('customer_id='); // tenant-wide, not per customer
+  expect(updates[1]?.sql.startsWith('update customers')).toBe(true);
+  expect(updates[2]?.sql.startsWith('update tenants')).toBe(true);
+  expect(updates[2]?.sql).toContain("status='inactive'");
+  expect(updates[2]?.sql).toContain("status='active'"); // only deactivate an active tenant
+  expect(updates[2]?.params).toEqual([TENANT]);
+  for (const u of updates) expect(u?.sql).not.toContain('delete from');
+  // audit_log/users/sessions bleiben unangetastet (append-only / global).
+  expect(pool.queries.some(q => q.sql.includes('audit_log') || q.sql.includes('from users') || q.sql.includes('from sessions'))).toBe(false);
+  expect(pool.queries.some(q => q.sql === 'commit')).toBe(true);
+});
+
+test('deleteTenant on an already-inactive tenant yields TENANT_NOT_FOUND', async () => {
+  const pool = new FakePool([
+    [], // begin
+    [], // set_config
+    [], // update cards
+    [], // update customers
+    [], // update tenants -> no row (already inactive)
+  ]);
+  const repo = new CardRepository(pool);
+  await expect(repo.deleteTenant(TENANT)).rejects.toThrow('TENANT_NOT_FOUND');
+  expect(pool.queries.some(q => q.sql === 'rollback')).toBe(true);
+});
+
+test('cleanupExpiredSessions with a tenant restricts the delete to that tenant and sets tenant context', async () => {
+  const pool = new FakePool([
+    [], // begin
+    [], // set_config app.tenant_id
+    [{ id: 's1' }, { id: 's2' }], // delete returning ids
+    [], // commit
+  ]);
+  const repo = new CardRepository(pool);
+  const count = await repo.cleanupExpiredSessions(TENANT);
+  expect(count).toBe(2);
+  const del = pool.queries.find(q => q.sql.startsWith('delete from sessions'));
+  expect(del?.sql).toContain('tenant_id=$1');
+  expect(del?.sql).toContain('revoked_at is null');
+  expect(del?.sql).toContain('expires_at<=now()');
+  expect(del?.params).toEqual([TENANT]);
+  const tenantContext = pool.queries.findIndex(q => q.sql.includes("set_config('app.tenant_id'"));
+  expect(tenantContext).toBe(1);
+  expect(pool.queries.some(q => q.sql === 'commit')).toBe(true);
+});
+
+test('cleanupExpiredSessions without a tenant runs the global operator sweep (no tenant context, no tenant filter)', async () => {
+  const pool = new FakePool([
+    [], // begin
+    [], // delete returning ids (global)
+    [], // commit
+  ]);
+  const repo = new CardRepository(pool);
+  const count = await repo.cleanupExpiredSessions(null);
+  expect(count).toBe(0);
+  const del = pool.queries.find(q => q.sql.startsWith('delete from sessions'));
+  expect(del?.sql).not.toContain('tenant_id');
+  expect(del?.params).toEqual([]);
+  expect(pool.queries.some(q => q.sql.includes("set_config('app.tenant_id'"))).toBe(false);
+  expect(pool.queries.some(q => q.sql === 'commit')).toBe(true);
+});
+
+test('publicCard and findByPublicTokenHash never find soft-deleted cards (deleted_at is null filter)', async () => {
+  const pool1 = new FakePool([
+    [], // begin
+    [], // set_config
+    [], // cards select -> no row (deleted)
+    [], // commit
+  ]);
+  const repo1 = new CardRepository(pool1);
+  expect(await repo1.publicCard(TENANT, 'a'.repeat(64))).toBeNull();
+  const publicSelect = pool1.queries.find(q => q.sql.includes('from cards'));
+  expect(publicSelect?.sql).toContain('deleted_at is null');
+
+  const pool2 = new FakePool([
+    [], // begin
+    [], // set_config
+    [], // cards select -> no row (deleted)
+    [], // commit
+  ]);
+  const repo2 = new CardRepository(pool2);
+  expect(await repo2.findByPublicTokenHash(TENANT, 'a'.repeat(64))).toBeNull();
+  const findSelect = pool2.queries.find(q => q.sql.includes('from cards'));
+  expect(findSelect?.sql).toContain('deleted_at is null');
+  expect(findSelect?.params).toEqual([TENANT, 'a'.repeat(64), 'active']);
+});

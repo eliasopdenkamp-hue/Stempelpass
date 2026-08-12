@@ -83,7 +83,7 @@ export const REQUIRED_GRANTS: Readonly<Record<string, readonly ('SELECT' | 'INSE
   users: ['SELECT'],
   sessions: ['SELECT', 'INSERT', 'UPDATE'],
   tenant_memberships: ['SELECT', 'INSERT', 'UPDATE'],
-  customers: ['SELECT'],
+  customers: ['SELECT', 'UPDATE'],
   tenant_branding: ['SELECT', 'INSERT', 'UPDATE'],
   stamp_rules: ['SELECT', 'INSERT'],
   cards: ['SELECT', 'INSERT', 'UPDATE'],

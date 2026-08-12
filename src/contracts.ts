@@ -54,3 +54,12 @@ export function toStaffResponse(value: StaffResponse): StaffResponse { return va
 /** GET /join/:publicKey — unchanged shape, centralized contract. */
 export interface JoinResponse { tenantId: string; joinPath: string; customerLoginRequired: boolean; customerAccountRequired: boolean; }
 export function toJoinResponse(value: JoinResponse): JoinResponse { return value; }
+
+/**
+ * DELETE .../cards/:cardId, .../customers/:customerId, .../tenants/:tenantId —
+ * minimal acknowledgement of a soft-delete: only `deleted:true` and the
+ * deleted entity's id. Never a full row (no customer/tenant/token/timestamp
+ * fields cross the wire).
+ */
+export interface DeleteResponse { deleted: true; id: string; }
+export function toDeleteResponse(result: { id: string }): DeleteResponse { return { deleted: true, id: result.id }; }

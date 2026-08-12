@@ -979,3 +979,165 @@ test('PUT pilot by a staff member is rejected with FORBIDDEN (owner/admin only)'
     expect(pool.queries.some(q => q.sql.includes('insert into tenant_entry_points'))).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// (15) DSGVO delete routes — DELETE cards/customers (owner+admin) and
+// DELETE tenant (owner only); minimal {deleted:true,id} ack, never full rows
+// ---------------------------------------------------------------------------
+const CARD_ID = '77777777-7777-4777-8777-777777777777';
+
+test('DELETE card by an admin soft-deletes and returns only {deleted:true,id}', async () => {
+  const adminSession: (sql: string, params: unknown[]) => unknown[] = (_sql, params) =>
+    params[0] === SESSION_HASH ? [sessionRow({ role: 'admin' })] : [];
+  const pool = new FakePool([
+    ...sessionHandlers(adminSession),
+    { match: contains('update cards set'), rows: [{ id: CARD_ID }] },
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}/cards/${CARD_ID}`, {
+      method: 'DELETE', headers: authedHeaders(),
+    }));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { request_id: string; data: { deleted: boolean; id: string } };
+    expect(Object.keys(body).sort()).toEqual(['data', 'request_id']);
+    expect(body.data).toEqual({ deleted: true, id: CARD_ID });
+    const raw = JSON.stringify(body);
+    expect(raw).not.toContain('customerId');
+    expect(raw).not.toContain('publicTokenHash');
+    expect(raw).not.toContain('stampCount');
+    const update = pool.queries.find(q => q.sql.startsWith('update cards'));
+    expect(update?.sql).toContain("status='inactive'");
+    expect(update?.sql).toContain('deleted_at=now()');
+    expect(update?.sql).toContain('deleted_at is null');
+    expect(update?.params).toEqual([TENANT, CARD_ID]);
+    expect(pool.queries.some(q => q.sql.startsWith('delete from cards'))).toBe(false);
+  });
+});
+
+test('DELETE card by a staff member is rejected with FORBIDDEN (owner/admin only)', async () => {
+  const pool = new FakePool([...sessionHandlers(validSession)]); // default role: staff
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}/cards/${CARD_ID}`, {
+      method: 'DELETE', headers: authedHeaders(),
+    }));
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { data: { error: string } }).data.error).toBe('FORBIDDEN');
+    expect(pool.queries.some(q => q.sql.startsWith('update cards'))).toBe(false);
+  });
+});
+
+test('DELETE card with a wrong CSRF token is rejected (mutating route)', async () => {
+  const pool = new FakePool([...sessionHandlers(validSession)]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}/cards/${CARD_ID}`, {
+      method: 'DELETE', headers: authedHeaders({ 'x-csrf-token': '0'.repeat(64) }),
+    }));
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { data: { error: string } }).data.error).toBe('CSRF_INVALID');
+    expect(pool.queries.some(q => q.sql.startsWith('update cards'))).toBe(false);
+  });
+});
+
+test('DELETE card without a session is rejected with UNAUTHENTICATED', async () => {
+  const pool = new FakePool([...sessionHandlers(validSession)]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}/cards/${CARD_ID}`, {
+      method: 'DELETE',
+      headers: authedHeaders({ cookie: '' }),
+    }));
+    expect(res.status).toBe(401);
+    expect(((await res.json()) as { data: { error: string } }).data.error).toBe('UNAUTHENTICATED');
+  });
+});
+
+test('DELETE card of an already-deleted card yields 404 CARD_NOT_FOUND', async () => {
+  const adminSession: (sql: string, params: unknown[]) => unknown[] = (_sql, params) =>
+    params[0] === SESSION_HASH ? [sessionRow({ role: 'admin' })] : [];
+  const pool = new FakePool([
+    ...sessionHandlers(adminSession),
+    { match: contains('update cards set'), rows: [] }, // no row -> already deleted
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}/cards/${CARD_ID}`, {
+      method: 'DELETE', headers: authedHeaders(),
+    }));
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as { data: { error: string } }).data.error).toBe('CARD_NOT_FOUND');
+  });
+});
+
+test('DELETE customer by an admin soft-deletes the customer and its cards, minimal ack', async () => {
+  const adminSession: (sql: string, params: unknown[]) => unknown[] = (_sql, params) =>
+    params[0] === SESSION_HASH ? [sessionRow({ role: 'admin' })] : [];
+  const pool = new FakePool([
+    ...sessionHandlers(adminSession),
+    { match: contains('update cards set'), rows: [] },
+    { match: contains('update customers set'), rows: [{ id: CUSTOMER }] },
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}/customers/${CUSTOMER}`, {
+      method: 'DELETE', headers: authedHeaders(),
+    }));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: { deleted: boolean; id: string } };
+    expect(body.data).toEqual({ deleted: true, id: CUSTOMER });
+    const updates = pool.queries.filter(q => q.sql.startsWith('update'));
+    expect(updates.length).toBe(2);
+    // FK-Reihenfolge: Karten (Kinder) vor Kunden (Eltern).
+    expect(updates[0]?.sql.startsWith('update cards')).toBe(true);
+    expect(updates[1]?.sql.startsWith('update customers')).toBe(true);
+    expect(pool.queries.some(q => q.sql.startsWith('delete from'))).toBe(false);
+  });
+});
+
+test('DELETE customer by a staff member is rejected with FORBIDDEN', async () => {
+  const pool = new FakePool([...sessionHandlers(validSession)]); // staff
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}/customers/${CUSTOMER}`, {
+      method: 'DELETE', headers: authedHeaders(),
+    }));
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { data: { error: string } }).data.error).toBe('FORBIDDEN');
+    expect(pool.queries.some(q => q.sql.startsWith('update customers'))).toBe(false);
+  });
+});
+
+test('DELETE tenant by the owner deactivates tenant + soft-deletes customers/cards, minimal ack', async () => {
+  const ownerSession: (sql: string, params: unknown[]) => unknown[] = (_sql, params) =>
+    params[0] === SESSION_HASH ? [sessionRow({ role: 'owner' })] : [];
+  const pool = new FakePool([
+    ...sessionHandlers(ownerSession),
+    { match: contains('update cards set'), rows: [] },
+    { match: contains('update customers set'), rows: [] },
+    { match: contains('update tenants set'), rows: [{ id: TENANT }] },
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}`, {
+      method: 'DELETE', headers: authedHeaders(),
+    }));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: { deleted: boolean; id: string } };
+    expect(body.data).toEqual({ deleted: true, id: TENANT });
+    const updates = pool.queries.filter(q => q.sql.startsWith('update'));
+    expect(updates.length).toBe(3);
+    expect(updates[0]?.sql.startsWith('update cards')).toBe(true);
+    expect(updates[1]?.sql.startsWith('update customers')).toBe(true);
+    expect(updates[2]?.sql.startsWith('update tenants')).toBe(true);
+    expect(updates[2]?.sql).toContain("status='inactive'");
+    expect(pool.queries.some(q => q.sql.startsWith('delete from'))).toBe(false);
+  });
+});
+
+test('DELETE tenant by an admin is rejected with FORBIDDEN (owner only)', async () => {
+  const adminSession: (sql: string, params: unknown[]) => unknown[] = (_sql, params) =>
+    params[0] === SESSION_HASH ? [sessionRow({ role: 'admin' })] : [];
+  const pool = new FakePool([...sessionHandlers(adminSession)]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}`, {
+      method: 'DELETE', headers: authedHeaders(),
+    }));
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { data: { error: string } }).data.error).toBe('FORBIDDEN');
+    expect(pool.queries.some(q => q.sql.startsWith('update tenants'))).toBe(false);
+  });
+});

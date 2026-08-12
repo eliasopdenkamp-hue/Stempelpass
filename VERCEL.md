@@ -20,7 +20,7 @@ require exit code `0`. It statically verifies the required environment
 (`DATABASE_URL`, `SESSION_SECRET`, `FRONTEND_ORIGIN`), the configured Google
 credential mode (external-account or service-account fallback),
 `MFA_ENCRYPTION_KEY` only when MFA is active, `COMMUNICATION_HASH_SECRET` only
-when SMTP is active, the exact migration set 001–010 and the Vercel entry
+when SMTP is active, the exact migration set 001–011 and the Vercel entry
 point/Node build wiring — without opening a database connection and without
 printing any secret value. Exit codes and the classified error list are
 documented in `TESTING.md`. The live diagnostics (Neon connectivity,

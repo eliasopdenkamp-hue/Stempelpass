@@ -1,0 +1,13 @@
+-- 011: Soft-delete for cards (DSGVO Art. 17 flows, BACKUP_RUNBOOK.md §3).
+--
+-- cards.deleted_at mirrors customers.deleted_at (001): a soft-deleted card is
+-- set to status='inactive' + deleted_at=now() and must no longer be found by
+-- the public lookups (publicCard / findByPublicTokenHash filter
+-- `deleted_at is null`). There are NO hard deletes anywhere: stamp_events and
+-- rewards stay as append-only history bound to the (soft-deleted) card row.
+--
+-- Decision documented (BACKUP_RUNBOOK.md §3.3 / §5 Nr. 10): the
+-- unique(tenant_id, external_ref) constraint on customers stays as-is — a
+-- soft-deleted customer keeps its external_ref and the reference is NOT
+-- reused after soft-delete (no partial unique index, no ref clearing).
+alter table cards add column deleted_at timestamptz;
