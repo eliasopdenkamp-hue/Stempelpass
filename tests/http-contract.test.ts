@@ -365,7 +365,7 @@ test('login with missing credentials is rejected before any account lookup', asy
 // ---------------------------------------------------------------------------
 // (5) Authenticated card creation — minimal projection, no internals
 // ---------------------------------------------------------------------------
-test('POST cards returns only the minimal created-card projection', async () => {
+test('POST cards returns the minimal projection plus the one-time raw card token', async () => {
   const pool = new FakePool([
     ...sessionHandlers(validSession),
     { match: contains('from tenants'), rows: [{ customer_limit: 500 }] },
@@ -381,9 +381,18 @@ test('POST cards returns only the minimal created-card projection', async () => 
       body: JSON.stringify({ customerId: CUSTOMER, ruleId: RULE }),
     }));
     expect(res.status).toBe(201);
-    const body = (await res.json()) as { data: { card: Record<string, unknown> } };
-    expect(body.data).toEqual({ card: { id: 'card-1', ruleId: RULE, stampCount: 0, revision: 1 } });
+    const body = (await res.json()) as { data: { card: Record<string, unknown>; cardToken: string } };
+    expect(body.data.card).toEqual({ id: 'card-1', ruleId: RULE, stampCount: 0, revision: 1 });
+    // Fresh raw token (32 random bytes, unpadded base64url) — usable as /card/:tenantId/:cardToken.
+    expect(body.data.cardToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expectNoInternalFields(body);
+    // Only the SHA-256 hash of the token may reach the database — never the raw token.
+    const insert = pool.queries.find((q) => q.sql.startsWith('insert into cards'));
+    expect(insert).toBeDefined();
+    const stored = insert!.params[3] as string;
+    expect(stored).toMatch(/^[a-f0-9]{64}$/);
+    expect(stored).not.toBe(body.data.cardToken);
+    expect(JSON.stringify(pool.queries)).not.toContain(body.data.cardToken);
   });
 });
 

@@ -19,9 +19,21 @@ export interface StampResponse {
 }
 export function toStampResponse(result: StampResult): StampResponse { return result; }
 
-/** POST .../cards — minimal projection of the created card. */
-export interface CreateCardResponse { card: CreatedCard; }
-export function toCreateCardResponse(card: CreatedCard): CreateCardResponse { return { card }; }
+/**
+ * POST .../cards — minimal projection of the created card plus the fresh raw
+ * public token. The token is delivered exactly once, only in this 201 response
+ * of the authenticated creation request: it is never logged, never persisted
+ * (only its SHA-256 hash is stored as public_token_hash) and never present in
+ * any public GET response. Clients build the public card URL as
+ * /card/:tenantId/:cardToken (or the JSON equivalent
+ * /api/public/tenants/:tenantId/cards/:cardToken).
+ */
+export interface CreateCardResponse {
+  card: CreatedCard;
+  /** Raw public card token — one-time, authenticated-response-only value. */
+  cardToken: string;
+}
+export function toCreateCardResponse(card: CreatedCard, cardToken: string): CreateCardResponse { return { card, cardToken }; }
 
 /** POST .../rewards/:rewardId/redeem — never a full rewards row. */
 export interface RedeemResponse { rewardId: string; status: 'issued' | 'redeemed'; }

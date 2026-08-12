@@ -73,7 +73,11 @@ Neon `TEST_DATABASE_URL`). It pins the wire contracts end to end:
 - Public card JSON → allowlisted fields only, never `customerId`/`publicTokenHash`.
 - Login success → exactly `{csrfToken, mfaRequired}` + session cookie; login
   failures → always `INVALID_CREDENTIALS` (no internal MFA reason leak).
-- `POST .../cards` → `{card:{id,ruleId,stampCount,revision}}` only.
+- `POST .../cards` → `{card:{id,ruleId,stampCount,revision}, cardToken}`. `cardToken` is the
+  freshly generated raw public token, returned exactly once in this 201 response of the
+  authenticated creation request: never logged, never persisted (only its SHA-256 hash is
+  stored as `public_token_hash`) and never present in public GET responses. Build the public
+  card URL as `/card/:tenantId/:cardToken`.
 - `POST .../cards/:id/stamps` normal and idempotency replay → identical minimal
   `{card, reward?, idempotencyKey?}` payload; replay writes nothing.
 - `POST .../rewards/:id/redeem` → `{rewardId, status}` only.
