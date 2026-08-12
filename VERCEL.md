@@ -98,14 +98,29 @@ is an explicit operator declaration. Order matters:
    DATABASE_URL='postgresql://.../db?sslmode=require' bun run db:migrate
    ```
    Exit `0` = applied. Never run this from the Vercel request path.
-3. **Create the dedicated app role** (owner-side, per `RLS_AUTH_P1.md`) and
+3. **Seed the pilot tenant once, out-of-band** (CLI only — never on the
+   request path; refuses to run when `VERCEL=1`):
+   ```sh
+   DATABASE_URL='postgresql://.../db?sslmode=require' \
+   PILOT_TENANT_SLUG='stempelpass' \
+   PILOT_TENANT_LEGAL_NAME='Stempelpass GmbH' \
+   PILOT_OWNER_EMAIL='owner@example.com' \
+   PILOT_OWNER_PASSWORD='<starkes Passwort, min. 12 Zeichen>' \
+   bun run db:seed-pilot
+   ```
+   Reads only `PILOT_*` variables, hashes the password (scrypt, no
+   plaintext stored/printed), creates tenant + owner + membership (+ optional
+   `PILOT_CUSTOMER_REF` test customer) idempotently under the seed advisory
+   lock and prints only anonymized ids/status. Exit `0` = ok. Full runbook:
+   `PILOT_ONBOARDING.md` ("Einmaliger Pilot-Seed").
+4. **Create the dedicated app role** (owner-side, per `RLS_AUTH_P1.md`) and
    verify RLS/role isolation read-only:
    ```sh
    RLS_VERIFY_DATABASE_URL='postgresql://<app-role>@.../db?sslmode=require' bun run rls-verify
    ```
    Exit `0` = pass. Until the app role exists, RLS enforcement cannot be
    exercised by the live API (documented blocker, `RLS_AUTH_P1.md`).
-4. **Declare pilot readiness**: set `PILOT_READY=1` in the production
+5. **Declare pilot readiness**: set `PILOT_READY=1` in the production
    environment (redeploy applies it). `/health` then reports
    `{"status":"ready"}`; before that it honestly reports `{"status":"not_ready"}`
    even though the function is reachable.

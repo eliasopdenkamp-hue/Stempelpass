@@ -214,6 +214,35 @@ security properties. Route-level `/join` contracts (200 shape, 404,
 no-DB-on-malformed-key, INTERNAL_ERROR sanitization) live in
 `tests/http-contract.test.ts`.
 
+## Pilot seed tests
+
+`tests/seed-pilot.test.ts` (no database) pins the one-time pilot seed CLI
+(`bun run db:seed-pilot`, `src/seed-pilot.ts`):
+
+- **Env validation** — required `PILOT_TENANT_SLUG`/`PILOT_TENANT_LEGAL_NAME`/
+  `PILOT_OWNER_EMAIL`/`PILOT_OWNER_PASSWORD`, optional `PILOT_CUSTOMER_REF`,
+  format checks (lowercase slug, email, ≥ 12-char password, length caps),
+  whitespace normalization, and the hard `VERCEL=1` block
+  (`SEED_NOT_ALLOWED_ON_VERCEL` — the seed must never run on the Vercel
+  request path). Validation errors are stable codes and never echo input
+  values.
+- **Anonymization** — `maskId` keeps only the first 8 chars; formatted output
+  contains masked ids and statuses only and never the slug, legal name, email,
+  customer ref, password or a full UUID.
+- **Hash format** — `hashPassword` output matches
+  `$scrypt$N=32768,r=8,p=1$<22-char salt>$<43-char digest>` and round-trips via
+  `verifyPassword`; the password reaches the DB only as this hash, never as
+  plaintext.
+- **Idempotent DML** — via a scripted `DbClient`: first run inserts
+  tenant/user/membership/customer and writes the `pilot.seeded` audit row with
+  `app.tenant_id` set after the tenant upsert; a second run issues no inserts
+  at all and never overwrites an existing password hash (only fills it when
+  the user has none); without `PILOT_CUSTOMER_REF` no customer query runs.
+- **Orchestrator** — via a fake pool: `begin` → `pg_advisory_xact_lock(742002)`
+  → seed → `commit`; rollback + exit 1 on failure; exit 1 without connecting
+  for missing env, `VERCEL=1` or missing `DATABASE_URL`; stdout is
+  anonymized.
+
 The **live** diagnostic is a separate on-demand operator step, not part of the
 unit suite and never part of `bun test` against Neon. Against a real database
 (production or a migrated staging copy) with the app-role connection string:
