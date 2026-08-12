@@ -20,10 +20,13 @@ test('invalid persisted branding colors are replaced with fixed defaults', () =>
 });
 
 test('public card response is strictly allowlisted (no customerId, no publicTokenHash, no DB row)', () => {
-  const payload = toPublicCardResponse({ card: fullCard, branding, rule, reward }, 'tenant-1');
-  expect(Object.keys(payload).sort()).toEqual(['branding', 'cardId', 'revision', 'reward', 'rule', 'stampCount', 'tenantId']);
+  const payload = toPublicCardResponse({ card: fullCard, branding, rule, reward, controllerName: 'Beispiel GmbH', privacyContact: 'datenschutz@beispiel.de' }, 'tenant-1');
+  expect(Object.keys(payload).sort()).toEqual(['branding', 'cardId', 'controllerName', 'privacyContact', 'revision', 'reward', 'rule', 'stampCount', 'tenantId']);
   const serialized = JSON.stringify(payload); expect(serialized).not.toContain('customerId'); expect(serialized).not.toContain('customer-1'); expect(serialized).not.toContain('publicTokenHash'); expect(serialized).not.toContain('deadbeef-public-token-hash');
   expect(payload.cardId).toBe('card-1'); expect(payload.stampCount).toBe(3); expect(payload.revision).toBe(2); expect(payload.branding).toEqual(branding); expect(payload.rule).toEqual(rule); expect(payload.reward).toEqual(reward);
+  // DSGVO Art. 13 fields: controller + optional privacy contact, nothing else new.
+  expect(payload.controllerName).toBe('Beispiel GmbH');
+  expect(payload.privacyContact).toBe('datenschutz@beispiel.de');
 });
-test('public card response keeps null branding/rule/reward without leaking card internals', () => { const payload = toPublicCardResponse({ card: fullCard, branding: null, rule: null, reward: null }, 'tenant-1'); expect(payload.branding).toBeNull(); expect(payload.rule).toBeNull(); expect(payload.reward).toBeNull(); expect(JSON.stringify(payload)).not.toContain('publicTokenHash'); expect(JSON.stringify(payload)).not.toContain('customer-1'); });
+test('public card response keeps null branding/rule/reward without leaking card internals', () => { const payload = toPublicCardResponse({ card: fullCard, branding: null, rule: null, reward: null, controllerName: null, privacyContact: null }, 'tenant-1'); expect(payload.branding).toBeNull(); expect(payload.rule).toBeNull(); expect(payload.reward).toBeNull(); expect(payload.controllerName).toBeNull(); expect(payload.privacyContact).toBeNull(); expect(JSON.stringify(payload)).not.toContain('publicTokenHash'); expect(JSON.stringify(payload)).not.toContain('customer-1'); });
 test('wallet card view carries exactly id and stampCount, never customer data', () => { const view = toWalletCardView(fullCard); expect(Object.keys(view).sort()).toEqual(['id', 'stampCount']); expect(view.id).toBe('card-1'); expect(view.stampCount).toBe(3); const serialized = JSON.stringify(view); expect(serialized).not.toContain('customerId'); expect(serialized).not.toContain('publicTokenHash'); });

@@ -317,12 +317,12 @@ describe('communicationCheck (hash secret required only when SMTP active)', () =
 // migrationCheck
 // ---------------------------------------------------------------------------
 
-describe('migrationCheck (filesystem only, exact 001–011 set)', () => {
+describe('migrationCheck (filesystem only, exact 001–012 set)', () => {
   test('real migrations directory: complete contiguous set', async () => {
     const check = await migrationCheck(join(ROOT, 'migrations'));
     expect(check.ok).toBe(true);
-    expect(check.present).toBe(11);
-    expect(check.expected).toBe(11);
+    expect(check.present).toBe(12);
+    expect(check.expected).toBe(12);
     expect(check.missing).toEqual([]);
     expect(check.files).toEqual([...EXPECTED_MIGRATIONS]);
   });
@@ -330,11 +330,11 @@ describe('migrationCheck (filesystem only, exact 001–011 set)', () => {
   test('missing file -> MIGRATIONS_INCOMPLETE with missing name listed', async () => {
     const root = '/proj';
     const files: Record<string, string> = {};
-    for (const f of EXPECTED_MIGRATIONS.slice(0, 10)) files[join(root, 'migrations', f)] = '-- sql';
+    for (const f of EXPECTED_MIGRATIONS.slice(0, 11)) files[join(root, 'migrations', f)] = '-- sql';
     const check = await migrationCheck(join(root, 'migrations'), fakeIo(files));
     expect(check.ok).toBe(false);
     expect(check.errors).toEqual(['MIGRATIONS_INCOMPLETE']);
-    expect(check.missing).toEqual([EXPECTED_MIGRATIONS[10]]);
+    expect(check.missing).toEqual(EXPECTED_MIGRATIONS.slice(11));
   });
 
   test('extra file beyond 011 -> MIGRATIONS_INCOMPLETE', async () => {

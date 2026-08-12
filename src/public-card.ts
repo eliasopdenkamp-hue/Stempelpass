@@ -20,9 +20,13 @@ export function safeBranding(branding: Branding | null | undefined): Branding | 
 export interface PublicCardResponse {
   cardId: string; tenantId: string; stampCount: number; revision: number;
   branding: Branding | null; rule: StampRule | null; reward: PublicReward | null;
+  /** DSGVO Art. 13: controller display name (tenants.legal_name), null when unset. */
+  controllerName: string | null;
+  /** DSGVO Art. 13: optional contact for data-subject requests (tenant_branding.privacy_email). */
+  privacyContact: string | null;
 }
-export interface PublicCardSource { card: Pick<Card, 'id' | 'stampCount' | 'revision'>; branding: Branding | null; rule: StampRule | null; reward: PublicReward | null; }
+export interface PublicCardSource { card: Pick<Card, 'id' | 'stampCount' | 'revision'>; branding: Branding | null; rule: StampRule | null; reward: PublicReward | null; controllerName: string | null; privacyContact: string | null; }
 export function toPublicCardResponse(result: PublicCardSource, tenantId: string): PublicCardResponse {
-  return { cardId: result.card.id, tenantId, stampCount: result.card.stampCount, revision: result.card.revision, branding: safeBranding(result.branding), rule: result.rule, reward: result.reward };
+  return { cardId: result.card.id, tenantId, stampCount: result.card.stampCount, revision: result.card.revision, branding: safeBranding(result.branding), rule: result.rule, reward: result.reward, controllerName: result.controllerName ?? null, privacyContact: result.privacyContact ?? null };
 }
 export function toWalletCardView(card: Pick<Card, 'id' | 'stampCount'>): WalletCardView { return { id: card.id, stampCount: card.stampCount }; }

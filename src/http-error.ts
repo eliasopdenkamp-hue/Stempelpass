@@ -67,6 +67,9 @@ export function errorStatus(code: string): number {
   if (code === 'TENANT_CONTEXT_REQUIRED' || code === 'FORBIDDEN') return 403;
   if (code === 'UNAUTHENTICATED') return 401;
   if (code === 'RATE_LIMITED') return 429;
+  // CSRF failures are a client-authentication problem, not a malformed
+  // request: 403 Forbidden (semantically correct vs. the previous 400).
+  if (code === 'CSRF_INVALID') return 403;
   return 400;
 }
 

@@ -28,6 +28,7 @@ const EXPECTED = [
   '009_sessions_rls_and_audit_split.sql',
   '010_membership_mfa_resolver.sql',
   '011_card_soft_delete.sql',
+  '012_privacy_info.sql',
 ];
 
 test('migration files: exact expected set, runner-compatible names, stable order', async () => {
@@ -280,6 +281,26 @@ test('011 adds cards.deleted_at only — soft-delete column, no other schema cha
   expect(m011).not.toMatch(/create or replace function/i);
   expect(m011).not.toMatch(/grant|revoke/i);
   expect(m011).not.toMatch(/force row level security/i);
+});
+
+test('012 adds tenant_branding.privacy_email only — nullable Art. 13 contact, no other schema change', async () => {
+  const m001 = await readFile(join(MIGRATIONS_DIR, '001_init.sql'), 'utf8');
+  const m012 = await readFile(join(MIGRATIONS_DIR, '012_privacy_info.sql'), 'utf8');
+  // tenant_branding exists (001) and had no privacy column before 012.
+  expect(m001).toMatch(/create table tenant_branding/);
+  expect(m001).not.toMatch(/privacy_email/);
+  // 012 adds the nullable contact column (no NOT NULL — optional field).
+  expect(m012).toMatch(/alter table tenant_branding add column privacy_email text/);
+  expect(m012).not.toMatch(/not null/i);
+  // Statements only: exactly ONE schema change, nothing else (no index,
+  // no policy, no function, no GRANT/REVOKE, no FORCE RLS).
+  const stmts = m012.replace(/^--.*$/gm, '').trim();
+  expect(stmts).toMatch(/^alter table tenant_branding add column privacy_email text;$/);
+  expect(m012).not.toMatch(/create index/i);
+  expect(m012).not.toMatch(/create policy/i);
+  expect(m012).not.toMatch(/create or replace function/i);
+  expect(m012).not.toMatch(/grant|revoke/i);
+  expect(m012).not.toMatch(/force row level security/i);
 });
 
 /* ------------------------------------------------------------------ *

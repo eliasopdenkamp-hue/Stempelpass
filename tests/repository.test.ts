@@ -171,7 +171,8 @@ test('publicCard aliases every cards column snake_case→camelCase (no select *)
     [], // begin
     [], // set_config
     [{ id: 'card-1', tenantId: TENANT, customerId: CUSTOMER, publicTokenHash: 'a'.repeat(64), status: 'active', stampCount: 3, revision: 2, ruleId: RULE, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' }], // cards select -> camelCase row
-    [{ cardTitle: 'Café', cardText: 'Treuekarte', primaryColor: '#123456', secondaryColor: '#ffffff', version: 1 }], // branding select
+    [{ cardTitle: 'Café', cardText: 'Treuekarte', primaryColor: '#123456', secondaryColor: '#ffffff', privacyEmail: 'datenschutz@beispiel.de', version: 1 }], // branding select
+    [{ legal_name: 'Beispiel GmbH' }], // tenants select (DSGVO Art. 13 controller)
     [{ id: RULE, tenantId: TENANT, name: 'Regel', stampsRequired: 11, rewardTitle: '1 Monat gratis', rewardDescription: '', active: true, version: 1 }], // rule select
     [{ id: 'reward-1', status: 'issued', issuedAt: null, redeemedAt: null }], // rewards select
     [], // commit
@@ -190,6 +191,14 @@ test('publicCard aliases every cards column snake_case→camelCase (no select *)
   expect(cardsSelect?.sql).toContain('created_at as "createdAt"');
   expect(cardsSelect?.sql).toContain('updated_at as "updatedAt"');
   expect(cardsSelect?.sql).not.toMatch(/select \*/);
+  // DSGVO Art. 13: the branding query carries the optional privacy contact and
+  // the tenants query the controller legal_name (both only ever surface as the
+  // allowlisted controllerName/privacyContact fields, never raw columns).
+  const brandingSelect = pool.queries.find(q => q.sql.includes('from tenant_branding'));
+  expect(brandingSelect?.sql).toContain('privacy_email as "privacyEmail"');
+  const tenantsSelect = pool.queries.find(q => q.sql.includes('select legal_name from tenants'));
+  expect(tenantsSelect?.sql).toContain('where id=$1');
+  expect(tenantsSelect?.params).toEqual([TENANT]);
   // The rule lookup is driven by the aliased ruleId — proving the wiring works.
   const ruleSelect = pool.queries.find(q => q.sql.includes('from stamp_rules'));
   expect(ruleSelect?.params).toEqual([RULE, TENANT]);
@@ -197,6 +206,8 @@ test('publicCard aliases every cards column snake_case→camelCase (no select *)
   expect(result?.card.ruleId).toBe(RULE);
   expect(result?.rule?.stampsRequired).toBe(11);
   expect(result?.reward?.status).toBe('issued');
+  expect(result?.controllerName).toBe('Beispiel GmbH');
+  expect(result?.privacyContact).toBe('datenschutz@beispiel.de');
   expect(pool.queries.some(q => q.sql === 'commit')).toBe(true);
 });
 

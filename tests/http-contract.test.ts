@@ -169,7 +169,8 @@ test('public card JSON exposes only allowlisted fields, never customerId/publicT
   };
   const pool = new FakePool([
     { match: contains('from cards where'), rows: [fullCardRow] },
-    { match: contains('from tenant_branding'), rows: [{ cardTitle: 'StempelPass Demo', cardText: 'Deine Karte', primaryColor: '#155e75', secondaryColor: '#f8fafc', version: 1 }] },
+    { match: contains('from tenant_branding'), rows: [{ cardTitle: 'StempelPass Demo', cardText: 'Deine Karte', primaryColor: '#155e75', secondaryColor: '#f8fafc', privacyEmail: 'datenschutz@beispiel.de', version: 1 }] },
+    { match: contains('select legal_name from tenants'), rows: [{ legal_name: 'Beispiel GmbH' }] },
     { match: contains('from stamp_rules'), rows: [{ id: RULE, tenantId: TENANT, name: 'R', stampsRequired: 5, rewardTitle: 'Prämie', rewardDescription: 'D', active: true, version: 1 }] },
     { match: contains('from rewards'), rows: [{ id: 'reward-1', status: 'issued', issuedAt: null, redeemedAt: null }] },
   ]);
@@ -183,13 +184,72 @@ test('public card JSON exposes only allowlisted fields, never customerId/publicT
       branding: { cardTitle: 'StempelPass Demo', cardText: 'Deine Karte', primaryColor: '#155e75', secondaryColor: '#f8fafc', version: 1 },
       rule: { id: RULE, tenantId: TENANT, name: 'R', stampsRequired: 5, rewardTitle: 'Prämie', rewardDescription: 'D', active: true, version: 1 },
       reward: { id: 'reward-1', status: 'issued', issuedAt: null, redeemedAt: null },
+      // DSGVO Art. 13: controller + optional privacy contact only.
+      controllerName: 'Beispiel GmbH',
+      privacyContact: 'datenschutz@beispiel.de',
     });
     const raw = JSON.stringify(body);
     expect(raw).not.toContain('customerId');
     expect(raw).not.toContain('publicTokenHash');
     expect(raw).not.toContain('public_token_hash');
     expect(raw).not.toContain('customer_id');
+    expect(raw).not.toContain('legal_name');
+    expect(raw).not.toContain('privacyEmail');
     expect(raw).not.toContain('"status":"active"');
+  });
+});
+
+test('public card HTML renders the Art. 13 privacy block with controller and contact', async () => {
+  const fullCardRow = {
+    id: 'card-1', tenantId: TENANT, customerId: CUSTOMER, publicTokenHash: 'f'.repeat(64),
+    status: 'active', stampCount: 3, revision: 2, ruleId: RULE,
+  };
+  const pool = new FakePool([
+    { match: contains('from cards where'), rows: [fullCardRow] },
+    { match: contains('from tenant_branding'), rows: [{ cardTitle: 'StempelPass Demo', cardText: 'Deine Karte', primaryColor: '#155e75', secondaryColor: '#f8fafc', privacyEmail: 'datenschutz@beispiel.de', version: 1 }] },
+    { match: contains('select legal_name from tenants'), rows: [{ legal_name: 'Beispiel GmbH' }] },
+    { match: contains('from stamp_rules'), rows: [{ id: RULE, tenantId: TENANT, name: 'R', stampsRequired: 5, rewardTitle: 'Prämie', rewardDescription: 'D', active: true, version: 1 }] },
+    { match: contains('from rewards'), rows: [] },
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/card/${TENANT}/public-token-abc`));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/html');
+    const html = await res.text();
+    // Art. 13 block: controller, processor note, rights + contact.
+    expect(html).toContain('Datenschutz');
+    expect(html).toContain('Verantwortlich für die Verarbeitung: Beispiel GmbH');
+    expect(html).toContain('Auftragsverarbeiter (Art. 28 DSGVO)');
+    expect(html).toContain('Kontakt für Anfragen: datenschutz@beispiel.de');
+    // Never card/customer internals in the HTML.
+    expect(html).not.toContain('customerId');
+    expect(html).not.toContain('publicTokenHash');
+    expect(html).not.toContain(CUSTOMER);
+  });
+});
+
+test('public card HTML omits the contact line without privacy email and falls back to &lt;Tenant&gt;', async () => {
+  const fullCardRow = {
+    id: 'card-1', tenantId: TENANT, customerId: CUSTOMER, publicTokenHash: 'f'.repeat(64),
+    status: 'active', stampCount: 3, revision: 2, ruleId: RULE,
+  };
+  const pool = new FakePool([
+    { match: contains('from cards where'), rows: [fullCardRow] },
+    // No privacy_email -> the contact line must be omitted entirely.
+    { match: contains('from tenant_branding'), rows: [{ cardTitle: 'X', cardText: '', primaryColor: '#155e75', secondaryColor: '#f8fafc', version: 1 }] },
+    // No tenants row (optional join) -> controllerName null -> escaped <Tenant> fallback.
+    { match: contains('select legal_name from tenants'), rows: [] },
+    { match: contains('from stamp_rules'), rows: [{ id: RULE, tenantId: TENANT, name: 'R', stampsRequired: 1, rewardTitle: 'P', rewardDescription: '', active: true, version: 1 }] },
+    { match: contains('from rewards'), rows: [] },
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/card/${TENANT}/public-token-abc`));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).not.toContain('Kontakt für Anfragen');
+    // No invented PII: the fallback is the literal escaped placeholder.
+    expect(html).toContain('&lt;Tenant&gt;');
+    expect(html).not.toContain('<Tenant>');
   });
 });
 // ---------------------------------------------------------------------------
@@ -599,7 +659,7 @@ test('mutating requests without a CSRF token are rejected', async () => {
       headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}`, 'content-type': 'application/json' },
       body: JSON.stringify({ quantity: 1 }),
     }));
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(403);
     expect(((await res.json()) as { data: { error: string } }).data.error).toBe('CSRF_INVALID');
     expect(pool.queries.some((q) => q.sql.startsWith('insert into stamp_events'))).toBe(false);
   });
@@ -613,7 +673,7 @@ test('mutating requests with a wrong CSRF token are rejected', async () => {
       headers: authedHeaders({ 'x-csrf-token': '0'.repeat(64) }),
       body: JSON.stringify({ quantity: 1 }),
     }));
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(403);
     expect(((await res.json()) as { data: { error: string } }).data.error).toBe('CSRF_INVALID');
     expect(pool.queries.some((q) => q.sql.startsWith('insert into stamp_events'))).toBe(false);
   });
@@ -1032,7 +1092,7 @@ test('DELETE card with a wrong CSRF token is rejected (mutating route)', async (
     const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}/cards/${CARD_ID}`, {
       method: 'DELETE', headers: authedHeaders({ 'x-csrf-token': '0'.repeat(64) }),
     }));
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(403);
     expect(((await res.json()) as { data: { error: string } }).data.error).toBe('CSRF_INVALID');
     expect(pool.queries.some(q => q.sql.startsWith('update cards'))).toBe(false);
   });
