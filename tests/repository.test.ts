@@ -104,6 +104,52 @@ test('createCard succeeds for a valid active customer of the tenant and inserts 
   expect(pool.queries.some(q => q.sql === 'commit')).toBe(true);
 });
 
+test('createCard with idempotency key creates once and replay returns same card and token', async () => {
+  const previous = process.env.SESSION_SECRET;
+  process.env.SESSION_SECRET = 'test-session-secret-that-is-at-least-32-bytes';
+  try {
+    const firstPool = new FakePool([
+      [], [], [], // begin, tenant context, idempotency lookup (missing)
+      [{ customer_limit: 500 }], [{ id: CUSTOMER }], [{ count: '0' }], [{ id: RULE }],
+      [{ id: 'card-1', ruleId: RULE, stampCount: 0, revision: 1 }], [], [], // card, idempotency insert, commit
+    ]);
+    const first = await new CardRepository(firstPool).createCard(TENANT, CUSTOMER, RULE, TOKEN_HASH, 'create-key', 'raw-token-1');
+    expect(first).toEqual({ id: 'card-1', ruleId: RULE, stampCount: 0, revision: 1, token: 'raw-token-1' });
+    const idemInsert = firstPool.queries.find(q => q.sql.startsWith('insert into card_creation_idempotency'));
+    expect(idemInsert?.params?.[4]).not.toBe('raw-token-1');
+    expect(String(idemInsert?.params?.[4])).toContain('.');
+    const replayPool = new FakePool([
+      [], [], [{ request_fingerprint: idemInsert?.params?.[2], card_id: 'card-1', token_ciphertext: idemInsert?.params?.[4] }],
+      [{ id: 'card-1', ruleId: RULE, stampCount: 0, revision: 1 }], [],
+    ]);
+    const replay = await new CardRepository(replayPool).createCard(TENANT, CUSTOMER, RULE, 'different-hash', 'create-key', 'other-token');
+    expect(replay).toEqual(first);
+    expect(replayPool.queries.some(q => q.sql.startsWith('insert into cards'))).toBe(false);
+  } finally { if (previous === undefined) delete process.env.SESSION_SECRET; else process.env.SESSION_SECRET = previous; }
+});
+
+test('createCard rejects idempotency-key reuse with a different payload', async () => {
+  const previous = process.env.SESSION_SECRET;
+  process.env.SESSION_SECRET = 'test-session-secret-that-is-at-least-32-bytes';
+  try {
+    const pool = new FakePool([
+      [], [], [{ request_fingerprint: 'different-fingerprint', card_id: 'card-1', token_ciphertext: 'x.y.z' }],
+    ]);
+    await expect(new CardRepository(pool).createCard(TENANT, CUSTOMER, RULE, TOKEN_HASH, 'create-key', 'raw-token')).rejects.toThrow('IDEMPOTENCY_KEY_REUSED');
+    expect(pool.queries.some(q => q.sql.startsWith('insert into cards'))).toBe(false);
+  } finally { if (previous === undefined) delete process.env.SESSION_SECRET; else process.env.SESSION_SECRET = previous; }
+});
+
+test('createCard without optional idempotency key remains compatible and does not write idempotency storage', async () => {
+  const pool = new FakePool([
+    [], [], [{ customer_limit: 500 }], [{ id: CUSTOMER }], [{ count: '0' }], [{ id: RULE }],
+    [{ id: 'card-1', ruleId: RULE, stampCount: 0, revision: 1 }], [],
+  ]);
+  const result = await new CardRepository(pool).createCard(TENANT, CUSTOMER, RULE, TOKEN_HASH);
+  expect(result).toEqual({ id: 'card-1', ruleId: RULE, stampCount: 0, revision: 1 });
+  expect(pool.queries.some(q => q.sql.includes('card_creation_idempotency'))).toBe(false);
+});
+
 test('stamp returns only the minimized card view and echoes the client idempotency key', async () => {
   const pool = new FakePool([
     [], // begin

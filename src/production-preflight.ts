@@ -242,6 +242,7 @@ export const EXPECTED_MIGRATIONS: readonly string[] = [
   '010_membership_mfa_resolver.sql',
   '011_card_soft_delete.sql',
   '012_privacy_info.sql',
+  '013_card_idempotency.sql',
 ];
 
 export interface MigrationCheck {

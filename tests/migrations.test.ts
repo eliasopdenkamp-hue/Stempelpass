@@ -29,6 +29,7 @@ const EXPECTED = [
   '010_membership_mfa_resolver.sql',
   '011_card_soft_delete.sql',
   '012_privacy_info.sql',
+  '013_card_idempotency.sql',
 ];
 
 test('migration files: exact expected set, runner-compatible names, stable order', async () => {
@@ -283,6 +284,17 @@ test('011 adds cards.deleted_at only — soft-delete column, no other schema cha
   expect(m011).not.toMatch(/force row level security/i);
 });
 
+test('013 creates tenant-scoped encrypted idempotency storage with no raw-token column', async () => {
+  const m013 = await readFile(join(MIGRATIONS_DIR, '013_card_idempotency.sql'), 'utf8');
+  expect(m013).toMatch(/create table card_creation_idempotency/);
+  expect(m013).toMatch(/tenant_id uuid not null references tenants\(id\)/i);
+  expect(m013).toMatch(/primary key \(tenant_id, idempotency_key\)/i);
+  expect(m013).toMatch(/request_fingerprint text not null/i);
+  expect(m013).toMatch(/token_ciphertext text not null/i);
+  expect(m013).toMatch(/enable row level security/i);
+  expect(m013).toMatch(/create policy tenant_isolation on card_creation_idempotency/i);
+  expect(m013.replace(/^--.*$/gm, '')).not.toMatch(/raw[_ ]?token/i);
+});
 test('012 adds tenant_branding.privacy_email only — nullable Art. 13 contact, no other schema change', async () => {
   const m001 = await readFile(join(MIGRATIONS_DIR, '001_init.sql'), 'utf8');
   const m012 = await readFile(join(MIGRATIONS_DIR, '012_privacy_info.sql'), 'utf8');
