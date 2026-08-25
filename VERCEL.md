@@ -20,7 +20,7 @@ require exit code `0`. It statically verifies the required environment
 (`DATABASE_URL`, `SESSION_SECRET`, `FRONTEND_ORIGIN`), the configured Google
 credential mode (external-account or service-account fallback),
 `MFA_ENCRYPTION_KEY` only when MFA is active, `COMMUNICATION_HASH_SECRET` only
-when SMTP is active, the exact migration set 001–011 and the Vercel entry
+when SMTP is active, the exact migration set 001–014 and the Vercel entry
 point/Node build wiring — without opening a database connection and without
 printing any secret value. Exit codes and the classified error list are
 documented in `TESTING.md`. The live diagnostics (Neon connectivity,
@@ -36,7 +36,7 @@ in `vercel.json`, so the Node version is project-managed only).
 
 Set these in the Vercel project/environment (never commit values):
 
-- `DATABASE_URL`: Neon PostgreSQL connection string, EU project, with TLS (`sslmode=require`).
+- `DATABASE_URL`: Neon PostgreSQL connection string, EU project, with TLS (`sslmode=require`), pointing to the dedicated non-owner/non-`BYPASSRLS` runtime app role. Do not use the migration/admin/owner connection here; role and grants are prepared manually as documented in `RLS_AUTH_P1.md`.
 - `SESSION_SECRET`: at least 32 random characters/bytes.
 - `FRONTEND_ORIGIN`: exact published frontend origin, currently
   `https://a1e91d0731cfc57ecf5a508e37635a85.ctonew.app` (no trailing slash).

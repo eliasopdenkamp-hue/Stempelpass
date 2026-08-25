@@ -44,7 +44,7 @@
 import postgres from 'postgres';
 
 // ---------------------------------------------------------------------------
-// Expected schema (derived from migrations/001..007)
+// Expected schema and runtime grants (derived from migrations/001..014)
 // ---------------------------------------------------------------------------
 
 /** Tables that MUST have row-level security enabled: tenant-scoped tables
@@ -55,6 +55,7 @@ export const TENANT_SENSITIVE_TABLES: readonly string[] = [
   'tenant_branding',
   'stamp_rules',
   'cards',
+  'card_creation_idempotency',
   'stamp_events',
   'rewards',
   'communication_preferences',
@@ -95,7 +96,15 @@ export const REQUIRED_GRANTS: Readonly<Record<string, readonly ('SELECT' | 'INSE
   communication_consent_events: ['SELECT', 'INSERT', 'UPDATE'],
   communication_message_logs: ['SELECT', 'INSERT', 'UPDATE'],
   schema_migrations: ['SELECT', 'INSERT'],
+  card_creation_idempotency: ['SELECT', 'INSERT', 'UPDATE'],
 };
+
+/** SECURITY DEFINER functions the runtime role must be able to call. */
+export const REQUIRED_FUNCTION_GRANTS: readonly { name: string; identityArguments: string }[] = [
+  { name: 'resolve_entry_point', identityArguments: 'text' },
+  { name: 'resolve_session_user', identityArguments: 'text' },
+  { name: 'membership_mfa_required', identityArguments: 'uuid' },
+];
 
 // ---------------------------------------------------------------------------
 // Queries (all SELECT-only; role names/schema/table lists are bind parameters;
@@ -127,6 +136,11 @@ export function buildAsRoleQueries(schema: string): RlsQuery[] {
       name: 'grants',
       sql: `select c.relname as table_name, has_table_privilege(c.oid, 'SELECT') as sel, has_table_privilege(c.oid, 'INSERT') as ins, has_table_privilege(c.oid, 'UPDATE') as upd, has_table_privilege(c.oid, 'DELETE') as del ${FROM_PG_CLASS} where n.nspname = $1 and c.relkind in ('r','p') and c.relname = any($2)`,
       params: [schema, [...ALL_APP_TABLES]],
+    },
+    {
+      name: 'function-grants',
+      sql: `select p.proname as function_name, pg_get_function_identity_arguments(p.oid) as identity_arguments, has_function_privilege(p.oid, 'EXECUTE') as execute_ok from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = $1 and p.proname = any($2) and pg_get_function_identity_arguments(p.oid) = any($3)`,
+      params: [schema, REQUIRED_FUNCTION_GRANTS.map(f => f.name), REQUIRED_FUNCTION_GRANTS.map(f => f.identityArguments)],
     },
     {
       name: 'schema-privileges',
@@ -169,6 +183,11 @@ export function buildNamedRoleQueries(roleName: string, schema: string): RlsQuer
       params: [schema, [...ALL_APP_TABLES], roleName],
     },
     {
+      name: 'function-grants',
+      sql: `select p.proname as function_name, pg_get_function_identity_arguments(p.oid) as identity_arguments, has_function_privilege($4::name, p.oid, 'EXECUTE') as execute_ok from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = $1 and p.proname = any($2) and pg_get_function_identity_arguments(p.oid) = any($3)`,
+      params: [schema, REQUIRED_FUNCTION_GRANTS.map(f => f.name), REQUIRED_FUNCTION_GRANTS.map(f => f.identityArguments), roleName],
+    },
+    {
       name: 'schema-privileges',
       sql: `select has_schema_privilege($2::name, $1, 'USAGE') as usage_ok, has_schema_privilege($2::name, $1, 'CREATE') as create_ok`,
       params: [schema, roleName],
@@ -198,6 +217,7 @@ export interface RlsChecks {
   rlsInactiveForRole: string[];
   grantsComplete: boolean;
   missingGrants: string[];
+  missingFunctionGrants: string[];
   schemaUsage: boolean;
   schemaCreate: boolean;
 }
@@ -218,6 +238,7 @@ export interface RlsRawInput {
   ownedTables: string[];
   rlsRows: { table_name: string; rls_enabled: boolean; rls_forced: boolean }[];
   grantRows: { table_name: string; sel: boolean; ins: boolean; upd: boolean; del: boolean }[];
+  functionGrantRows?: { function_name: string; identity_arguments: string; execute_ok: boolean }[];
   schemaRow: { usage_ok: boolean; create_ok: boolean } | null;
   rowSecurityRows: { table_name: string; active: boolean }[] | null;
   errors: string[];
@@ -248,7 +269,12 @@ export function classifyRlsReport(input: RlsRawInput): RlsVerifyReport {
       if (!granted) missingGrants.push(`${table}:${priv}`);
     }
   }
-  if (missingGrants.length > 0) errors.push('grants-missing');
+  const missingFunctionGrants: string[] = [];
+  for (const required of REQUIRED_FUNCTION_GRANTS) {
+    const row = (input.functionGrantRows ?? []).find(r => r.function_name === required.name && r.identity_arguments === required.identityArguments);
+    if (!row || !row.execute_ok) missingFunctionGrants.push(`${required.name}(${required.identityArguments}):EXECUTE`);
+  }
+  if (missingGrants.length > 0 || missingFunctionGrants.length > 0) errors.push('grants-missing');
   if (input.schemaRow && !input.schemaRow.usage_ok) errors.push('schema-usage-denied');
 
   const rlsInactiveForRole = input.rowSecurityRows
@@ -272,8 +298,9 @@ export function classifyRlsReport(input: RlsRawInput): RlsVerifyReport {
     rlsActiveForRole: input.rowSecurityRows ? rlsInactiveForRole.length === 0 : null,
     rlsMissing,
     rlsInactiveForRole,
-    grantsComplete: missingGrants.length === 0,
-    missingGrants,
+    grantsComplete: missingGrants.length === 0 && missingFunctionGrants.length === 0,
+    missingGrants: [...missingGrants, ...missingFunctionGrants],
+    missingFunctionGrants,
     schemaUsage: input.schemaRow?.usage_ok ?? false,
     schemaCreate: input.schemaRow?.create_ok ?? false,
   };
@@ -447,6 +474,9 @@ export async function verifyRls(opts: VerifyRlsOptions): Promise<RlsVerifyReport
       grantRows: (results['grants']?.rows ?? []).map(r => ({
         table_name: str(r.table_name), sel: bool(r.sel), ins: bool(r.ins), upd: bool(r.upd), del: bool(r.del),
       })),
+      functionGrantRows: (results['function-grants']?.rows ?? []).map(r => ({
+        function_name: str(r.function_name), identity_arguments: str(r.identity_arguments), execute_ok: bool(r.execute_ok),
+      })),
       schemaRow: results['schema-privileges']?.rows[0] as never ?? null,
       rowSecurityRows: results['row-security-active']
         ? (results['row-security-active'].rows ?? []).map(r => ({ table_name: str(r.table_name), active: bool(r.active) }))
@@ -489,7 +519,7 @@ function failReport(mode: RlsMode, errors: string[]): RlsVerifyReport {
       ownsAnyTable: false, ownedTables: [],
       rlsEnabledOnAllTenantTables: false, rlsForcedOnAllTenantTables: false, rlsActiveForRole: null,
       rlsMissing: [], rlsInactiveForRole: [],
-      grantsComplete: false, missingGrants: [],
+      grantsComplete: false, missingGrants: [], missingFunctionGrants: [],
       schemaUsage: false, schemaCreate: false,
     },
     errors,

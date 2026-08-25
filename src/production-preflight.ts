@@ -243,6 +243,7 @@ export const EXPECTED_MIGRATIONS: readonly string[] = [
   '011_card_soft_delete.sql',
   '012_privacy_info.sql',
   '013_card_idempotency.sql',
+  '014_app_role_grants.sql',
 ];
 
 export interface MigrationCheck {
@@ -254,7 +255,7 @@ export interface MigrationCheck {
   errors: string[];
 }
 
-/** Filesystem-only: 001–010 present, runner-compatible names, contiguous. */
+/** Filesystem-only: 001–014 present, runner-compatible names, contiguous. */
 export async function migrationCheck(dir: string, io: PreflightIo = realIo): Promise<MigrationCheck> {
   const errors: string[] = [];
   let files: string[] = [];

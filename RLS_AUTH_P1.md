@@ -39,6 +39,73 @@ Mit der tatsächlich verwendeten App-Rolle und einer separaten Admin-/Owner-Prü
 
 Keine echten Secrets oder Wallet-Credentials gehören in diese Prüfung oder in das Repository.
 
+## Runtime-Rolle und manuelle DB-Schritte nach Migration 014
+
+Migration `014_app_role_grants.sql` ist bewusst nur ein **additiver Grant-Schritt**:
+Wenn `app_role` bereits existiert, erhält sie `USAGE` auf `public`,
+`SELECT/INSERT/UPDATE` auf `public.card_creation_idempotency` und `EXECUTE` auf
+die drei Resolver-Funktionen. Fehlt die Rolle, wird nichts angelegt und nichts
+geändert. Die Migration führt ausdrücklich **keine** Rollen-Downgrades,
+Ownership-Änderungen oder Entzüge geerbter Rechte aus und kann sicher erneut
+ausgeführt werden.
+
+Vor dem Runtime-Deploy sind deshalb manuell, über eine getrennte Admin-/Owner-
+Verbindung, alle folgenden Schritte nachzuweisen:
+
+1. Eine dedizierte Runtime-Rolle provisionieren (oder `app_role` nur dann
+   verwenden, wenn sie nachweislich dediziert und nicht privilegiert ist):
+   `LOGIN`, kein `SUPERUSER`, `BYPASSRLS`, `CREATEROLE`, `CREATEDB` oder
+   `REPLICATION`, keine unkontrollierten Rollenmitgliedschaften und kein Owner
+   der App-Tabellen. Eine aktuell privilegierte/Owner-artige `app_role` darf
+   **nicht** als Runtime-Rolle verwendet werden; gegebenenfalls ist eine neue
+   Rolle anzulegen und die Grants für diesen Namen separat nachzuziehen.
+2. Die Rolle als Tabellen-/Funktions- und Schema-Berechtigungsinhaber prüfen.
+   Falls sie Tabellen besitzt, Ownership mit der Admin-Verbindung auf eine
+   dedizierte Migrations-/Owner-Rolle übertragen. Die Sicherheitsprüfung darf
+   dabei nicht durch automatische Änderungen in einer Anwendungsmigration
+   ersetzt werden.
+3. `014_app_role_grants.sql` mit der Migrationsrolle ausführen, sobald
+   `app_role` vorhanden ist. Bei einer anders benannten Runtime-Rolle die
+   entsprechenden fünf additiven Grants manuell für diese Rolle ausführen
+   (Schema-`USAGE`, Idempotency-DML sowie die drei Resolver-`EXECUTE`-Grants).
+4. Erst danach muss `DATABASE_URL` im Runtime-Environment auf die dedizierte,
+   nicht privilegierte Runtime-Rolle zeigen — niemals auf die Admin-/Owner-
+   Verbindung, die Migrationen oder Seeds ausführt. Mit `RLS_VERIFY_DATABASE_URL`
+   (as-role und zusätzlich named-role) `rolbypassrls`, Owner-Risiko, RLS,
+   Tabellen-DML und alle drei `EXECUTE`-Grants prüfen; ein privilegierter
+   Verbindungs-String ist kein gültiger Ersatztest.
+
+Beispiel für die manuelle, ausdrücklich zu prüfende Reihenfolge (nur mit einer
+Admin-/Owner-Verbindung; Platzhalter nie unverändert ausführen):
+
+```sql
+-- 1) Ist-Zustand prüfen, bevor eine Rolle verändert wird.
+select rolname, rolsuper, rolbypassrls, rolcreaterole, rolcreatedb, rolreplication
+  from pg_roles where rolname = 'app_role';
+
+-- 2) Nur nach expliziter Freigabe und Prüfung der Ownership/Memberships:
+-- alter role app_role nosuperuser nobypassrls nocreaterole nocreatedb
+--   noreplication noinherit;
+-- revoke <breite_oder_unerwünschte_mitgliedschaft> from app_role;
+
+-- 3) Additive Grants für eine bereits geprüfte app_role (014 macht dies
+--    bedingt automatisch; bei einer neu benannten Runtime-Rolle manuell):
+grant usage on schema public to app_role;
+grant select, insert, update on table public.card_creation_idempotency to app_role;
+grant execute on function public.resolve_entry_point(text) to app_role;
+grant execute on function public.resolve_session_user(text) to app_role;
+grant execute on function public.membership_mfa_required(uuid) to app_role;
+```
+
+Bei einer neuen, anders benannten Rolle müssen die fünf Grant-Anweisungen auf
+diesen Namen angepasst werden; Migration 014 erteilt sie absichtlich nur an
+den Namen `app_role`. Danach Ownership, Mitgliedschaften und die effektiven
+Rechte nochmals mit `rls-verify` prüfen, bevor `DATABASE_URL` umgestellt wird.
+
+Die konkreten Rollennamen, Passwörter, Ownership-Änderungen und Provider-
+Environment-Einträge bleiben bewusste Owner-/DB-Operator-Schritte; keine
+Secrets werden dokumentiert oder committet.
+
 ## Teil C: Produktionsrollen-/RLS-Diagnose (opt-in, read-only, anonymisiert)
 
 `src/rls-verify.ts` prüft gegen eine **explizit bereitgestellte** DB-Verbindung
@@ -91,11 +158,12 @@ fehlgeschlagen), `2` = nicht ausgeführt (Opt-in-Umgebungsvariable fehlt).
 (`relrowsecurity` je Tenant-Tabelle), `rlsForcedOnAllTenantTables` +
 `rlsInactiveForRole` (informational bzw. as-role; Migrationen setzen kein
 FORCE ROW SECURITY), `grantsComplete` + `missingGrants` (gegen
-`REQUIRED_GRANTS`, abgeleitet aus repository/server-Codepfaden),
-`schemaUsage`/`schemaCreate` (CREATE nur informational — nötig, solange die
-App-Rolle Start-Migrationen ausführt; für Least Privilege Migrationen später
-auf eine separate Admin-Rolle verlagern), `tablesMissing` (Schema unvollständig
-→ Fail).
+`REQUIRED_GRANTS` sowie die drei erforderlichen Resolver-`EXECUTE`-Grants,
+abgeleitet aus repository/server-Codepfaden), `missingFunctionGrants` für
+die Resolver im Detail, `schemaUsage`/`schemaCreate` (CREATE nur
+informational — nötig, solange die App-Rolle Start-Migrationen ausführt; für
+Least Privilege Migrationen später auf eine separate Admin-Rolle verlagern),
+`tablesMissing` (Schema unvollständig → Fail).
 
 **Blocker (Stand dieser Revision):** Für eine echte Ende-zu-Ende-Verifikation
 ist eine separate Nicht-Owner-/Nicht-BYPASSRLS-App-Rolle samt Verbindungsdaten
