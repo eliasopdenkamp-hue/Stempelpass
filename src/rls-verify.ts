@@ -139,7 +139,7 @@ export function buildAsRoleQueries(schema: string): RlsQuery[] {
     },
     {
       name: 'function-grants',
-      sql: `select p.proname as function_name, pg_get_function_identity_arguments(p.oid) as identity_arguments, has_function_privilege(p.oid, 'EXECUTE') as execute_ok from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = $1 and p.proname = any($2) and pg_get_function_identity_arguments(p.oid) = any($3)`,
+      sql: `select p.proname as function_name, regexp_replace(pg_get_function_identity_arguments(p.oid), '(^|, )[^ ,]+ ', '\\1', 'g') as identity_arguments, has_function_privilege(p.oid, 'EXECUTE') as execute_ok from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = $1 and p.proname = any($2) and regexp_replace(pg_get_function_identity_arguments(p.oid), '(^|, )[^ ,]+ ', '\\1', 'g') = any($3)`, 
       params: [schema, REQUIRED_FUNCTION_GRANTS.map(f => f.name), REQUIRED_FUNCTION_GRANTS.map(f => f.identityArguments)],
     },
     {
@@ -184,7 +184,7 @@ export function buildNamedRoleQueries(roleName: string, schema: string): RlsQuer
     },
     {
       name: 'function-grants',
-      sql: `select p.proname as function_name, pg_get_function_identity_arguments(p.oid) as identity_arguments, has_function_privilege($4::name, p.oid, 'EXECUTE') as execute_ok from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = $1 and p.proname = any($2) and pg_get_function_identity_arguments(p.oid) = any($3)`,
+      sql: `select p.proname as function_name, regexp_replace(pg_get_function_identity_arguments(p.oid), '(^|, )[^ ,]+ ', '\\1', 'g') as identity_arguments, has_function_privilege($4::name, p.oid, 'EXECUTE') as execute_ok from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = $1 and p.proname = any($2) and regexp_replace(pg_get_function_identity_arguments(p.oid), '(^|, )[^ ,]+ ', '\\1', 'g') = any($3)`, 
       params: [schema, REQUIRED_FUNCTION_GRANTS.map(f => f.name), REQUIRED_FUNCTION_GRANTS.map(f => f.identityArguments), roleName],
     },
     {
