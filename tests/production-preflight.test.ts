@@ -10,7 +10,7 @@
  *   - MFA key validation (64-hex / 32-byte base64, only when MFA is active),
  *   - communication activation (all five EMAIL_SMTP_* values) and the
  *     COMMUNICATION_HASH_SECRET requirement,
- *   - the exact migration set 001–010 (filesystem only) and Vercel entry
+ *   - the exact migration set 001–014 (filesystem only) and Vercel entry
  *     point / Node build wiring,
  *   - the anonymization contract: NO secret value and no 'leak' marker may
  *     ever appear in the report, and the module must never import the DB.
@@ -317,12 +317,12 @@ describe('communicationCheck (hash secret required only when SMTP active)', () =
 // migrationCheck
 // ---------------------------------------------------------------------------
 
-describe('migrationCheck (filesystem only, exact 001–012 set)', () => {
+describe('migrationCheck (filesystem only, exact 001–014 set)', () => {
   test('real migrations directory: complete contiguous set', async () => {
     const check = await migrationCheck(join(ROOT, 'migrations'));
     expect(check.ok).toBe(true);
-    expect(check.present).toBe(12);
-    expect(check.expected).toBe(12);
+    expect(check.present).toBe(14);
+    expect(check.expected).toBe(14);
     expect(check.missing).toEqual([]);
     expect(check.files).toEqual([...EXPECTED_MIGRATIONS]);
   });
@@ -337,11 +337,11 @@ describe('migrationCheck (filesystem only, exact 001–012 set)', () => {
     expect(check.missing).toEqual(EXPECTED_MIGRATIONS.slice(11));
   });
 
-  test('extra file beyond 011 -> MIGRATIONS_INCOMPLETE', async () => {
+  test('extra file beyond 014 -> MIGRATIONS_INCOMPLETE', async () => {
     const root = '/proj';
     const files: Record<string, string> = {};
     for (const f of EXPECTED_MIGRATIONS) files[join(root, 'migrations', f)] = '-- sql';
-    files[join(root, 'migrations', '012_extra.sql')] = '-- sql';
+    files[join(root, 'migrations', '015_extra.sql')] = '-- sql';
     const check = await migrationCheck(join(root, 'migrations'), fakeIo(files));
     expect(check.ok).toBe(false);
     expect(check.errors).toEqual(['MIGRATIONS_INCOMPLETE']);

@@ -19,6 +19,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   ALL_APP_TABLES,
   TENANT_SENSITIVE_TABLES,
+  REQUIRED_FUNCTION_GRANTS,
   buildAsRoleQueries,
   buildNamedRoleQueries,
   classifyRlsReport,
@@ -44,6 +45,7 @@ function healthyInput(overrides: Partial<RlsRawInput> = {}): RlsRawInput {
     ownedTables: [],
     rlsRows: TENANT_SENSITIVE_TABLES.map(t => ({ table_name: t, rls_enabled: true, rls_forced: false })),
     grantRows: ALL_APP_TABLES.map(t => ({ table_name: t, sel: true, ins: true, upd: true, del: true })),
+    functionGrantRows: REQUIRED_FUNCTION_GRANTS.map(f => ({ function_name: f.name, identity_arguments: f.identityArguments, execute_ok: true })),
     schemaRow: { usage_ok: true, create_ok: true },
     rowSecurityRows: TENANT_SENSITIVE_TABLES.map(t => ({ table_name: t, active: true })),
     errors: [],
@@ -94,6 +96,21 @@ describe('query builders (read-only, anonymized)', () => {
     for (const t of TENANT_SENSITIVE_TABLES) expect(ALL_APP_TABLES).toContain(t);
     expect(new Set(ALL_APP_TABLES).size).toBe(ALL_APP_TABLES.length);
     expect(new Set(TENANT_SENSITIVE_TABLES).size).toBe(TENANT_SENSITIVE_TABLES.length);
+  });
+
+  test('function-grants query checks exactly the three resolver signatures', () => {
+    for (const [mode, queries] of [
+      ['as-role', buildAsRoleQueries('public')],
+      ['named-role', buildNamedRoleQueries('app_role_x', 'public')],
+    ] as const) {
+      const q = queries.find(q => q.name === 'function-grants');
+      expect(q).toBeDefined();
+      expect(q?.sql).toContain('has_function_privilege');
+      expect(q?.sql).toContain('pg_get_function_identity_arguments');
+      expect(q?.params?.[1]).toEqual(REQUIRED_FUNCTION_GRANTS.map(f => f.name));
+      expect(q?.params?.[2]).toEqual(REQUIRED_FUNCTION_GRANTS.map(f => f.identityArguments));
+      if (mode === 'named-role') expect(q?.params?.[3]).toBe('app_role_x');
+    }
   });
 });
 
@@ -158,6 +175,14 @@ describe('classifyRlsReport', () => {
     expect(r.checks.rlsActiveForRole).toBe(null);
   });
 
+  test('idempotency table is part of the tenant/RLS and DML grant contract', () => {
+    expect(TENANT_SENSITIVE_TABLES).toContain('card_creation_idempotency');
+    expect(ALL_APP_TABLES).toContain('card_creation_idempotency');
+    expect(healthyInput().grantRows.find(r => r.table_name === 'card_creation_idempotency')).toEqual({
+      table_name: 'card_creation_idempotency', sel: true, ins: true, upd: true, del: true,
+    });
+  });
+
   test('missing grants fail with classified table:PRIV entries', () => {
     const grantRows = ALL_APP_TABLES.map(t => ({ table_name: t, sel: true, ins: true, upd: true, del: true })).map(row =>
       row.table_name === 'cards' ? { ...row, upd: false } : row,
@@ -166,6 +191,17 @@ describe('classifyRlsReport', () => {
     expect(r.ok).toBe(false);
     expect(r.checks.grantsComplete).toBe(false);
     expect(r.checks.missingGrants).toEqual(['cards:UPDATE']);
+  });
+
+  test('missing resolver EXECUTE grant fails and is named without hiding table grants', () => {
+    const functionGrantRows = REQUIRED_FUNCTION_GRANTS
+      .filter(f => f.name !== 'resolve_session_user')
+      .map(f => ({ function_name: f.name, identity_arguments: f.identityArguments, execute_ok: true }));
+    const r = report(healthyInput({ functionGrantRows }));
+    expect(r.ok).toBe(false);
+    expect(r.checks.grantsComplete).toBe(false);
+    expect(r.checks.missingFunctionGrants).toEqual(['resolve_session_user(text):EXECUTE']);
+    expect(r.checks.missingGrants).toEqual(['resolve_session_user(text):EXECUTE']);
   });
 
   test('missing schema_migrations (schema not migrated) fails', () => {
@@ -228,6 +264,7 @@ const healthyHandlers = {
   'has_table_privilege': {
     rows: ALL_APP_TABLES.map(t => ({ table_name: t, sel: true, ins: true, upd: true, del: true })),
   },
+  'has_function_privilege': { rows: REQUIRED_FUNCTION_GRANTS.map(f => ({ function_name: f.name, identity_arguments: f.identityArguments, execute_ok: true })) },
   'has_schema_privilege': { rows: [{ usage_ok: true, create_ok: true }] },
   'row_security_active': { rows: TENANT_SENSITIVE_TABLES.map(t => ({ table_name: t, active: true })) },
 };
@@ -249,7 +286,7 @@ describe('verifyRls (scripted RlsDb)', () => {
     expect(db.statements.at(-1)).toBe('COMMIT');
     expect(db.statements).not.toContain('ROLLBACK');
     for (const s of db.statements.slice(1, -1)) expect(s.trim().toLowerCase().startsWith('select ')).toBe(true);
-    expect(db.statements.length).toBe(8); // BEGIN + 6 checks + COMMIT
+    expect(db.statements.length).toBe(9); // BEGIN + 7 checks + COMMIT
   });
 
   test('named-role mode skips row_security_active and binds the role name', async () => {

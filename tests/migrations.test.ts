@@ -30,6 +30,7 @@ const EXPECTED = [
   '011_card_soft_delete.sql',
   '012_privacy_info.sql',
   '013_card_idempotency.sql',
+  '014_app_role_grants.sql',
 ];
 
 test('migration files: exact expected set, runner-compatible names, stable order', async () => {
@@ -295,6 +296,30 @@ test('013 creates tenant-scoped encrypted idempotency storage with no raw-token 
   expect(m013).toMatch(/create policy tenant_isolation on card_creation_idempotency/i);
   expect(m013.replace(/^--.*$/gm, '')).not.toMatch(/raw[_ ]?token/i);
 });
+test('014 grants the dedicated app role idempotency DML and resolver EXECUTE privileges without role changes', async () => {
+  const m014 = await readFile(join(MIGRATIONS_DIR, '014_app_role_grants.sql'), 'utf8');
+  const stmts = m014.replace(/^--.*$/gm, '');
+  expect(stmts).toMatch(/if exists \(select 1 from pg_roles where rolname = 'app_role'\)/i);
+  expect(stmts).toMatch(/execute 'grant usage on schema public to app_role'/i);
+  expect(stmts).toMatch(/execute 'grant select, insert, update on table public\.card_creation_idempotency to app_role'/i);
+  for (const [name, args] of [['resolve_entry_point', 'text'], ['resolve_session_user', 'text'], ['membership_mfa_required', 'uuid']]) {
+    expect(stmts).toContain(`execute 'grant execute on function public.${name}(${args}) to app_role'`);
+  }
+  // GRANT is additive/idempotent; migration must not silently alter role
+  // attributes or remove privileges.
+  expect(stmts).not.toMatch(/\b(revoke|alter role|drop role|create role)\b/i);
+  expect((stmts.match(/execute 'grant /gi) ?? []).length).toBe(5);
+});
+
+test('013 idempotency key is tenant-scoped and cannot create duplicate rows', async () => {
+  const m013 = await readFile(join(MIGRATIONS_DIR, '013_card_idempotency.sql'), 'utf8');
+  expect(m013).toMatch(/primary key \(tenant_id, idempotency_key\)/i);
+  expect(m013).toMatch(/tenant_id uuid not null references tenants\(id\)/i);
+  expect(m013).toMatch(/enable row level security/i);
+  expect(m013).toMatch(/using \(tenant_id = nullif\(current_setting\('app\.tenant_id', true\), ''\)::uuid\)/i);
+  expect(m013).toMatch(/with check \(tenant_id = nullif\(current_setting\('app\.tenant_id', true\), ''\)::uuid\)/i);
+});
+
 test('012 adds tenant_branding.privacy_email only — nullable Art. 13 contact, no other schema change', async () => {
   const m001 = await readFile(join(MIGRATIONS_DIR, '001_init.sql'), 'utf8');
   const m012 = await readFile(join(MIGRATIONS_DIR, '012_privacy_info.sql'), 'utf8');
