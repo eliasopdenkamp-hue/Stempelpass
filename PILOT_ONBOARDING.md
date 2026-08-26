@@ -52,6 +52,23 @@ Verhalten und Sicherheitsvertrag:
 
 Erst ausführen, nachdem die Migrations- und Rollenprüfung (RLS_AUTH_P1.md Teil C) abgeschlossen ist und bevor `PILOT_READY=1` gesetzt wird (Reihenfolge: `db:migrate` → `db:seed-pilot` → App-Rolle/`rls-verify` → `PILOT_READY=1`).
 
+## Owner-Passwort setzen/rotieren (CLI, nur Operator)
+
+Für einen **bereits vorhandenen** Owner gibt es ausschließlich den operator-only CLI-Pfad `bun run db:rotate-owner-password`. Er läuft nie bei `VERCEL=1`, prüft vor jeder DML die Operator-/Tabellenowner-Rolle und sucht ausschließlich den bestehenden aktiven Owner über Tenant-Slug plus exakte Owner-E-Mail. Es werden keine User oder Memberships angelegt.
+
+```sh
+export DATABASE_URL='postgresql://.../db?sslmode=require'
+export OWNER_PASSWORD_ROTATION_TENANT_SLUG='stempelpass'
+export OWNER_PASSWORD_ROTATION_OWNER_EMAIL='owner@example.com'
+export OWNER_PASSWORD_ROTATION_ID="owner-rotation-$(date -u +%Y%m%dT%H%M%SZ)"
+read -r -s OWNER_PASSWORD_ROTATION_PASSWORD
+export OWNER_PASSWORD_ROTATION_PASSWORD
+bun run db:rotate-owner-password
+unset OWNER_PASSWORD_ROTATION_PASSWORD
+```
+
+Das Ersatzpasswort wird mit derselben scrypt-`hashPassword`-Logik gehasht, bevor `users.password_hash` geschrieben wird. Danach werden alle bestehenden Sessions des Users widerrufen und genau ein append-only Audit-Ereignis (`operator.owner_password_rotated`) geschrieben. Ausgabe enthält nur `status=rotated` bzw. `status=already_applied`; Passwort, E-Mail, Tenant- und interne IDs werden nie ausgegeben. Bei einem Retry dieselbe `OWNER_PASSWORD_ROTATION_ID` wiederverwenden; eine bereits erfolgreich angewendete Operation ändert weder Passwort noch Sessions erneut. Alternativ kann das Passwort über stdin gepiped werden. Das Passwort niemals als CLI-Argument verwenden oder in Dateien/Notizen schreiben.
+
 ## Migration und Tests
 
 Migration `006_pilot_onboarding.sql` ergänzt Entry-Points und Audit-Log, jeweils mit Tenant-RLS. Vor Pilotbetrieb Migrationen ausführen sowie Backups/Löschprozesse und Secrets produktiv konfigurieren. Keine echten Pilotdaten in Tests erzeugen.
