@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { GoogleWalletAdapter, PrivateKeyJwtSigner, IamSignBlobJwtSigner, walletAdapter, googleWalletConfiguration } from './wallet';
+import { GoogleWalletAdapter, GoogleWalletApiClassProvisioner, PrivateKeyJwtSigner, IamSignBlobJwtSigner, walletAdapter, googleWalletConfiguration } from './wallet';
 import { ExternalAccountCredentials, ServiceAccountJsonCredentials } from './gcp-credentials';
 const card = { id:'card-1', tenantId:'tenant-1', customerId:'customer-1', publicTokenHash:'hash', status:'active' as const, stampCount:3, revision:2, ruleId:'rule-1' };
 const branding = { cardTitle:'Café', cardText:'Treuekarte', primaryColor:'#123456', secondaryColor:'#fff', version:1 };
@@ -50,10 +50,12 @@ test('google adapter signs a loyalty JWT with supplied test key (fallback mode)'
 test('walletAdapter resolves the classic fallback from GOOGLE_SERVICE_ACCOUNT_JSON', async () => withCleanEnv(async () => {
   const key = await Bun.$`openssl genrsa 2048 2>/dev/null`.text();
   process.env.GOOGLE_ISSUER_ID = '123';
+  const calls: Array<{ url: string; init: RequestInit }> = [];
   process.env.GOOGLE_SERVICE_ACCOUNT_JSON = JSON.stringify({ client_email: 'sa@example.invalid', private_key: key });
-  const result = await walletAdapter('google').issue(card, branding);
+  const result = await walletAdapter('google', { fetchFn: mockGoogleFetch(calls) }).issue(card, branding);
   expect(result.status).toBe('issued');
   expect(result.artifact?.split('.')).toHaveLength(3);
+  expect(calls.map(c => c.url)).toEqual(['https://oauth2.googleapis.com/token', 'https://walletobjects.googleapis.com/walletobjects/v1/loyaltyClass/123.stempelpass_loyalty']);
 }));
 
 const EAC_CONFIG = JSON.stringify({
@@ -71,6 +73,12 @@ function mockGoogleFetch(calls: Array<{ url: string; init: RequestInit }>): type
     calls.push({ url, init: init ?? {} });
     if (url.endsWith('/token') && url.includes('sts.googleapis.com')) {
       return new Response(JSON.stringify({ access_token: 'sts-token', expires_in: 3600 }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (url === 'https://oauth2.googleapis.com/token') {
+      return new Response(JSON.stringify({ access_token: 'oauth-token', expires_in: 3600, token_type: 'Bearer' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (url.includes('/loyaltyClass/')) {
+      return new Response(JSON.stringify({ id: '123.stempelpass_loyalty' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     if (url.includes(':generateAccessToken')) {
       return new Response(JSON.stringify({ accessToken: 'sa-token', expireTime: new Date(Date.now() + 3600_000).toISOString() }), { status: 200, headers: { 'Content-Type': 'application/json' } });
@@ -108,12 +116,15 @@ test('keyless external-account mode issues a signed JWT without any private key 
   expect(calls.map(c => c.url)).toEqual([
     'https://sts.googleapis.com/v1/token',
     'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/wallet-sa@project.iam.gserviceaccount.com:generateAccessToken',
+    'https://walletobjects.googleapis.com/walletobjects/v1/loyaltyClass/123.stempelpass_loyalty',
+    'https://sts.googleapis.com/v1/token',
+    'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/wallet-sa@project.iam.gserviceaccount.com:generateAccessToken',
     'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/wallet-sa@project.iam.gserviceaccount.com:signBlob',
   ]);
   const stsBody = JSON.parse(String(calls[0].init.body)) as Record<string, string>;
   expect(stsBody.subject_token).toBe('vercel-oidc-token');
   expect(stsBody.subject_token_type).toBe('urn:ietf:params:oauth:token-type:jwt');
-  const signBlobAuth = (calls[2].init.headers as Record<string, string>).Authorization;
+  const signBlobAuth = (calls[5].init.headers as Record<string, string>).Authorization;
   expect(signBlobAuth).toBe('Bearer sa-token');
 }));
 
@@ -152,5 +163,29 @@ test('ServiceAccountJsonCredentials signs locally (fallback)', async () => {
   expect(creds.mode).toBe('service-account-json');
   const sig = await creds.signBlob(Buffer.from('hello'));
   expect(sig.length).toBeGreaterThan(0);
-  await expect(creds.getAccessToken()).rejects.toThrow('ACCESS_TOKEN_NOT_SUPPORTED_IN_FALLBACK_MODE');
+  const failingFetch = (async () => new Response('denied', { status: 403 })) as unknown as typeof fetch;
+  const tokenCreds = new ServiceAccountJsonCredentials('test@example.invalid', key, failingFetch);
+  await expect(tokenCreds.getAccessToken()).rejects.toThrow('GCP_TOKEN_FAILED_403');
+});
+
+
+test('Google Wallet class provisioning is idempotent (GET then CREATE on 404)', async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); calls.push({ url, init: init ?? {} });
+    if (url.includes('/loyaltyClass/')) return new Response('not found', { status: 404 });
+    return new Response(JSON.stringify({ id: '123.stempelpass_loyalty' }), { status: 200 });
+  }) as unknown as typeof fetch;
+  const credentials = {
+    mode: 'service-account-json' as const, clientEmail: 'sa@example.invalid', description: 'test',
+    signBlob: async () => new Uint8Array(),
+    getAccessToken: async (scope?: string) => { expect(scope).toBe('https://www.googleapis.com/auth/wallet_object.issuer'); return { token: 'access', expiresAt: Date.now() + 3_600_000 }; },
+  };
+  const provisioner = new GoogleWalletApiClassProvisioner(credentials, fetchFn);
+  await provisioner.ensureClassExists({ id: '123.stempelpass_loyalty', issuerName: 'Stempelpass', programName: 'StempelPass', reviewStatus: 'UNDER_REVIEW', programLogo: { sourceUri: { uri: 'https://example.invalid/logo.png' } } });
+  expect(calls.map(call => call.url)).toEqual([
+    'https://walletobjects.googleapis.com/walletobjects/v1/loyaltyClass/123.stempelpass_loyalty',
+    'https://walletobjects.googleapis.com/walletobjects/v1/loyaltyClass',
+  ]);
+  expect(JSON.parse(String(calls[1].init.body)).reviewStatus).toBe('UNDER_REVIEW');
 });

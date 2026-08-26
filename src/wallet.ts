@@ -1,11 +1,12 @@
 import type { Branding, Provider, WalletArtifact, WalletCardView } from './domain.js';
 import { createSign } from 'node:crypto';
-import { resolveGcpCredentials, gcpCredentialMode, base64url, type GcpCredentialProvider } from './gcp-credentials.js';
+import { resolveGcpCredentials, gcpCredentialMode, base64url, WALLET_OBJECT_SCOPE, type GcpCredentialProvider } from './gcp-credentials.js';
 
 export interface LoyaltyClass {
   id: string;
   issuerName: string;
   programName: string;
+  reviewStatus?: 'UNDER_REVIEW' | 'APPROVED';
   programLogo?: { sourceUri: { uri: string } };
 }
 export interface LoyaltyObject {
@@ -54,6 +55,30 @@ class UnconfiguredWalletAdapter implements WalletAdapter {
   async revoke(_card: WalletCardView) { /* no external call without credentials */ }
 }
 
+export interface GoogleWalletClassProvisioner {
+  ensureClassExists(classModel: LoyaltyClass): Promise<void>;
+}
+
+/** Idempotently provisions the issuer-wide LoyaltyClass before issuing a pass. */
+export class GoogleWalletApiClassProvisioner implements GoogleWalletClassProvisioner {
+  constructor(private readonly credentials: GcpCredentialProvider, private readonly fetchFn: typeof fetch = fetch) {}
+
+  async ensureClassExists(classModel: LoyaltyClass): Promise<void> {
+    const { token } = await this.credentials.getAccessToken(WALLET_OBJECT_SCOPE);
+    const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+    const url = `https://walletobjects.googleapis.com/walletobjects/v1/loyaltyClass/${encodeURIComponent(classModel.id)}`;
+    const existing = await this.fetchFn(url, { headers });
+    if (existing.ok) return;
+    if (existing.status !== 404) throw new Error(`GOOGLE_WALLET_CLASS_GET_FAILED_${existing.status}`);
+
+    const create = await this.fetchFn('https://walletobjects.googleapis.com/walletobjects/v1/loyaltyClass', {
+      method: 'POST', headers, body: JSON.stringify(classModel),
+    });
+    if (create.ok || create.status === 409) return;
+    throw new Error(`GOOGLE_WALLET_CLASS_CREATE_FAILED_${create.status}`);
+  }
+}
+
 export class GoogleWalletAdapter implements WalletAdapter {
   readonly classModel: LoyaltyClass;
   /**
@@ -67,13 +92,21 @@ export class GoogleWalletAdapter implements WalletAdapter {
     private readonly signer: JwtSigner,
     private readonly clientEmail: string,
     private readonly credentialMode: 'service-account-json' | 'external-account',
+    private readonly classProvisioner?: GoogleWalletClassProvisioner,
   ) {
-    this.classModel = { id: `${issuerId}.stempelpass_loyalty`, issuerName: 'StempelPass Deutschland', programName: 'StempelPass' };
+    this.classModel = {
+      id: `${issuerId}.stempelpass_loyalty`,
+      issuerName: 'Stempelpass',
+      programName: 'StempelPass',
+      reviewStatus: 'UNDER_REVIEW',
+      programLogo: { sourceUri: { uri: 'https://www.gstatic.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png' } },
+    };
   }
   private objectModel(card: WalletCardView, branding: Branding, context?: { stampRequired?: number; rewardTitle?: string }): LoyaltyObject {
     return { id: `${this.issuerId}.${card.id}`, classId: this.classModel.id, state: 'ACTIVE', loyaltyPoints: { balance: { int: card.stampCount } }, textModulesData: [{ header: branding.cardTitle, body: `${card.stampCount}/${context?.stampRequired ?? '?'} Stempel · ${context?.rewardTitle ?? 'Prämie'}` }] };
   }
   async issue(card: WalletCardView, branding: Branding, context?: { stampRequired?: number; rewardTitle?: string }): Promise<WalletArtifact> {
+    if (this.classProvisioner) await this.classProvisioner.ensureClassExists(this.classModel);
     const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'savetowallet' }));
     const payload = base64url(JSON.stringify({ iss: this.clientEmail, aud: 'google', typ: 'savetowallet', iat: Math.floor(Date.now() / 1000), payload: { loyaltyObjects: [this.objectModel(card, branding, context)] } }));
     const signature = await this.signer.sign(`${header}.${payload}`);
@@ -106,9 +139,8 @@ export function walletAdapter(provider: Provider, options: WalletAdapterOptions 
     if (resolution.provider) {
       const creds = resolution.provider;
       if (!creds.clientEmail) return new UnconfiguredWalletAdapter(provider, 'service account email is not derivable from the configured credentials');
-      // Both modes expose signBlob(): external-account signs via IAM Credentials
-      // (keyless), service-account-json signs locally with the private key.
-      return new GoogleWalletAdapter(issuerId, new IamSignBlobJwtSigner(creds), creds.clientEmail, creds.mode);
+      const provisioner = new GoogleWalletApiClassProvisioner(creds, options.fetchFn);
+      return new GoogleWalletAdapter(issuerId, new IamSignBlobJwtSigner(creds), creds.clientEmail, creds.mode, provisioner);
     }
     return new UnconfiguredWalletAdapter(provider, resolution.missing.join(', ') || 'GOOGLE_ISSUER_ID');
   }

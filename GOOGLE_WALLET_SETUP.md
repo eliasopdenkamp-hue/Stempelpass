@@ -2,8 +2,10 @@
 
 StempelPass uses Google Wallet Loyalty classes/objects, not Google Pay payments.
 The adapter returns a server-signed `savetowallet` JWT only when a credential
-source is configured. Without credentials it returns `status: not_configured`
-and no URL or fake pass.
+source is configured. Before issuing it, the adapter idempotently GETs the
+issuer-wide LoyaltyClass and creates it through the Google Wallet API when it
+is missing. Without credentials it returns `status: not_configured` and no URL
+or fake pass.
 
 The "Save to Google Wallet" flow fundamentally requires the JWT to be signed
 with a Google service-account private key. This project supports two ways to
