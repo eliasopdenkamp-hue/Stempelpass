@@ -40,8 +40,8 @@ export interface GcpCredentialProvider {
   readonly description: string;
   /** Sign raw bytes with the service-account key (RS256). Never returns key material. */
   signBlob(input: Uint8Array): Promise<Uint8Array>;
-  /** Obtain a short-lived Google access token (external-account mode only). */
-  getAccessToken(): Promise<GcpAccessToken>;
+  /** Obtain a short-lived Google access token for the requested API scope. */
+  getAccessToken(scope?: string): Promise<GcpAccessToken>;
 }
 
 export interface GcpCredentialResolution {
@@ -60,7 +60,8 @@ export interface ExternalAccountConfig {
   scope?: string;
 }
 
-const CLOUD_PLATFORM_SCOPE = 'https://www.googleapis.com/auth/cloud-platform';
+export const CLOUD_PLATFORM_SCOPE = 'https://www.googleapis.com/auth/cloud-platform';
+export const WALLET_OBJECT_SCOPE = 'https://www.googleapis.com/auth/wallet_object.issuer';
 const STS_TOKEN_URL = 'https://sts.googleapis.com/v1/token';
 
 function base64url(value: string | Uint8Array): string {
@@ -103,7 +104,7 @@ export class ExternalAccountCredentials implements GcpCredentialProvider {
   readonly mode: GcpCredentialMode = 'external-account';
   readonly clientEmail: string | null;
   readonly description = 'Google Workload Identity Federation (external account, keyless)';
-  private cached: GcpAccessToken | null = null;
+  private readonly cached = new Map<string, GcpAccessToken>();
   private readonly scope: string;
 
   constructor(
@@ -118,8 +119,9 @@ export class ExternalAccountCredentials implements GcpCredentialProvider {
     this.scope = config.scope ?? CLOUD_PLATFORM_SCOPE;
   }
 
-  async getAccessToken(): Promise<GcpAccessToken> {
-    if (this.cached && this.cached.expiresAt > this.now() + 60_000) return this.cached;
+  async getAccessToken(scope = this.scope): Promise<GcpAccessToken> {
+    const cached = this.cached.get(scope);
+    if (cached && cached.expiresAt > this.now() + 60_000) return cached;
     const subjectToken = await this.getSubjectToken();
     if (!subjectToken) throw new GcpCredentialsError('OIDC_TOKEN_MISSING');
     const stsUrl = this.config.token_url ?? STS_TOKEN_URL;
@@ -130,7 +132,7 @@ export class ExternalAccountCredentials implements GcpCredentialProvider {
         audience: this.config.audience,
         grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
         requested_token_type: 'urn:ietf:params:oauth:token-type:access_token',
-        scope: this.scope,
+        scope,
         subject_token: subjectToken,
         subject_token_type: this.config.subject_token_type ?? 'urn:ietf:params:oauth:token-type:jwt',
       }),
@@ -141,25 +143,27 @@ export class ExternalAccountCredentials implements GcpCredentialProvider {
     const stsExpiresAt = this.now() + (sts.expires_in ?? 3600) * 1000;
 
     if (!this.config.service_account_impersonation_url) {
-      this.cached = { token: sts.access_token, expiresAt: stsExpiresAt };
-      return this.cached;
+      const token = { token: sts.access_token, expiresAt: stsExpiresAt };
+      this.cached.set(scope, token);
+      return token;
     }
     const impResponse = await this.fetchFn(this.config.service_account_impersonation_url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sts.access_token}` },
-      body: JSON.stringify({ scope: [this.scope], lifetime: '3600s' }),
+      body: JSON.stringify({ scope: [scope], lifetime: '3600s' }),
     });
     if (!impResponse.ok) throw new GcpCredentialsError(`GCP_IMPERSONATION_FAILED_${impResponse.status}`);
     const imp = (await impResponse.json()) as { accessToken?: string; expireTime?: string };
     if (!imp.accessToken) throw new GcpCredentialsError('GCP_IMPERSONATION_NO_TOKEN');
     const expiresAt = imp.expireTime ? Date.parse(imp.expireTime) : stsExpiresAt;
-    this.cached = { token: imp.accessToken, expiresAt };
-    return this.cached;
+    const token = { token: imp.accessToken, expiresAt };
+    this.cached.set(scope, token);
+    return token;
   }
 
   async signBlob(input: Uint8Array): Promise<Uint8Array> {
     if (!this.clientEmail) throw new GcpCredentialsError('GCP_IMPERSONATION_URL_REQUIRED');
-    const { token } = await this.getAccessToken();
+    const { token } = await this.getAccessToken(CLOUD_PLATFORM_SCOPE);
     const response = await this.fetchFn(
       `https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${this.clientEmail}:signBlob`,
       {
@@ -186,7 +190,13 @@ export class ServiceAccountJsonCredentials implements GcpCredentialProvider {
   readonly mode: GcpCredentialMode = 'service-account-json';
   readonly clientEmail: string;
   readonly description = 'classic service-account key (fallback mode)';
-  constructor(client_email: string, private_key: string) {
+  private readonly cached = new Map<string, GcpAccessToken>();
+  constructor(
+    client_email: string,
+    private_key: string,
+    private readonly fetchFn: typeof fetch = fetch,
+    private readonly now: () => number = Date.now,
+  ) {
     this.clientEmail = client_email;
     fallbackPrivateKeys.set(this, private_key);
   }
@@ -198,8 +208,30 @@ export class ServiceAccountJsonCredentials implements GcpCredentialProvider {
     signer.end();
     return signer.sign(key);
   }
-  async getAccessToken(): Promise<GcpAccessToken> {
-    throw new GcpCredentialsError('ACCESS_TOKEN_NOT_SUPPORTED_IN_FALLBACK_MODE');
+  async getAccessToken(scope = WALLET_OBJECT_SCOPE): Promise<GcpAccessToken> {
+    const cached = this.cached.get(scope);
+    if (cached && cached.expiresAt > this.now() + 60_000) return cached;
+    const key = fallbackPrivateKeys.get(this);
+    if (!key) throw new GcpCredentialsError('FALLBACK_KEY_UNAVAILABLE');
+    const tokenUrl = 'https://oauth2.googleapis.com/token';
+    const now = Math.floor(this.now() / 1000);
+    const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+    const claims = base64url(JSON.stringify({ iss: this.clientEmail, scope, aud: tokenUrl, iat: now, exp: now + 3600 }));
+    const signer = createSign('RSA-SHA256');
+    signer.update(`${header}.${claims}`, 'utf8');
+    signer.end();
+    const assertion = `${header}.${claims}.${signer.sign(key, 'base64url')}`;
+    const response = await this.fetchFn(tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion }),
+    });
+    if (!response.ok) throw new GcpCredentialsError(`GCP_TOKEN_FAILED_${response.status}`);
+    const body = await response.json() as { access_token?: string; expires_in?: number };
+    if (!body.access_token) throw new GcpCredentialsError('GCP_TOKEN_NO_ACCESS_TOKEN');
+    const token = { token: body.access_token, expiresAt: this.now() + (body.expires_in ?? 3600) * 1000 };
+    this.cached.set(scope, token);
+    return token;
   }
 }
 
@@ -282,7 +314,7 @@ export function resolveGcpCredentials(
   const email = parsedJson?.client_email ?? fileSa?.client_email ?? env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
   const key =
     parsedJson?.private_key ?? fileSa?.private_key ?? env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
-  if (email && key) return { provider: new ServiceAccountJsonCredentials(email, key), missing: [] };
+  if (email && key) return { provider: new ServiceAccountJsonCredentials(email, key, options.fetchFn ?? fetch), missing: [] };
 
   if (rawExternal || adcPath || rawJson || env.GOOGLE_SERVICE_ACCOUNT_EMAIL || env.GOOGLE_PRIVATE_KEY) {
     if (!email) missing.push('GOOGLE_SERVICE_ACCOUNT_EMAIL (or complete service-account JSON)');
