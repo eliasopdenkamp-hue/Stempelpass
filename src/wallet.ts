@@ -93,6 +93,8 @@ export class GoogleWalletAdapter implements WalletAdapter {
     private readonly clientEmail: string,
     private readonly credentialMode: 'service-account-json' | 'external-account',
     private readonly classProvisioner?: GoogleWalletClassProvisioner,
+    private readonly credentials?: GcpCredentialProvider,
+    private readonly fetchFn: typeof fetch = fetch,
   ) {
     this.classModel = {
       id: `${issuerId}.stempelpass_loyalty`,
@@ -116,7 +118,24 @@ export class GoogleWalletAdapter implements WalletAdapter {
     return { provider: 'google', status: 'issued', message, artifact: `${header}.${payload}.${signature}` };
   }
   async refresh(_card: WalletCardView, _changedFields: string[]) { return { provider: 'google' as const, status: 'issued' as const, message: 'Google Wallet object refresh is handled by the issuer API.' }; }
-  async revoke(_card: WalletCardView) { /* issuer API integration follows credential verification */ }
+  async revoke(card: WalletCardView): Promise<void> {
+    if (!this.credentials) {
+      console.error('wallet_revoke_failed code=GOOGLE_WALLET_CREDENTIALS_UNAVAILABLE');
+      return;
+    }
+    try {
+      const { token } = await this.credentials.getAccessToken(WALLET_OBJECT_SCOPE);
+      const response = await this.fetchFn(
+        `https://walletobjects.googleapis.com/walletobjects/v1/loyaltyObject/${encodeURIComponent(`${this.issuerId}.${card.id}`)}`,
+        { method: 'PATCH', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ state: 'INACTIVE' }) },
+      );
+      if (!response.ok && response.status !== 404) throw new Error(`GOOGLE_WALLET_REVOKE_FAILED_${response.status}`);
+    } catch (error) {
+      const code = error instanceof Error && /^GOOGLE_WALLET_REVOKE_FAILED_[0-9]+$/.test(error.message)
+        ? error.message : 'GOOGLE_WALLET_REVOKE_UNAVAILABLE';
+      console.error(`wallet_revoke_failed code=${code}`);
+    }
+  }
 }
 
 export interface WalletAdapterOptions {
@@ -140,7 +159,7 @@ export function walletAdapter(provider: Provider, options: WalletAdapterOptions 
       const creds = resolution.provider;
       if (!creds.clientEmail) return new UnconfiguredWalletAdapter(provider, 'service account email is not derivable from the configured credentials');
       const provisioner = new GoogleWalletApiClassProvisioner(creds, options.fetchFn);
-      return new GoogleWalletAdapter(issuerId, new IamSignBlobJwtSigner(creds), creds.clientEmail, creds.mode, provisioner);
+      return new GoogleWalletAdapter(issuerId, new IamSignBlobJwtSigner(creds), creds.clientEmail, creds.mode, provisioner, creds, options.fetchFn);
     }
     return new UnconfiguredWalletAdapter(provider, resolution.missing.join(', ') || 'GOOGLE_ISSUER_ID');
   }

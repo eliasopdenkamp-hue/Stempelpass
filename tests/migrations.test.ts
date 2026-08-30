@@ -31,6 +31,7 @@ const EXPECTED = [
   '012_privacy_info.sql',
   '013_card_idempotency.sql',
   '014_app_role_grants.sql',
+  '015_customer_legal_retention_hold.sql',
 ];
 
 test('migration files: exact expected set, runner-compatible names, stable order', async () => {
@@ -509,4 +510,10 @@ test('runMigrations: failed migration rolls back, records no version, releases t
     expect(state.executed['create table beta ();']).toBe(1);
     expect([...state.versions].sort()).toEqual(['001_init.sql', '002_broken.sql']);
   });
+});
+
+test('015 adds an explicit legal-retention hold for hard-delete candidates', async () => {
+  const m015 = await readFile(join(MIGRATIONS_DIR, '015_customer_legal_retention_hold.sql'), 'utf8');
+  expect(m015).toMatch(/alter table customers add column legal_retention_hold boolean not null default false/i);
+  expect(m015).toMatch(/customers_hard_delete_candidates/i);
 });
