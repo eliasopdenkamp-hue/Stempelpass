@@ -36,9 +36,21 @@ integration('database scenarios run in an isolated temporary schema', async () =
   if (url === process.env.DATABASE_URL) throw new Error('TEST_DATABASE_URL_MUST_NOT_EQUAL_DATABASE_URL');
 
   const schema = `test_${crypto.randomUUID().replaceAll('-', '')}`;
+  // Neon can route pooled queries through a different backend session, so a
+  // per-session SET alone is not sufficient to pin unqualified test queries.
+  // Send the schema as a startup connection parameter as well, then retain the
+  // explicit setPath() verification for every reserved connection.
+  const schemaSearchPath = `"${schema}", public`;
   // Keep every test connection bounded. A stale session or catalog lock in the
   // shared disposable database must fail the test, never leave Bun waiting.
-  const sql = postgres(url, { max: 4, prepare: false, connect_timeout: 10, idle_timeout: 2, max_lifetime: 30 });
+  const sql = postgres(url, {
+    max: 4,
+    prepare: false,
+    connect_timeout: 10,
+    idle_timeout: 2,
+    max_lifetime: 30,
+    connection: { search_path: schemaSearchPath },
+  });
   const migrationDir = join(import.meta.dir, '../migrations');
   const configureConnection = async (db: Queryable) => {
     await db.unsafe("set statement_timeout = '10s'; set lock_timeout = '2s'");
@@ -114,7 +126,9 @@ integration('database scenarios run in an isolated temporary schema', async () =
     console.error('DB_PHASE:verify_tables:done');
 
     // The production plans are 500/1000. This local check is intentionally removed for a one-slot limit test.
-    await q('alter table tenants drop constraint if exists tenants_customer_limit_check');
+    // Keep this DDL schema-qualified too: it is the only setup mutation that
+    // changes a migrated table definition, and must never target public.tenants.
+    await q(`alter table "${schema}".tenants drop constraint if exists tenants_customer_limit_check`);
     const tenantA = (await q<{ id: string }>("insert into tenants(slug,legal_name,plan_code,customer_limit) values('tenant-a','Tenant A','up_to_500',1) returning id"))[0].id;
     const tenantB = (await q<{ id: string }>("insert into tenants(slug,legal_name,plan_code,customer_limit) values('tenant-b','Tenant B','up_to_500',1) returning id"))[0].id;
     const user = (await q<{ id: string }>("insert into users(email) values('db-test@example.invalid') returning id"))[0].id;
