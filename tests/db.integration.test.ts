@@ -202,7 +202,7 @@ integration('database scenarios run in an isolated temporary schema', async () =
       await r("insert into rewards(tenant_id,card_id,rule_id,status) values($1,$2,$3,'issued')", [retentionTenant, oldCard, retentionRule]);
       await r("insert into card_creation_idempotency(tenant_id,idempotency_key,request_fingerprint,card_id,token_ciphertext) values($1,'retention-create-key','retention-fingerprint',$2,'retention-token-ciphertext')", [retentionTenant, oldCard]);
       await r("insert into communication_preferences(tenant_id,customer_id,purpose,channel,opted_in,opted_in_at) values($1,$2,'marketing','email',true,now())", [retentionTenant, oldCustomer]);
-      await r("insert into communication_consent_events(tenant_id,customer_id,purpose,channel,action,source) values($1,$2,'marketing','email','opt_in','retention-test-source')", [retentionTenant, oldCustomer]);
+      await r("insert into communication_consent_events(tenant_id,customer_id,purpose,channel,action,source) values($1,$2,'marketing','email','opt_in','web_form')", [retentionTenant, oldCustomer]);
       await r("insert into communication_message_logs(tenant_id,customer_id,purpose,channel,message_type,recipient_hash,status,provider_message_id) values($1,$2,'marketing','email','retention-test','retention-recipient-hash','sent','retention-provider-id')", [retentionTenant, oldCustomer]);
 
       const revokedOld = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
