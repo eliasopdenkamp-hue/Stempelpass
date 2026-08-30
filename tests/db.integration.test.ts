@@ -9,7 +9,9 @@ import type { WalletAdapter } from '../src/wallet';
 // Deliberately no DATABASE_URL fallback: integration tests require an explicit disposable DB.
 const url = process.env.TEST_DATABASE_URL;
 const integration = url ? test : test.skip;
-setDefaultTimeout(30_000);
+// Neon migration plus retention scenarios can exceed Bun's 30-second default;
+// keep the higher ceiling local to this integration file rather than the suite.
+setDefaultTimeout(300_000);
 
 // Bun's test timeout must never be the first timeout we hit. PostgreSQL's
 // statement/lock settings protect the server, while this deadline also covers
