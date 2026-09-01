@@ -216,10 +216,15 @@ test('public card HTML renders the Art. 13 privacy block with controller and con
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('text/html');
     const html = await res.text();
-    // Art. 13 block: controller, processor note, rights + contact.
+    // Art. 13 block: controller, processor note, retention, rights + contact.
     expect(html).toContain('Datenschutz');
     expect(html).toContain('Verantwortlich für die Verarbeitung: Beispiel GmbH');
     expect(html).toContain('Auftragsverarbeiter (Art. 28 DSGVO)');
+    expect(html).toContain('Die Karte wird nach 12 Monaten ohne Stempelaktivität deaktiviert.');
+    expect(html).toContain('Kundendaten werden 30 Tage nach der Soft-Löschung endgültig gelöscht.');
+    expect(html).toContain('die Kommunikationshistorie 24 Monate gespeichert');
+    expect(html).toContain('für einen Zeitraum von 3 Jahren nach Ihrem Widerruf gespeichert');
+    expect(html).toContain('Audit-Aufzeichnungen werden zur Beweissicherung dauerhaft aufbewahrt.');
     expect(html).toContain('Kontakt für Anfragen: datenschutz@beispiel.de');
     // Never card/customer internals in the HTML.
     expect(html).not.toContain('customerId');
