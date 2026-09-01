@@ -195,7 +195,7 @@ async function verifyRuntimeGrants(db: QueryConnection): Promise<void> {
       if (!rows[0]?.granted) missing.push(`${table}:${privilege}`);
     }
   }
-  const schemaRows = await query<{ granted: boolean }>(db, 'select has_schema_privilege($1::name, $2::text) as granted', [TEST_ROLE, 'public']);
+  const schemaRows = await query<{ granted: boolean }>(db, 'select has_schema_privilege($1::name, $2::text, \'USAGE\') as granted', [TEST_ROLE, 'public']);
   if (!schemaRows[0]?.granted) missing.push('public:USAGE');
   for (const required of REQUIRED_FUNCTION_GRANTS) {
     const match = required.match(/^([^(:]+)\(([^)]*)\):EXECUTE$/)!;
