@@ -432,6 +432,26 @@ async function runHarness(url: string): Promise<{ checks: Check[]; tableCounts?:
   }
 }
 
+function redactDiagnostic(value: string): string {
+  return value
+    .replace(/postgres(?:ql)?:\/\/[^\s\"']+/gi, '[REDACTED_DATABASE_URL]')
+    .replace(/((?:password|token|secret|authorization|cookie|api[_-]?key)[=:]\s*)[^\s,;]+/gi, '$1[REDACTED]')
+    .replace(/\b[a-f0-9]{64}\b/gi, '[REDACTED_HASH]')
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[REDACTED_EMAIL]');
+}
+
+function unexpectedErrorDetails(error: unknown): { name: string; message: string; stack?: string } {
+  if (error instanceof Error) {
+    const details: { name: string; message: string; stack?: string } = {
+      name: redactDiagnostic(error.name),
+      message: redactDiagnostic(error.message),
+    };
+    if (error.stack) details.stack = redactDiagnostic(error.stack);
+    return details;
+  }
+  return { name: typeof error, message: redactDiagnostic(String(error)) };
+}
+
 async function main(): Promise<number> {
   const env = process.env;
   if (env.VERCEL === '1') {
@@ -450,7 +470,9 @@ async function main(): Promise<number> {
     console.log(JSON.stringify({ ...result, failures }, null, 2));
     return failures.length ? 1 : 0;
   } catch (error) {
-    const failure = error instanceof HarnessFailure ? { code: error.code, details: error.details } : { code: 'HARNESS_FAILED' };
+    const failure = error instanceof HarnessFailure
+      ? { kind: 'harness_failure', code: error.code, details: error.details }
+      : { kind: 'unexpected_error', code: 'HARNESS_FAILED', error: unexpectedErrorDetails(error) };
     console.log(JSON.stringify({ checks: [{ name: 'harness execution', expected: 'ready', actual: failure, pass: false }], failures: ['harness execution'] }, null, 2));
     return 1;
   }
