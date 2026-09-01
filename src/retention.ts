@@ -11,6 +11,8 @@ import { walletAdapter, type WalletAdapter } from './wallet.js';
 export const RETENTION_LOCK_KEY = 742_005;
 export const CUSTOMER_HARD_DELETE_RETENTION = '30 days';
 export const REVOKED_SESSION_RETENTION = '7 days';
+export const MESSAGE_LOG_RETENTION = '24 months';
+export const CONSENT_EVENT_RETENTION_AFTER_REVOCATION = '3 years';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -56,6 +58,8 @@ const CANDIDATES_TENANT = `select id, tenant_id from customers
 /** Counts only database rows actually removed; no ids are returned to callers. */
 export interface RetentionCounts {
   sessionsDeleted: number;
+  messageLogsRetentionDeleted: number;
+  consentEventsRetentionDeleted: number;
   customersHardDeleted: number;
   cardsHardDeleted: number;
   communicationMessageLogsDeleted: number;
@@ -69,6 +73,8 @@ export interface RetentionCounts {
 
 const emptyCounts = (): RetentionCounts => ({
   sessionsDeleted: 0,
+  messageLogsRetentionDeleted: 0,
+  consentEventsRetentionDeleted: 0,
   customersHardDeleted: 0,
   cardsHardDeleted: 0,
   communicationMessageLogsDeleted: 0,
@@ -96,6 +102,42 @@ export async function runRetention(db: TxClient, tenantId: string | null, wallet
     ? `delete from sessions where tenant_id = $1 and ((revoked_at is null and expires_at <= now()) or (revoked_at is not null and revoked_at <= now() - interval '${REVOKED_SESSION_RETENTION}')) returning id`
     : `delete from sessions where (revoked_at is null and expires_at <= now()) or (revoked_at is not null and revoked_at <= now() - interval '${REVOKED_SESSION_RETENTION}') returning id`;
   counts.sessionsDeleted = await deleteRows(db, sessionSql, tenantId ? [tenantId] : []);
+
+  const messageLogsRetentionSql = tenantId
+    ? `delete from communication_message_logs where tenant_id = $1 and created_at <= now() - interval '${MESSAGE_LOG_RETENTION}' returning id`
+    : `delete from communication_message_logs where created_at <= now() - interval '${MESSAGE_LOG_RETENTION}' returning id`;
+  counts.messageLogsRetentionDeleted = await deleteRows(db, messageLogsRetentionSql, tenantId ? [tenantId] : []);
+
+  // Consent history is evidence of both opt-in and withdrawal. Retain it until
+  // the customer's latest non-null withdrawal timestamp is older than the
+  // owner-confirmed period; customers with no withdrawal remain untouched.
+  const consentEventsRetentionSql = tenantId
+    ? `delete from communication_consent_events e
+ where e.tenant_id = $1
+   and exists (
+     select 1 from communication_preferences p
+      where p.tenant_id = e.tenant_id
+        and p.customer_id = e.customer_id
+      group by p.tenant_id, p.customer_id
+      having max(p.withdrawn_at) is not null
+         and max(p.withdrawn_at) <= now() - interval '${CONSENT_EVENT_RETENTION_AFTER_REVOCATION}'
+   )
+ returning id`
+    : `delete from communication_consent_events e
+ where exists (
+     select 1 from communication_preferences p
+      where p.tenant_id = e.tenant_id
+        and p.customer_id = e.customer_id
+      group by p.tenant_id, p.customer_id
+      having max(p.withdrawn_at) is not null
+         and max(p.withdrawn_at) <= now() - interval '${CONSENT_EVENT_RETENTION_AFTER_REVOCATION}'
+   )
+ returning id`;
+  counts.consentEventsRetentionDeleted = await deleteRows(
+    db,
+    consentEventsRetentionSql,
+    tenantId ? [tenantId] : [],
+  );
 
   const candidates = (tenantId
     ? await db.query<RetentionCustomer>(CANDIDATES_TENANT, [tenantId])
@@ -149,6 +191,8 @@ export function formatRetentionResult(counts: RetentionCounts, durationMs: numbe
   return [
     'retention_ok',
     `sessions_deleted=${counts.sessionsDeleted}`,
+    `message_logs_retention_deleted=${counts.messageLogsRetentionDeleted}`,
+    `consent_events_retention_deleted=${counts.consentEventsRetentionDeleted}`,
     `customers_hard_deleted=${counts.customersHardDeleted}`,
     `cards_hard_deleted=${counts.cardsHardDeleted}`,
     `communication_message_logs_deleted=${counts.communicationMessageLogsDeleted}`,
