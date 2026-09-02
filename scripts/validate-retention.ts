@@ -163,6 +163,13 @@ function allZero(counts: RetentionCounts): boolean {
 }
 function quoteIdentifier(value: string): string { return `"${value.replaceAll('"', '""')}"`; }
 
+/** Keep setup and grant checks on the authenticated admin context, never on a
+ * role left behind by the negative-path CLI probe. */
+async function resetHarnessContext(db: QueryConnection): Promise<void> {
+  await exec(db, 'reset role');
+  await exec(db, 'set search_path to public, pg_catalog');
+}
+
 async function prepareMigrations(db: QueryConnection): Promise<void> {
   await exec(db, 'set search_path to public, pg_catalog');
   await exec(db, 'create table if not exists schema_migrations (version text primary key, applied_at timestamptz not null default now())');
@@ -263,10 +270,17 @@ async function insertFixtures(db: QueryConnection): Promise<void> {
   await exec(db, 'insert into communication_message_logs(tenant_id, customer_id, purpose, channel, message_type, recipient_hash, status, provider_message_id, created_at) values ($1,$2,\'marketing\',\'email\',\'fixture-23-month\',$3,\'sent\',\'fixture-provider-23\',$4::timestamptz),($1,$2,\'marketing\',\'email\',\'fixture-25-month\',$3,\'sent\',\'fixture-provider-25\',$5::timestamptz),($1,$6,\'service\',\'email\',\'fixture-customer\',$3,\'sent\',\'fixture-provider-customer\',$7::timestamptz),($8,$9,\'service\',\'email\',\'fixture-b-25-month\',$3,\'sent\',\'fixture-provider-b\',$5::timestamptz)', [
     IDS.tenantA, IDS.activeA, hash('fixture-recipient'), m23, m25, IDS.staleA, now, IDS.tenantB, IDS.staleB,
   ]);
-  await exec(db, 'insert into sessions(id, user_id, tenant_id, token_hash, csrf_token_hash, expires_at, revoked_at) values ($1,$2,$3,$4,$5,$6::timestamptz,null::timestamptz),($7,$2,$3,$8,$9,$10::timestamptz,null::timestamptz),($11,$2,$3,$12,$13,$14::timestamptz,$15::timestamptz),($16,$2,$3,$17,$18,$19::timestamptz,$20::timestamptz)', [
-    '00000000-0000-4000-8000-000000000801', IDS.userA, IDS.tenantA, hash('active-session'), hash('active-csrf'), future,
-    '00000000-0000-4000-8000-000000000802', IDS.userA, IDS.tenantA, hash('expired-session'), hash('expired-csrf'), minusDays(now, 1),
+  const sessionInsert = 'insert into sessions(id, user_id, tenant_id, token_hash, csrf_token_hash, expires_at, revoked_at) values ($1,$2,$3,$4,$5,$6::timestamptz,$7::timestamptz)';
+  await exec(db, sessionInsert, [
+    '00000000-0000-4000-8000-000000000801', IDS.userA, IDS.tenantA, hash('active-session'), hash('active-csrf'), future, null,
+  ]);
+  await exec(db, sessionInsert, [
+    '00000000-0000-4000-8000-000000000802', IDS.userA, IDS.tenantA, hash('expired-session'), hash('expired-csrf'), minusDays(now, 1), null,
+  ]);
+  await exec(db, sessionInsert, [
     '00000000-0000-4000-8000-000000000803', IDS.userA, IDS.tenantA, hash('revoked-6-session'), hash('revoked-6-csrf'), future, d6,
+  ]);
+  await exec(db, sessionInsert, [
     '00000000-0000-4000-8000-000000000804', IDS.userA, IDS.tenantA, hash('revoked-8-session'), hash('revoked-8-csrf'), future, d8,
   ]);
 }
@@ -352,8 +366,13 @@ async function invokeCli(
 async function createInvalidRole(db: QueryConnection): Promise<void> {
   await exec(db, `drop role if exists ${quoteIdentifier(INVALID_ROLE)}`);
   await exec(db, `create role ${quoteIdentifier(INVALID_ROLE)} noinherit`);
+  // Neon owner connections are not implicitly allowed to SET ROLE to a role
+  // they created; grant membership so the negative-path probe reaches the
+  // production operator-role check instead of failing with 42501.
+  await exec(db, `grant ${quoteIdentifier(INVALID_ROLE)} to current_user`);
 }
 async function dropInvalidRole(db: QueryConnection): Promise<void> {
+  await exec(db, `revoke ${quoteIdentifier(INVALID_ROLE)} from current_user`);
   await exec(db, `drop role if exists ${quoteIdentifier(INVALID_ROLE)}`);
 }
 
@@ -381,7 +400,9 @@ async function runHarness(url: string): Promise<{ checks: Check[]; tableCounts?:
   } satisfies WalletAdapter & { revokeCalls: string[] };
   try {
     db = await sql.reserve();
+    await resetHarnessContext(db);
     await prepareMigrations(db);
+    await resetHarnessContext(db);
     await verifyRuntimeGrants(db);
     await cleanupFixtures(db);
     await insertFixtures(db);
