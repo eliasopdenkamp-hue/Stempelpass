@@ -116,6 +116,9 @@ function directUrl(raw: string): string {
   url.hostname = url.hostname.replace(/-pooler(?=\.|$)/, '');
   url.searchParams.set('connect_timeout', '10');
   url.searchParams.set('statement_timeout', String(STATEMENT_TIMEOUT_MS));
+  // Bound lock waits explicitly: a stale disposable-DB session must fail fast,
+  // not leave the validation harness looking hung while holding its xact lock.
+  url.searchParams.set('lock_timeout', '5000');
   return url.toString();
 }
 
@@ -191,6 +194,31 @@ async function prepareMigrations(db: QueryConnection): Promise<void> {
   }
 }
 
+async function grantCheckContext(db: QueryConnection): Promise<{ currentUser: string; sessionUser: string; searchPath: string }> {
+  const rows = await query<{ current_user: string; session_user: string; search_path: string }>(db, 'select current_user::text as current_user, session_user::text as session_user, current_setting(\'search_path\')::text as search_path');
+  return { currentUser: rows[0]?.current_user ?? 'unknown', sessionUser: rows[0]?.session_user ?? 'unknown', searchPath: rows[0]?.search_path ?? 'unknown' };
+}
+
+async function checkGrant(
+  db: QueryConnection,
+  object: { kind: string; schema?: string; name: string; signature?: string },
+  privilege: string,
+  statement: string,
+  params: unknown[],
+): Promise<boolean> {
+  const context = await grantCheckContext(db);
+  try {
+    const rows = await query<{ granted: boolean }>(db, statement, params);
+    const granted = rows[0]?.granted === true;
+    console.error(JSON.stringify({ retention_grant_check: { context, object, privilege, result: granted } }));
+    return granted;
+  } catch (error) {
+    const code = typeof error === 'object' && error !== null && 'code' in error ? String((error as { code?: unknown }).code) : 'unknown';
+    console.error(JSON.stringify({ retention_grant_check: { context, object, privilege, result: 'error', code } }));
+    throw error;
+  }
+}
+
 async function verifyRuntimeGrants(db: QueryConnection): Promise<void> {
   const roleRows = await query<{ exists: boolean }>(db, 'select exists(select 1 from pg_roles where rolname = $1) as exists', [TEST_ROLE]);
   if (!roleRows[0]?.exists) throw new HarnessFailure('RETENTION_RUNTIME_ROLE_MISSING', { role: TEST_ROLE });
@@ -198,16 +226,17 @@ async function verifyRuntimeGrants(db: QueryConnection): Promise<void> {
   const tables = Object.entries(REQUIRED_GRANTS);
   for (const [table, privileges] of tables) {
     for (const privilege of privileges) {
-      const rows = await query<{ granted: boolean }>(db, 'select has_table_privilege($1::name, $2::text, $3::text) as granted', [TEST_ROLE, `public.${table}`, privilege]);
-      if (!rows[0]?.granted) missing.push(`${table}:${privilege}`);
+      const granted = await checkGrant(db, { kind: 'table', schema: 'public', name: table }, privilege, 'select has_table_privilege($1::name, $2::text, $3::text) as granted', [TEST_ROLE, `public.${table}`, privilege]);
+      if (!granted) missing.push(`${table}:${privilege}`);
     }
   }
-  const schemaRows = await query<{ granted: boolean }>(db, 'select has_schema_privilege($1::name, $2::text, \'USAGE\') as granted', [TEST_ROLE, 'public']);
-  if (!schemaRows[0]?.granted) missing.push('public:USAGE');
+  const schemaGranted = await checkGrant(db, { kind: 'schema', name: 'public' }, 'USAGE', 'select has_schema_privilege($1::name, $2::text, \'USAGE\') as granted', [TEST_ROLE, 'public']);
+  if (!schemaGranted) missing.push('public:USAGE');
   for (const required of REQUIRED_FUNCTION_GRANTS) {
     const match = required.match(/^([^(:]+)\(([^)]*)\):EXECUTE$/)!;
-    const rows = await query<{ granted: boolean }>(db, 'select has_function_privilege($1::name, $2::text, \'EXECUTE\') as granted', [TEST_ROLE, `public.${match[1]}(${match[2]})`]);
-    if (!rows[0]?.granted) missing.push(required);
+    const signature = `public.${match[1]}(${match[2]})`;
+    const granted = await checkGrant(db, { kind: 'function', schema: 'public', name: match[1], signature }, 'EXECUTE', 'select has_function_privilege($1::name, $2::text, \'EXECUTE\') as granted', [TEST_ROLE, signature]);
+    if (!granted) missing.push(required);
   }
   if (missing.length) throw new HarnessFailure('RETENTION_RUNTIME_GRANTS_MISSING', { missing });
 }
@@ -300,11 +329,13 @@ function txClient(db: QueryConnection): TxClient {
   };
 }
 
-async function invokeRetention(db: QueryConnection, tenantId: string | null, wallet: WalletAdapter): Promise<JobResult> {
+async function invokeRetention(sql: HarnessSql, tenantId: string | null, wallet: WalletAdapter): Promise<JobResult> {
+  const db = await sql.reserve();
   const logs: string[] = [];
   const started = Date.now();
-  await exec(db, 'begin');
   try {
+    await exec(db, 'set search_path to public, pg_catalog');
+    await exec(db, 'begin');
     // The lock belongs exclusively in this real job call, never in setup or gates.
     await exec(db, 'select pg_advisory_xact_lock($1)', [RETENTION_LOCK_KEY]);
     const counts = await runRetention(txClient(db), tenantId, wallet);
@@ -315,6 +346,8 @@ async function invokeRetention(db: QueryConnection, tenantId: string | null, wal
     await exec(db, 'rollback').catch(() => undefined);
     logs.push('retention_failed RETENTION_FAILED');
     return { exitCode: 1, logs, errorCode: 'RETENTION_FAILED' };
+  } finally {
+    db.release();
   }
 }
 
@@ -409,17 +442,17 @@ async function runHarness(url: string): Promise<{ checks: Check[]; tableCounts?:
     const before = await snapshot(db, [IDS.tenantA, IDS.tenantB]);
     const beforeB = await snapshot(db, [IDS.tenantB]);
 
-    const scoped = await invokeRetention(db, IDS.tenantA, wallet);
+    const scoped = await invokeRetention(sql, IDS.tenantA, wallet);
     allLogs.push(...scoped.logs);
     const afterScopedB = await snapshot(db, [IDS.tenantB]);
     checks.push({ name: 'tenant-scoped retention on A', expected: expectedA(), actual: scoped.counts ? selectedCounts(scoped.counts) : scoped.errorCode, pass: scoped.exitCode === 0 && jsonEqual(selectedCounts(scoped.counts ?? emptyCounts()), { ...emptyCounts(), ...expectedA() }) });
     checks.push({ name: 'tenant B unchanged by tenant-scoped run', expected: beforeB, actual: afterScopedB, pass: jsonEqual(beforeB, afterScopedB) });
 
-    const second = await invokeRetention(db, IDS.tenantA, wallet);
+    const second = await invokeRetention(sql, IDS.tenantA, wallet);
     allLogs.push(...second.logs);
     checks.push({ name: 'immediate second run is idempotent', expected: { exitCode: 0, counts: 'all zero' }, actual: { exitCode: second.exitCode, counts: second.counts ?? second.errorCode }, pass: second.exitCode === 0 && allZero(second.counts ?? emptyCounts()) });
 
-    const global = await invokeRetention(db, null, wallet);
+    const global = await invokeRetention(sql, null, wallet);
     allLogs.push(...global.logs);
     checks.push({ name: 'global run cleans tenant B', expected: { customersHardDeleted: 1, messageLogsRetentionDeleted: 1 }, actual: global.counts ? { customersHardDeleted: global.counts.customersHardDeleted, messageLogsRetentionDeleted: global.counts.messageLogsRetentionDeleted } : global.errorCode, pass: global.exitCode === 0 && global.counts?.customersHardDeleted === 1 && global.counts.messageLogsRetentionDeleted === 1 });
 
