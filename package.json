@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "db:migrate": "bun run src/migrate.ts",
     "db:seed-pilot": "bun run src/seed-pilot.ts",
+    "db:create-tenant": "bun run src/create-tenant.ts",
     "db:rotate-owner-password": "bun run src/rotate-owner-password.ts",
     "db:cleanup": "bun run src/cleanup.ts",
     "db:retention": "bun run src/retention.ts",
