@@ -126,6 +126,10 @@ describe('environmentCheck (required production variables)', () => {
     expect(sessionSecretConfigured).toBe(true);
     expect(frontendOriginConfigured).toBe(true);
     expect(frontendOriginValid).toBe(true);
+    const check = environmentCheck({ ...baseEnv(), FRONTEND_ORIGIN_DEV: 'https://stempelpass-dev.example' });
+    expect(check.frontendOriginDevConfigured).toBe(true);
+    expect(check.frontendOriginDevValid).toBe(true);
+    expect(check.errors).toEqual([]);
   });
 
   test('DATABASE_URL missing/blank -> DATABASE_URL_REQUIRED', () => {
@@ -153,6 +157,15 @@ describe('environmentCheck (required production variables)', () => {
       expect(environmentCheck({ ...baseEnv(), FRONTEND_ORIGIN: bad }).errors).toEqual(['FRONTEND_ORIGIN_INVALID']);
     }
     expect(environmentCheck({ ...baseEnv(), FRONTEND_ORIGIN: 'http://localhost:3000' }).errors).toEqual([]);
+  });
+
+  test('optional FRONTEND_ORIGIN_DEV invalid -> FRONTEND_ORIGIN_DEV_INVALID', () => {
+    for (const bad of ['not-a-url', 'https://', 'ftp://x.example', 'https://x.example/path', 'https://x.example/']) {
+      expect(environmentCheck({ ...baseEnv(), FRONTEND_ORIGIN_DEV: bad }).errors).toEqual(['FRONTEND_ORIGIN_DEV_INVALID']);
+    }
+    const absent = environmentCheck(baseEnv());
+    expect(absent.frontendOriginDevConfigured).toBe(false);
+    expect(absent.frontendOriginDevValid).toBeNull();
   });
 });
 
@@ -528,7 +541,7 @@ describe('anonymization contract (no secret values, no DB import)', () => {
 // ---------------------------------------------------------------------------
 
 const SCRUBBED_KEYS = [
-  'DATABASE_URL', 'TEST_DATABASE_URL', 'SESSION_SECRET', 'FRONTEND_ORIGIN', 'PUBLIC_SITE_ORIGIN',
+  'DATABASE_URL', 'TEST_DATABASE_URL', 'SESSION_SECRET', 'FRONTEND_ORIGIN', 'FRONTEND_ORIGIN_DEV', 'PUBLIC_SITE_ORIGIN',
   'GOOGLE_ISSUER_ID', 'GOOGLE_EXTERNAL_ACCOUNT_JSON', 'GOOGLE_APPLICATION_CREDENTIALS',
   'GOOGLE_SERVICE_ACCOUNT_JSON', 'GOOGLE_SERVICE_ACCOUNT_EMAIL', 'GOOGLE_PRIVATE_KEY',
   'MFA_ENCRYPTION_KEY', 'COMMUNICATION_HASH_SECRET', 'EMAIL_SMTP_HOST', 'EMAIL_SMTP_PORT',
@@ -575,6 +588,7 @@ describe('CLI (bun run production-preflight)', () => {
         DATABASE_URL: 'postgresql://cli-user:cli-pass@cli-host/cli-db?sslmode=require',
         SESSION_SECRET: LONG_SECRET,
         FRONTEND_ORIGIN: 'https://stempelpass.example',
+        FRONTEND_ORIGIN_DEV: 'https://stempelpass-dev.example',
         GOOGLE_ISSUER_ID: '1234567890',
         GOOGLE_EXTERNAL_ACCOUNT_JSON: VALID_EXTERNAL_ACCOUNT_JSON,
       }),

@@ -30,9 +30,12 @@ const SCRUBBED_KEYS = [
   'VERCEL_OIDC_TOKEN', 'APPLE_TEAM_IDENTIFIER', 'APPLE_PASS_TYPE_IDENTIFIER', 'APPLE_PRIVATE_KEY',
   'TIGER_PUBLIC_KEY', 'TIGER_SECRET_KEY', 'TIGER_PROJECT_ID',
   'EMAIL_SMTP_HOST', 'EMAIL_SMTP_PORT', 'EMAIL_SMTP_USER', 'EMAIL_SMTP_PASSWORD', 'EMAIL_FROM',
-  'COMMUNICATION_HASH_SECRET', 'PORT', 'PILOT_READY',
+  'COMMUNICATION_HASH_SECRET', 'PORT', 'PILOT_READY', 'FRONTEND_ORIGIN',
+  'FRONTEND_ORIGIN_DEV', 'PUBLIC_SITE_ORIGIN',
 ];
 for (const key of SCRUBBED_KEYS) delete process.env[key];
+process.env.FRONTEND_ORIGIN = 'https://a1e91d0731cfc57ecf5a508e37635a85.ctonew.app';
+process.env.FRONTEND_ORIGIN_DEV = 'https://a1e91d0731cfc57ecf5a508e37635a85-dev.ctonew.app';
 process.env.VERCEL = '1';
 
 const { fetchHandler, withTestDependencies } = await import('../src/server');
@@ -128,6 +131,48 @@ function authedHeaders(overrides: Record<string, string> = {}): Headers {
     ...overrides,
   });
 }
+
+// ---------------------------------------------------------------------------
+// (0) Credentialed CORS — both separately hosted site origins
+// ---------------------------------------------------------------------------
+const LIVE_ORIGIN = 'https://a1e91d0731cfc57ecf5a508e37635a85.ctonew.app';
+const DEV_ORIGIN = 'https://a1e91d0731cfc57ecf5a508e37635a85-dev.ctonew.app';
+
+test('credentialed CORS allows the live and dev origins with the required headers and methods', async () => {
+  for (const origin of [LIVE_ORIGIN, DEV_ORIGIN]) {
+    const res = await fetchHandler(new Request('http://test.local/api/auth/login', {
+      method: 'OPTIONS',
+      headers: {
+        origin,
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'content-type, x-csrf-token, idempotency-key',
+      },
+    }));
+    expect(res.status).toBe(204);
+    expect(res.headers.get('access-control-allow-origin')).toBe(origin);
+    expect(res.headers.get('access-control-allow-credentials')).toBe('true');
+    expect(res.headers.get('access-control-allow-headers')).toBe('Content-Type, x-csrf-token, idempotency-key');
+    expect(res.headers.get('access-control-allow-methods')).toBe('GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    expect(res.headers.get('vary')).toBe('Origin');
+
+    // CORS is also applied to ordinary responses, not only the preflight.
+    const normal = await fetchHandler(new Request('http://test.local/health', { headers: { origin } }));
+    expect(normal.headers.get('access-control-allow-origin')).toBe(origin);
+    expect(normal.headers.get('access-control-allow-credentials')).toBe('true');
+    expect(normal.headers.get('vary')).toBe('Origin');
+  }
+});
+
+test('credentialed CORS rejects an unconfigured origin while retaining Vary: Origin', async () => {
+  const res = await fetchHandler(new Request('http://test.local/api/auth/login', {
+    method: 'OPTIONS',
+    headers: { origin: 'https://not-configured.example', 'access-control-request-method': 'POST' },
+  }));
+  expect(res.status).toBe(204);
+  expect(res.headers.get('access-control-allow-origin')).toBeNull();
+  expect(res.headers.get('access-control-allow-credentials')).toBeNull();
+  expect(res.headers.get('vary')).toBe('Origin');
+});
 
 // ---------------------------------------------------------------------------
 // (1) GET /health — only the generic status, no request id, no config details
@@ -357,7 +402,7 @@ test('login success returns exactly the allowed fields and sets the session cook
     expect(setCookie).toContain('__Host-sp_session=');
     expect(setCookie).toContain('HttpOnly');
     expect(setCookie).toContain('Secure');
-    expect(setCookie).toContain('SameSite=Lax');
+    expect(setCookie).toContain('SameSite=None');
     expect(setCookie).toContain('Path=/');
     expect(setCookie).toContain('Max-Age=43200');
     // __Host- prefix contract: Secure + Path=/ + no Domain attribute, and no bare name.
@@ -505,7 +550,10 @@ test('stamp returns the minimal card/reward view, echoes the idempotency key and
     expect(body.data).toEqual(EXPECTED_STAMP_DATA);
     expectNoInternalFields(body);
     // Session rotation: fresh Set-Cookie AND the fresh CSRF value the client must reuse.
-    expect(res.headers.get('set-cookie')).toContain('__Host-sp_session=');
+    const rotatedCookie = res.headers.get('set-cookie') ?? '';
+    expect(rotatedCookie).toContain('__Host-sp_session=');
+    expect(rotatedCookie).toContain('SameSite=None');
+    expect(rotatedCookie).toContain('Secure');
     const rotatedCsrf = res.headers.get('x-csrf-token');
     expect(rotatedCsrf).toMatch(/^[0-9a-f]{64}$/);
     expect(rotatedCsrf).not.toBe(CSRF_VALUE);
@@ -643,7 +691,11 @@ test('logout revokes the session under the actor user context and clears the coo
     }));
     expect(res.status).toBe(200);
     expect(((await res.json()) as { data: unknown }).data).toEqual({ loggedOut: true });
-    expect(res.headers.get('set-cookie')).toContain('__Host-sp_session=;');
+    const setCookie = res.headers.get('set-cookie') ?? '';
+    expect(setCookie).toContain('__Host-sp_session=;');
+    expect(setCookie).toContain('SameSite=None');
+    expect(setCookie).toContain('Secure');
+    expect(setCookie).toContain('Max-Age=0');
     const sqls = pool.queries.map(q => q.sql);
     const userCtxIdx = sqls.findIndex(s => s.includes("set_config('app.user_id'"));
     const revokeIdx = sqls.findIndex(s => s.includes('update sessions set revoked_at=now() where token_hash'));
