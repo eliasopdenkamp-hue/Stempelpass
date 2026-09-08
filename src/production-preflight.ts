@@ -66,6 +66,8 @@ export interface EnvironmentCheck {
   sessionSecretConfigured: boolean;
   frontendOriginConfigured: boolean;
   frontendOriginValid: boolean | null; // null when not configured
+  frontendOriginDevConfigured: boolean;
+  frontendOriginDevValid: boolean | null; // null when not configured
   errors: string[];
 }
 
@@ -80,7 +82,7 @@ export function environmentCheck(env: NodeJS.ProcessEnv): EnvironmentCheck {
   if (!sessionSecretConfigured) errors.push(sessionSecret ? 'SESSION_SECRET_TOO_SHORT' : 'SESSION_SECRET_REQUIRED');
 
   // CORS origin for the admin web surface. PUBLIC_SITE_ORIGIN is the legacy
-  // alias; FRONTEND_ORIGIN takes precedence (see src/server.ts corsOrigin).
+  // alias; FRONTEND_ORIGIN takes precedence (see src/server.ts corsOrigins).
   const origin = env.FRONTEND_ORIGIN?.trim() || env.PUBLIC_SITE_ORIGIN?.trim() || '';
   const frontendOriginConfigured = origin.length > 0;
   let frontendOriginValid: boolean | null = null;
@@ -91,7 +93,17 @@ export function environmentCheck(env: NodeJS.ProcessEnv): EnvironmentCheck {
     if (!frontendOriginValid) errors.push('FRONTEND_ORIGIN_INVALID');
   }
 
-  return { databaseConfigured, sessionSecretConfigured, frontendOriginConfigured, frontendOriginValid, errors };
+  // Optional second origin for the separately hosted dev/demo site. It is
+  // validated independently but never replaces the required primary origin.
+  const devOrigin = env.FRONTEND_ORIGIN_DEV?.trim() || '';
+  const frontendOriginDevConfigured = devOrigin.length > 0;
+  let frontendOriginDevValid: boolean | null = null;
+  if (frontendOriginDevConfigured) {
+    frontendOriginDevValid = /^https?:\/\/[^\s/]+$/.test(devOrigin);
+    if (!frontendOriginDevValid) errors.push('FRONTEND_ORIGIN_DEV_INVALID');
+  }
+
+  return { databaseConfigured, sessionSecretConfigured, frontendOriginConfigured, frontendOriginValid, frontendOriginDevConfigured, frontendOriginDevValid, errors };
 }
 
 export interface GoogleWalletCheck {
@@ -440,6 +452,8 @@ export async function runPreflight(opts: PreflightOptions = {}): Promise<Preflig
         sessionSecretConfigured: environment.sessionSecretConfigured,
         frontendOriginConfigured: environment.frontendOriginConfigured,
         frontendOriginValid: environment.frontendOriginValid,
+        frontendOriginDevConfigured: environment.frontendOriginDevConfigured,
+        frontendOriginDevValid: environment.frontendOriginDevValid,
       },
       googleWallet: {
         configured: googleWallet.configured,

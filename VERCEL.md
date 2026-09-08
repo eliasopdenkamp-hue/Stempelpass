@@ -17,10 +17,11 @@ vercel deploy --prebuilt --prod # deploy the prebuilt production output, require
 
 Before any pilot/production deploy run `bun run production-preflight` and
 require exit code `0`. It statically verifies the required environment
-(`DATABASE_URL`, `SESSION_SECRET`, `FRONTEND_ORIGIN`), the configured Google
+(`DATABASE_URL`, `SESSION_SECRET`, `FRONTEND_ORIGIN` and optional
+`FRONTEND_ORIGIN_DEV`), the configured Google
 credential mode (external-account or service-account fallback),
 `MFA_ENCRYPTION_KEY` only when MFA is active, `COMMUNICATION_HASH_SECRET` only
-when SMTP is active, the exact migration set 001–014 and the Vercel entry
+when SMTP is active, the exact migration set 001–015 and the Vercel entry
 point/Node build wiring — without opening a database connection and without
 printing any secret value. Exit codes and the classified error list are
 documented in `TESTING.md`. The live diagnostics (Neon connectivity,
@@ -38,8 +39,14 @@ Set these in the Vercel project/environment (never commit values):
 
 - `DATABASE_URL`: Neon PostgreSQL connection string, EU project, with TLS (`sslmode=require`), pointing to the dedicated non-owner/non-`BYPASSRLS` runtime app role. Do not use the migration/admin/owner connection here; role and grants are prepared manually as documented in `RLS_AUTH_P1.md`.
 - `SESSION_SECRET`: at least 32 random characters/bytes.
-- `FRONTEND_ORIGIN`: exact published frontend origin, currently
+- `FRONTEND_ORIGIN`: exact primary frontend origin, currently
   `https://a1e91d0731cfc57ecf5a508e37635a85.ctonew.app` (no trailing slash).
+- `FRONTEND_ORIGIN_DEV`: optional exact second frontend origin for the dev/demo
+  site, currently `https://a1e91d0731cfc57ecf5a508e37635a85-dev.ctonew.app`.
+  The handler reflects the matching request origin and allows credentialed
+  requests only for these configured origins. It allows `GET, POST, PUT, PATCH,
+  DELETE, OPTIONS` and the `Content-Type`, `x-csrf-token`, and `idempotency-key`
+  headers, while retaining `Vary: Origin`.
 
 `MFA_ENCRYPTION_KEY` is optional until MFA is enabled; when enabled it must be a
 32-byte base64 or 64-character hex secret.
@@ -89,7 +96,8 @@ is an explicit operator declaration. Order matters:
 
 1. **Set the production environment** in Vercel: `DATABASE_URL` (EU Neon,
    `sslmode=require`), `SESSION_SECRET` (≥ 32 chars), `FRONTEND_ORIGIN` (exact
-   published origin, no trailing slash) and the Google Wallet variables
+   published origin, no trailing slash), optionally `FRONTEND_ORIGIN_DEV` (exact
+   dev/demo origin, no trailing slash), and the Google Wallet variables
    (`GOOGLE_ISSUER_ID` + keyless `GOOGLE_EXTERNAL_ACCOUNT_JSON`, see below).
    **Do NOT set `RUN_MIGRATIONS_ON_START`** — migrations must never run in the
    Vercel request/cold-start path. Do NOT set `PILOT_READY` yet.
