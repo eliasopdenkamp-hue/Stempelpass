@@ -58,13 +58,14 @@ export const DOMAIN_ERROR_CODES: ReadonlySet<string> = new Set([
   'TENANT_CONTEXT_REQUIRED',
   'TENANT_NOT_FOUND',
   'UNAUTHENTICATED',
+  'WALLET_NOT_CONFIGURED',
 ]);
 
 /** HTTP status for a known domain error code. */
 export function errorStatus(code: string): number {
   if (code.includes('NOT_FOUND')) return 404;
   if (code === 'CUSTOMER_LIMIT_REACHED' || code === 'REWARD_ALREADY_REDEEMED') return 409;
-  if (code === 'DATABASE_UNAVAILABLE') return 503;
+  if (code === 'DATABASE_UNAVAILABLE' || code === 'WALLET_NOT_CONFIGURED') return 503;
   if (code === 'TENANT_CONTEXT_REQUIRED' || code === 'FORBIDDEN') return 403;
   if (code === 'UNAUTHENTICATED') return 401;
   if (code === 'RATE_LIMITED') return 429;
