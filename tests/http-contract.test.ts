@@ -1,6 +1,7 @@
 import { test, expect } from 'bun:test';
 import { CardRepository, type DbPool, type TxClient } from '../src/repository';
 import { cardResolveLimiter, hashPassword, hashSessionToken, loginAccountLimiter, loginIpLimiter, randomToken } from '../src/security';
+import { walletAdapter } from '../src/wallet';
 
 /**
  * HTTP-level contract tests against the REAL fetchHandler.
@@ -302,6 +303,94 @@ test('public card HTML omits the contact line without privacy email and falls ba
     expect(html).not.toContain('<Tenant>');
   });
 });
+// ---------------------------------------------------------------------------
+// (2a) Save-to-Wallet redirect + webcard button — same public-card guardrail
+// ---------------------------------------------------------------------------
+const WALLET_SAVE_PREFIX = 'https://pay.google.com/gp/v/save/';
+
+/** Shared public-card fixture: card row + branding + controller + rule + reward. */
+function publicCardHandlers(rewards: unknown[] = [{ id: 'reward-1', status: 'issued', issuedAt: null, redeemedAt: null }]): FakeHandler[] {
+  return [
+    { match: contains('from cards where'), rows: [{ id: 'card-1', tenantId: TENANT, customerId: CUSTOMER, publicTokenHash: 'f'.repeat(64), status: 'active', stampCount: 3, revision: 2, ruleId: RULE }] },
+    { match: contains('from tenant_branding'), rows: [{ cardTitle: 'StempelPass Demo', cardText: 'Deine Karte', primaryColor: '#155e75', secondaryColor: '#f8fafc', privacyEmail: 'datenschutz@beispiel.de', version: 1 }] },
+    { match: contains('select legal_name from tenants'), rows: [{ legal_name: 'Beispiel GmbH' }] },
+    { match: contains('from stamp_rules'), rows: [{ id: RULE, tenantId: TENANT, name: 'R', stampsRequired: 5, rewardTitle: 'Prämie', rewardDescription: 'D', active: true, version: 1 }] },
+    { match: contains('from rewards'), rows: rewards },
+  ];
+}
+
+/**
+ * Wallet-factory stand-in shaped like the real adapter (issue/refresh/revoke).
+ * artifact === null simulates the unconfigured honest adapter (no pass issued).
+ */
+function fakeWalletFactory(artifact: string | null) {
+  const adapter = {
+    async issue() {
+      return artifact === null
+        ? { provider: 'google' as const, status: 'not_configured' as const, message: 'google wallet is not configured; no pass was created.' }
+        : { provider: 'google' as const, status: 'issued' as const, message: 'ok', artifact };
+    },
+    async refresh() { return { provider: 'google' as const, status: 'issued' as const, message: 'ok' }; },
+    async revoke() {},
+  };
+  return (() => adapter) as unknown as typeof walletAdapter;
+}
+
+function runWithWallet(pool: DbPool, factory: typeof walletAdapter, fn: () => Promise<unknown>): Promise<unknown> {
+  const restore = withTestDependencies({ configured: true, pool, repository: new CardRepository(pool), walletFactory: factory });
+  return fn().finally(restore);
+}
+
+test('wallet redirect issues a pass and answers 302 with the Google save link', async () => {
+  await runWithWallet(new FakePool(publicCardHandlers()), fakeWalletFactory('header.payload.signature'), async () => {
+    const res = await fetchHandler(new Request(`http://test.local/api/public/tenants/${TENANT}/cards/public-token-abc/wallet/google/redirect`));
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe(`${WALLET_SAVE_PREFIX}header.payload.signature`);
+    expect(res.headers.get('location')).toStartWith(WALLET_SAVE_PREFIX);
+  });
+});
+
+test('wallet redirect without wallet configuration answers 503 WALLET_NOT_CONFIGURED', async () => {
+  await runWithWallet(new FakePool(publicCardHandlers()), fakeWalletFactory(null), async () => {
+    const res = await fetchHandler(new Request(`http://test.local/api/public/tenants/${TENANT}/cards/public-token-abc/wallet/google/redirect`));
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { request_id: string; data: { error: string } };
+    expect(body.data.error).toBe('WALLET_NOT_CONFIGURED');
+  });
+});
+
+test('wallet redirect for an unknown card keeps the public-card 404 CARD_NOT_FOUND guardrail', async () => {
+  const pool = new FakePool([]); // no card row -> publicCard() returns null
+  await runWithWallet(pool, fakeWalletFactory('unused'), async () => {
+    const res = await fetchHandler(new Request(`http://test.local/api/public/tenants/${TENANT}/cards/unknown-token/wallet/google/redirect`));
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { request_id: string; data: { error: string } };
+    expect(body.data.error).toBe('CARD_NOT_FOUND');
+  });
+});
+
+test('public card HTML shows the Save-to-Wallet button before the Art. 13 privacy block', async () => {
+  await runWith(new FakePool(publicCardHandlers()), async () => {
+    const res = await fetchHandler(new Request(`http://test.local/card/${TENANT}/public-token-abc`));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('Zu Google Wallet hinzufügen');
+    expect(html).toContain('Auf dem Handy öffnen, um die Karte ins Wallet zu legen.');
+    // The button targets the new redirect endpoint with tenant + raw token from the URL.
+    expect(html).toContain(`href="/api/public/tenants/${TENANT}/cards/public-token-abc/wallet/google/redirect"`);
+    // Button sits before the privacy section (whitespace-stable via indexOf).
+    expect(html.indexOf('Zu Google Wallet hinzufügen')).toBeLessThan(html.indexOf('<section class="privacy">'));
+    // Inline white-on-primary button styling with the sanitized primary color.
+    expect(html).toContain('background:#155e75');
+    expect(html).toContain('color:#fff');
+    expect(html).toContain('border-radius:.75rem');
+    // Existing guardrails still hold for the rendered HTML.
+    expect(html).not.toContain('customerId');
+    expect(html).not.toContain('publicTokenHash');
+    expect(html).not.toContain(CUSTOMER);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // (2b) GET /join/:publicKey — RLS-safe resolution through the resolver function
 // ---------------------------------------------------------------------------
