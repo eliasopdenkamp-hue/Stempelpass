@@ -20,35 +20,38 @@ QR-Code oder NFC-Tag verweist auf `/join/{publicKey}`. Der öffentliche Endpunkt
 
 Kunden werden weiterhin ohne Konto, Pflichtname, Telefonnummer oder E-Mail angelegt; Kommunikationsmodule bleiben optional.
 
-## Einmaliger Pilot-Seed (CLI, nur lokal/Operator)
+## Legacy: Einmaliger Pilot-Seed (CLI, nur lokal/Operator)
 
-Der Seed legt idempotent Pilot-Tenant, Owner-User, owner-Membership und – nur bei gesetzter Variable – einen Testkunden an. Er liest **ausschließlich** Umgebungsvariablen, hasht das Passwort mit der bestehenden `hashPassword`-Logik (scrypt, `$scrypt$N=32768,r=8,p=1$…`) und gibt nur anonymisierte IDs/Status aus. Er läuft **niemals** im Vercel-Requestpfad: reines CLI (`import.meta.main`), zusätzlich harte Sperre bei `VERCEL=1` (`SEED_NOT_ALLOWED_ON_VERCEL`).
+> **Legacy / weniger sicher:** Dieser Seed bleibt aus Kompatibilitätsgründen dokumentiert, ist aber nicht der primäre Onboarding-Weg. Für neue Betriebe den vollständigen, sichereren Ablauf `db:create-tenant` weiter unten verwenden.
 
-Voraussetzung: Migrationen sind angewendet (`bun run db:migrate`, Exit 0). Verbindung über `DATABASE_URL` mit der Operator-/Owner-Rolle (RLS wird als Tabellenowner umgangen — dieselbe Annahme wie `db:migrate`).
+Der Seed legt idempotent Pilot-Tenant, Owner-User, Owner-Membership und – nur bei gesetzter Variable – einen Testkunden an. Er liest **ausschließlich** Umgebungsvariablen, hasht das Passwort mit der bestehenden `hashPassword`-Logik (scrypt, `$scrypt$N=32768,r=8,p=1$…`) und gibt nur anonymisierte IDs/Status aus. Er läuft **niemals** im Vercel-Requestpfad: reines CLI (`import.meta.main`), zusätzlich harte Sperre bei `VERCEL=1` (`SEED_NOT_ALLOWED_ON_VERCEL`).
+
+Voraussetzung: Migrationen sind angewendet (`bun run db:migrate`, Exit 0). Die Datenbank-URL darf kein Passwort in einer Shell-History oder Export-Zeile enthalten: bevorzugt über Secret-Manager/gesicherte Injektion setzen oder PostgreSQL über eine `~/.pgpass`-Datei mit Modus `0600` authentifizieren und eine URL ohne Passwort verwenden.
 
 ```sh
-DATABASE_URL='postgresql://.../db?sslmode=require' \
-PILOT_TENANT_SLUG='stempelpass' \
-PILOT_TENANT_LEGAL_NAME='Stempelpass GmbH' \
-PILOT_OWNER_EMAIL='owner@example.com' \
-PILOT_OWNER_PASSWORD='<starkes Passwort, min. 12 Zeichen>' \
+# Bevorzugt: ~/.pgpass mit Modus 0600 konfigurieren und URL ohne Passwort verwenden.
+# Alternativ DATABASE_URL hier per Secret-Manager/secure injection bereitstellen.
+export DATABASE_URL='postgresql://<operator>@<host>/<db>?sslmode=require'
+export PILOT_TENANT_SLUG='<tenant-slug>'
+export PILOT_TENANT_LEGAL_NAME='<legal-name>'
+export PILOT_OWNER_EMAIL='<owner-email>'
+read -r -s PILOT_OWNER_PASSWORD
+printf '\\n'
+export PILOT_OWNER_PASSWORD
+# Optional: export PILOT_CUSTOMER_REF='<test-customer-ref>'
 bun run db:seed-pilot
+unset DATABASE_URL PILOT_OWNER_PASSWORD PILOT_CUSTOMER_REF PILOT_TENANT_SLUG PILOT_TENANT_LEGAL_NAME PILOT_OWNER_EMAIL
 ```
 
-Optionaler Testkunde (`unique(tenant_id, external_ref)`):
-
-```sh
-PILOT_CUSTOMER_REF='test-kunde-1' bun run db:seed-pilot   # zusätzlich zu den Variablen oben
-```
+Optionaler Testkunde (`unique(tenant_id, external_ref)`): `PILOT_CUSTOMER_REF` vor dem Lauf sicher injizieren; leer/fehlend = kein Kunde.
 
 Verhalten und Sicherheitsvertrag:
 
 - **Kein Klartextpasswort** wird gespeichert, geloggt, committet oder ausgegeben; das Passwort wird vor jeder SQL-Anweisung gehasht. Es gibt **kein Default-Passwort** und keine hartkodierten Ownerdaten (Runbook-Platzhalter sind Beispiele, keine Daten).
 - **Ein Transaktion + Advisory-Lock** (`pg_advisory_xact_lock`, Schlüssel `742002`, getrennt vom Migrations-Lock `742001`) serialisiert parallele Seeds; `app.tenant_id` wird transaktionslokal gesetzt (Konsistenz mit den App-Transaktionen).
-- **Idempotent**: existierende Tenant/User/Membership/Kunde bleiben unverändert; ein vorhandenes Passwort-Hash wird **nie** überschrieben (nur wenn der User noch keins hat, wird es gesetzt).
+- **Idempotent**: existierende Tenant/User/Membership/Kunde bleiben unverändert; ein vorhandener Passwort-Hash wird **nie** überschrieben (nur wenn der User noch keins hat, wird es gesetzt).
 - **Anonymisierte Ausgabe** (Beispiel): `pilot_seed_ok`, `tenant id=3f9a1c2e… status=created`, `owner id=… status=created`, `membership id=… status=created role=owner membership_status=active`, `customer status=skipped` (bzw. `customer id=… status=created`). Slug, Rechtsname, E-Mail, Kunden-Ref und Passwort erscheinen nie. Exit-Codes: `0` = Erfolg, `1` = Fehler (stabiler Fehlercode auf stderr, z. B. `pilot_seed_failed PILOT_TENANT_SLUG_REQUIRED`).
 - Der Tenant wird mit dem freigegebenen Pilot-Tarif `up_to_500`/500 angelegt; Tarifwechsel, Branding und Stamp Rule setzt der authentifizierte Ablauf `PUT /api/tenants/{tenantId}/pilot` (siehe oben). Karten/Tokens sind bewusst **nicht** Teil des Seeds.
-- `PILOT_CUSTOMER_REF` optional: leer/fehlend = kein Kunde.
 
 Erst ausführen, nachdem die Migrations- und Rollenprüfung (RLS_AUTH_P1.md Teil C) abgeschlossen ist und bevor `PILOT_READY=1` gesetzt wird (Reihenfolge: `db:migrate` → `db:seed-pilot` → App-Rolle/`rls-verify` → `PILOT_READY=1`).
 
@@ -84,12 +87,15 @@ Beispiel mit Platzhaltern (keine echten Zugangsdaten oder Pilotdaten in
 Runbooks/Dateien schreiben):
 
 ```sh
-export DATABASE_URL='postgresql://<operator>:<password>@<host>/<db>?sslmode=require'
+# Bevorzugt: ~/.pgpass mit Modus 0600 konfigurieren und URL ohne Passwort verwenden.
+# Alternativ DATABASE_URL per Secret-Manager/secure injection bereitstellen.
+export DATABASE_URL='postgresql://<operator>@<host>/<db>?sslmode=require'
 export TENANT_SLUG='<tenant-slug>'
 export TENANT_LEGAL_NAME='<legal-name>'
 export TENANT_PLAN_CODE='up_to_500'
 export OWNER_EMAIL='<owner-email>'
 read -r -s OWNER_PASSWORD
+printf '\n'
 export OWNER_PASSWORD
 export CARD_TITLE='<card-title>'
 export CARD_TEXT='<card-text>'
@@ -101,7 +107,7 @@ export REWARD_DESCRIPTION='<reward-description>'
 # Optional: export CUSTOMER_REF='<test-customer-ref>'
 # Optional: export ICON_ASSET_ID='<uuid>' / export LOGO_ASSET_ID='<uuid>'
 bun run db:create-tenant
-unset OWNER_PASSWORD
+unset DATABASE_URL OWNER_PASSWORD CUSTOMER_REF ICON_ASSET_ID LOGO_ASSET_ID TENANT_SLUG TENANT_LEGAL_NAME TENANT_PLAN_CODE OWNER_EMAIL CARD_TITLE CARD_TEXT PRIMARY_COLOR SECONDARY_COLOR STAMPS_REQUIRED REWARD_TITLE REWARD_DESCRIPTION
 ```
 
 ### Sicherheitsvertrag und Ablauf
@@ -117,10 +123,15 @@ unset OWNER_PASSWORD
   Entry-Point-Key bleibt bei Wiederholung erhalten.
 - Alle DML laufen in **einer Transaktion** unter der Operator-/Owner-
   Datenbankverbindung (dieselbe RLS-Bypass-Annahme wie `db:migrate` und
-  `db:seed-pilot`). Die Transaktion hält den neuen
-  `pg_advisory_xact_lock`-Schlüssel **742003** und setzt `app.tenant_id`
-  transaktionslokal. Der Schlüssel ist nicht mit 742001 (Migration) oder
-  742002 (Pilot-Seed) geteilt.
+  `db:seed-pilot`). Für einen vorhandenen Tenant wird vor jedem Onboarding-
+  DML die Tenant-Zeile per `select ... where slug = $1 for update` gesperrt;
+  beim Insert hält PostgreSQL die neue Zeile bereits gesperrt. Dieser
+  Tenant-Zeilen-Lock ist ein gemeinsames Protokoll: jeder Konfigurations-
+  schreiber, insbesondere `PUT /api/tenants/{tenantId}/pilot`, muss vor dem
+  Prüfen/Ändern von Branding oder Stamp Rules dieselbe Tenant-Zeile sperren.
+  Die Transaktion hält zusätzlich den neuen `pg_advisory_xact_lock`-Schlüssel
+  **742003** und setzt `app.tenant_id` transaktionslokal. Der Schlüssel ist
+  nicht mit 742001 (Migration) oder 742002 (Pilot-Seed) geteilt.
 - Der CLI ist durch `import.meta.main` auf reine CLI-Ausführung begrenzt und
   verweigert bei `VERCEL=1` mit stabilem Fehlercode den Lauf.
 - Stdout ist anonymisiert: nur maskierte interne IDs, Statuswerte und der
@@ -139,14 +150,17 @@ Stempeln bleibt ausschließlich dem authentifizierten Personal vorbehalten.
 Für einen **bereits vorhandenen** Owner gibt es ausschließlich den operator-only CLI-Pfad `bun run db:rotate-owner-password`. Er läuft nie bei `VERCEL=1`, prüft vor jeder DML die Operator-/Tabellenowner-Rolle und sucht ausschließlich den bestehenden aktiven Owner über Tenant-Slug plus exakte Owner-E-Mail. Es werden keine User oder Memberships angelegt.
 
 ```sh
-export DATABASE_URL='postgresql://.../db?sslmode=require'
-export OWNER_PASSWORD_ROTATION_TENANT_SLUG='stempelpass'
-export OWNER_PASSWORD_ROTATION_OWNER_EMAIL='owner@example.com'
+# Bevorzugt: ~/.pgpass mit Modus 0600 und URL ohne Passwort; alternativ
+# DATABASE_URL per Secret-Manager/secure injection bereitstellen.
+export DATABASE_URL='postgresql://<operator>@<host>/<db>?sslmode=require'
+export OWNER_PASSWORD_ROTATION_TENANT_SLUG='<tenant-slug>'
+export OWNER_PASSWORD_ROTATION_OWNER_EMAIL='<owner-email>'
 export OWNER_PASSWORD_ROTATION_ID="owner-rotation-$(date -u +%Y%m%dT%H%M%SZ)"
 read -r -s OWNER_PASSWORD_ROTATION_PASSWORD
+printf '\n'
 export OWNER_PASSWORD_ROTATION_PASSWORD
 bun run db:rotate-owner-password
-unset OWNER_PASSWORD_ROTATION_PASSWORD
+unset DATABASE_URL OWNER_PASSWORD_ROTATION_PASSWORD OWNER_PASSWORD_ROTATION_TENANT_SLUG OWNER_PASSWORD_ROTATION_OWNER_EMAIL OWNER_PASSWORD_ROTATION_ID
 ```
 
 Das Ersatzpasswort wird mit derselben scrypt-`hashPassword`-Logik gehasht, bevor `users.password_hash` geschrieben wird. Danach werden alle bestehenden Sessions des Users widerrufen und genau ein append-only Audit-Ereignis (`operator.owner_password_rotated`) geschrieben. Ausgabe enthält nur `status=rotated` bzw. `status=already_applied`; Passwort, E-Mail, Tenant- und interne IDs werden nie ausgegeben. Bei einem Retry dieselbe `OWNER_PASSWORD_ROTATION_ID` wiederverwenden; eine bereits erfolgreich angewendete Operation ändert weder Passwort noch Sessions erneut. Alternativ kann das Passwort über stdin gepiped werden. Das Passwort niemals als CLI-Argument verwenden oder in Dateien/Notizen schreiben.

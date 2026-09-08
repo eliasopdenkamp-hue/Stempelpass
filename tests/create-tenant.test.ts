@@ -17,7 +17,7 @@ const RULE_ID = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
 const CUSTOMER_ID = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
 const PUBLIC_KEY = '0123456789abcdef0123456789abcdef';
 const PASSWORD = 'correct horse battery staple';
-const HASH = '$scrypt$N=32768,r=8,p=1$AAAAAAAAAAAAAAAAAAAAAA$BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
+const HASH = '$scrypt$N=32768,r=8,p=1$AAAAAAAAAAAAAAAAAAAAAA$BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
 
 const VALID_ENV = {
   TENANT_SLUG: 'pro-pet-koller',
@@ -83,7 +83,10 @@ const EXISTS_SCRIPT = [
 ];
 
 function expectNoSecrets(text: string) {
-  for (const value of ['pro-pet-koller', 'Pro Pet Koller GmbH', 'owner@example.com', PASSWORD]) expect(text).not.toContain(value);
+  for (const value of [
+    'pro-pet-koller', 'Pro Pet Koller GmbH', 'owner@example.com', PASSWORD,
+    'test-customer', 'postgresql://fake/db', 'CUSTOMER_REF', 'DATABASE_URL',
+  ]) expect(text).not.toContain(value);
 }
 
 describe('parseCreateTenantEnv', () => {
@@ -148,6 +151,9 @@ describe('createTenantData', () => {
       entryPoint: { publicKey: PUBLIC_KEY, joinPath: `/join/${PUBLIC_KEY}`, status: 'upserted' },
       customer: { id: CUSTOMER_ID, status: 'created' },
     });
+    const tenantLookup = db.calls.find(call => call.sql.includes('from tenants where slug'));
+    expect(tenantLookup?.sql).toContain('for update');
+    expect(tenantLookup?.params).toEqual([VALID_INPUT.tenantSlug]);
     const setConfig = db.calls.find(call => call.sql.includes('set_config'));
     expect(setConfig?.params).toEqual([TENANT_ID]);
     const tenantInsert = db.calls.find(call => call.sql.includes('insert into tenants('));
@@ -171,6 +177,65 @@ describe('createTenantData', () => {
     expect(sqls.some(sql => sql.includes('update users'))).toBe(false);
     expect(sqls.some(sql => sql.includes('insert into tenant_memberships('))).toBe(false);
     expect(sqls.some(sql => sql.includes('insert into customers('))).toBe(false);
+    const entryPoint = db.calls.find(call => call.sql.includes('insert into tenant_entry_points('));
+    expect(entryPoint?.sql).toContain('on conflict(tenant_id) do update set updated_at=now() returning public_key,join_path');
+    expect(entryPoint?.sql).not.toContain('public_key=');
+    expect(entryPoint?.sql).not.toContain('join_path=');
+    expect(entryPoint?.params[2]).toMatch(/^\/join\/[0-9a-f]{32}$/);
+    expect(result.entryPoint).toEqual({ publicKey: PUBLIC_KEY, joinPath: `/join/${PUBLIC_KEY}`, status: 'upserted' });
+  });
+
+  test('fills a missing existing password hash but never replaces a non-null hash', async () => {
+    const db = new ScriptedDb([
+      { match: 'from tenants where slug', rows: [{ id: TENANT_ID, status: 'active' }] },
+      { match: 'set_config', rows: [] },
+      { match: 'from users where lower(email)', rows: [{ id: USER_ID, status: 'active', password_hash: null }] },
+      { match: 'update users', rows: [] },
+      { match: 'from tenant_memberships where tenant_id', rows: [{ id: MEMBERSHIP_ID, role: 'owner', status: 'active' }] },
+      { match: 'insert into tenant_branding(', rows: [] },
+      { match: 'select id from stamp_rules', rows: [{ id: RULE_ID }] },
+      { match: 'update stamp_rules set name=', rows: [] },
+      { match: 'insert into tenant_entry_points(', rows: [{ public_key: PUBLIC_KEY, join_path: `/join/${PUBLIC_KEY}` }] },
+      { match: 'insert into audit_log', rows: [] },
+    ]);
+    await createTenantData(db, VALID_INPUT, HASH);
+    const updates = db.calls.filter(call => call.sql.includes('update users'));
+    expect(updates).toHaveLength(1);
+    expect(updates[0]?.params).toEqual([HASH, USER_ID]);
+    expect(updates[0]?.sql).toContain('password_hash is null');
+  });
+
+  test('rejects invalid password hashes before any DML', async () => {
+    const db = new ScriptedDb(CREATED_SCRIPT);
+    await expect(createTenantData(db, VALID_INPUT, PASSWORD)).rejects.toThrow('INVALID_PASSWORD_HASH_FORMAT');
+    expect(db.calls).toHaveLength(0);
+  });
+
+  test('rejects unknown plan codes instead of defaulting to the larger limit', async () => {
+    const db = new ScriptedDb(CREATED_SCRIPT);
+    await expect(createTenantData(db, { ...VALID_INPUT, tenantPlanCode: 'unknown' as CreateTenantInput['tenantPlanCode'] }, HASH)).rejects.toThrow('INVALID_TENANT_PLAN_CODE');
+    expect(db.calls).toHaveLength(0);
+  });
+
+  test('deactivates every extra pre-existing active rule and keeps exactly one active', async () => {
+    const secondRuleId = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
+    const db = new ScriptedDb([
+      { match: 'from tenants where slug', rows: [{ id: TENANT_ID, status: 'active' }] },
+      { match: 'set_config', rows: [] },
+      { match: 'from users where lower(email)', rows: [{ id: USER_ID, status: 'active', password_hash: HASH }] },
+      { match: 'from tenant_memberships where tenant_id', rows: [{ id: MEMBERSHIP_ID, role: 'owner', status: 'active' }] },
+      { match: 'insert into tenant_branding(', rows: [] },
+      { match: 'select id from stamp_rules', rows: [{ id: RULE_ID }, { id: secondRuleId }] },
+      { match: 'update stamp_rules set name=', rows: [] },
+      { match: 'update stamp_rules set active=false', rows: [] },
+      { match: 'insert into tenant_entry_points(', rows: [{ public_key: PUBLIC_KEY, join_path: `/join/${PUBLIC_KEY}` }] },
+      { match: 'insert into audit_log', rows: [] },
+    ]);
+    const result = await createTenantData(db, VALID_INPUT, HASH);
+    expect(result.rule).toEqual({ id: RULE_ID, status: 'updated' });
+    const deactivate = db.calls.find(call => call.sql.includes('update stamp_rules set active=false'));
+    expect(deactivate?.params).toEqual([TENANT_ID, RULE_ID]);
+    expect(deactivate?.sql).toContain('active=true and id<>$2');
   });
 
   test('does not query or create a customer when CUSTOMER_REF is absent', async () => {
@@ -224,6 +289,26 @@ describe('formatCreateTenantResult and dbCreateTenant', () => {
     expectNoSecrets(lines.join('\n'));
   });
 
+  test('hashes the owner password before invoking the pool factory', async () => {
+    const order: string[] = [];
+    const pool = {
+      connect: async () => ({
+        query: async <T = unknown>(sql: string, params: unknown[] = []) => {
+          const hit = CREATED_SCRIPT.find(item => sql.includes(item.match));
+          return { rows: (hit?.rows ?? []) as T[] };
+        }, release() {},
+      }),
+      end: async () => {},
+    };
+    const code = await dbCreateTenant(
+      { ...VALID_ENV, DATABASE_URL: 'postgresql://fake/db' },
+      () => { order.push('makePool'); return pool; },
+      async () => { order.push('hashPassword'); return HASH; },
+    );
+    expect(code).toBe(0);
+    expect(order).toEqual(['hashPassword', 'makePool']);
+  });
+
   test('missing DATABASE_URL and VERCEL guard fail without connecting', async () => {
     capture();
     let connects = 0;
@@ -242,7 +327,7 @@ describe('formatCreateTenantResult and dbCreateTenant', () => {
       connect: async () => ({ query: async (sql: string) => { calls.push(sql); if (sql.includes('insert into tenants(')) throw new Error('database provider detail'); return { rows: [] }; }, release() {} }),
       end: async () => {},
     };
-    expect(await dbCreateTenant({ ...VALID_ENV, DATABASE_URL: 'postgresql://fake/db' }, () => pool)).toBe(1);
+    expect(await dbCreateTenant({ ...VALID_ENV, DATABASE_URL: 'postgresql://fake/db', CUSTOMER_REF: 'test-customer' }, () => pool)).toBe(1);
     expect(calls).toContain('rollback');
     expect(lines.join('\n')).toContain('create_tenant_failed INTERNAL_ERROR');
     expectNoSecrets(lines.join('\n'));

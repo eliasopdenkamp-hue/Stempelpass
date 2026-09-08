@@ -20,6 +20,7 @@ const COLOR_RE = /^#[0-9a-f]{6}$/i;
 const MAX_NAME_LENGTH = 200;
 const MAX_TEXT_LENGTH = 2000;
 const MIN_PASSWORD_LENGTH = 12;
+const SCRYPT_HASH_RE = /^\$scrypt\$N=32768,r=8,p=1\$[A-Za-z0-9_-]{22}\$[A-Za-z0-9_-]{43}$/;
 
 export interface CreateTenantInput {
   tenantSlug: string;
@@ -125,12 +126,27 @@ export interface CreateTenantResult {
   customer: { id: string; status: 'created' | 'exists' } | null;
 }
 
-const planLimit = (planCode: CreateTenantInput['tenantPlanCode']): number => planCode === 'up_to_500' ? 500 : 1000;
+function planLimit(planCode: CreateTenantInput['tenantPlanCode']): number {
+  switch (planCode) {
+    case 'up_to_500': return 500;
+    case 'up_to_1000': return 1000;
+    default: throw new Error('INVALID_TENANT_PLAN_CODE');
+  }
+}
 
-/** Full idempotent onboarding DML on a caller-owned locked transaction. */
+/**
+ * Full idempotent onboarding DML on a caller-owned locked transaction.
+ *
+ * The tenant row lock is part of the onboarding protocol: every configuration
+ * writer (including CardRepository.configurePilot) must lock the tenant row
+ * before inspecting or changing tenant-scoped branding/rules.
+ */
 export async function createTenantData(db: DbClient, input: CreateTenantInput, passwordHash: string): Promise<CreateTenantResult> {
+  if (!SCRYPT_HASH_RE.test(passwordHash)) throw new Error('INVALID_PASSWORD_HASH_FORMAT');
   const customerLimit = planLimit(input.tenantPlanCode);
-  const existingTenant = (await db.query<{ id: string; status: string }>('select id, status from tenants where slug = $1', [input.tenantSlug])).rows[0];
+  // Existing tenants are locked before any onboarding DML. INSERT already
+  // holds the row lock for a newly created tenant.
+  const existingTenant = (await db.query<{ id: string; status: string }>('select id, status from tenants where slug = $1 for update', [input.tenantSlug])).rows[0];
   let tenant: CreateTenantResult['tenant'];
   if (existingTenant) {
     tenant = { id: existingTenant.id, status: 'exists' };
@@ -276,10 +292,11 @@ function errorCode(error: unknown): string {
   return /^[A-Z][A-Z0-9_]+$/.test(message) ? message : 'INTERNAL_ERROR';
 }
 
-/** CLI orchestrator. The pool factory is injectable for DB-free tests. */
+/** CLI orchestrator. Pool and hash factories are injectable for DB-free tests. */
 export async function dbCreateTenant(
   env: NodeJS.ProcessEnv = process.env,
   makePool: (url: string) => DbPool = createPostgresPool,
+  hashPasswordFn: (password: string) => Promise<string> = hashPassword,
 ): Promise<number> {
   const parsed = parseCreateTenantEnv(env);
   if (!parsed.ok) {
@@ -295,7 +312,7 @@ export async function dbCreateTenant(
   // Hash before makePool/connect/BEGIN: no SQL can precede password hashing.
   let passwordHash: string;
   try {
-    passwordHash = await hashPassword(parsed.input.ownerPassword);
+    passwordHash = await hashPasswordFn(parsed.input.ownerPassword);
   } catch (error) {
     console.error(`create_tenant_failed ${errorCode(error)}`);
     return 1;
