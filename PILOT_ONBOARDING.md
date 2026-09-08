@@ -52,6 +52,88 @@ Verhalten und Sicherheitsvertrag:
 
 Erst ausführen, nachdem die Migrations- und Rollenprüfung (RLS_AUTH_P1.md Teil C) abgeschlossen ist und bevor `PILOT_READY=1` gesetzt wird (Reihenfolge: `db:migrate` → `db:seed-pilot` → App-Rolle/`rls-verify` → `PILOT_READY=1`).
 
+## Neuer Mandant (`db:create-tenant`)
+
+Für einen neuen Betrieb wird das vollständige Onboarding mit einem einzigen
+operator-only CLI-Lauf angelegt: Tenant, Owner-User, Owner-Mitgliedschaft,
+Branding, eine aktive Stempelregel, öffentlicher Entry-Point und optional ein
+Testkunde. Voraussetzung ist, dass die Migrationen bereits erfolgreich
+angewendet wurden (`bun run db:migrate`). Karten und Karten-Tokens werden
+bewusst **nicht** angelegt; die Kartenerstellung erfolgt später über den
+authentifizierten Flow bzw. einen separaten Schritt.
+
+### Env-Vertrag
+
+`DATABASE_URL` und alle folgenden Variablen sind erforderlich, sofern nicht als
+optional markiert. Leere oder nur aus Whitespace bestehende Werte sind ungültig.
+Es gibt keine Credential-Defaults und keine Pilotdaten im Code.
+
+- `TENANT_SLUG`: Kleinbuchstaben, Ziffern und Bindestriche, 1–63 Zeichen.
+- `TENANT_LEGAL_NAME`: Rechts-/Firmenname, maximal 200 Zeichen.
+- `TENANT_PLAN_CODE`: ausschließlich `up_to_500` (Limit 500) oder `up_to_1000` (Limit 1000).
+- `OWNER_EMAIL`: Login-E-Mail; der Abgleich erfolgt case-insensitiv über `lower(email)`.
+- `OWNER_PASSWORD`: mindestens 12 Zeichen; wird niemals als Klartext gespeichert oder ausgegeben.
+- `CARD_TITLE`, `CARD_TEXT`: Kartentitel und Kartentext.
+- `PRIMARY_COLOR`, `SECONDARY_COLOR`: jeweils exakt `#RRGGBB`.
+- `STAMPS_REQUIRED`: ganzzahlig `1` bis `100`.
+- `REWARD_TITLE`, `REWARD_DESCRIPTION`: Prämientitel und Beschreibung.
+- `ICON_ASSET_ID`, `LOGO_ASSET_ID`: optional; falls gesetzt UUIDs.
+- `CUSTOMER_REF`: optionaler externer Schlüssel für genau einen Testkunden (`unique(tenant_id, external_ref)`).
+
+Beispiel mit Platzhaltern (keine echten Zugangsdaten oder Pilotdaten in
+Runbooks/Dateien schreiben):
+
+```sh
+export DATABASE_URL='postgresql://<operator>:<password>@<host>/<db>?sslmode=require'
+export TENANT_SLUG='<tenant-slug>'
+export TENANT_LEGAL_NAME='<legal-name>'
+export TENANT_PLAN_CODE='up_to_500'
+export OWNER_EMAIL='<owner-email>'
+read -r -s OWNER_PASSWORD
+export OWNER_PASSWORD
+export CARD_TITLE='<card-title>'
+export CARD_TEXT='<card-text>'
+export PRIMARY_COLOR='#123456'
+export SECONDARY_COLOR='#ffffff'
+export STAMPS_REQUIRED='10'
+export REWARD_TITLE='<reward-title>'
+export REWARD_DESCRIPTION='<reward-description>'
+# Optional: export CUSTOMER_REF='<test-customer-ref>'
+# Optional: export ICON_ASSET_ID='<uuid>' / export LOGO_ASSET_ID='<uuid>'
+bun run db:create-tenant
+unset OWNER_PASSWORD
+```
+
+### Sicherheitsvertrag und Ablauf
+
+- `OWNER_PASSWORD` wird mit der bestehenden scrypt-`hashPassword`-Funktion
+  gehasht, **bevor** der CLI eine Datenbankverbindung bzw. SQL-Anweisung
+  ausführt. Das Klartextpasswort wird niemals geloggt, gespeichert,
+  committet oder ausgegeben.
+- Der Lauf ist idempotent: Ein vorhandener Tenant wird exakt beibehalten
+  (insbesondere kein Plan-Downgrade oder sonstige Tenant-Änderung), User und
+  Membership werden nicht dupliziert, ein bestehender Passwort-Hash nie
+  überschrieben, Branding/aktive Regel werden aktualisiert und der vorhandene
+  Entry-Point-Key bleibt bei Wiederholung erhalten.
+- Alle DML laufen in **einer Transaktion** unter der Operator-/Owner-
+  Datenbankverbindung (dieselbe RLS-Bypass-Annahme wie `db:migrate` und
+  `db:seed-pilot`). Die Transaktion hält den neuen
+  `pg_advisory_xact_lock`-Schlüssel **742003** und setzt `app.tenant_id`
+  transaktionslokal. Der Schlüssel ist nicht mit 742001 (Migration) oder
+  742002 (Pilot-Seed) geteilt.
+- Der CLI ist durch `import.meta.main` auf reine CLI-Ausführung begrenzt und
+  verweigert bei `VERCEL=1` mit stabilem Fehlercode den Lauf.
+- Stdout ist anonymisiert: nur maskierte interne IDs, Statuswerte und der
+  öffentliche `join_path` (kein Secret) erscheinen. Slug, Rechtsname,
+  E-Mail, `CUSTOMER_REF` und Credentials erscheinen nie. Fehler gehen als
+  stabile Codes mit Exit 1 nach stderr; Erfolg endet mit Exit 0.
+- Audit wird append-only als `tenant.configured` mit minimalen Metadaten
+  geschrieben. Die Ausgabe enthält keine Audit-/PII-Daten.
+
+Auszuführen ist der Ablauf nach `db:migrate` und vor dem produktiven Pilot-
+Betrieb. Die öffentliche Join-URL kann danach für QR/NFC verwendet werden;
+Stempeln bleibt ausschließlich dem authentifizierten Personal vorbehalten.
+
 ## Owner-Passwort setzen/rotieren (CLI, nur Operator)
 
 Für einen **bereits vorhandenen** Owner gibt es ausschließlich den operator-only CLI-Pfad `bun run db:rotate-owner-password`. Er läuft nie bei `VERCEL=1`, prüft vor jeder DML die Operator-/Tabellenowner-Rolle und sucht ausschließlich den bestehenden aktiven Owner über Tenant-Slug plus exakte Owner-E-Mail. Es werden keine User oder Memberships angelegt.
