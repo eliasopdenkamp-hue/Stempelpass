@@ -4,6 +4,7 @@ import {
   formatRetentionResult,
   MESSAGE_LOG_RETENTION,
   parseRetentionEnv,
+  REVOKED_SESSION_RETENTION,
   runRetention,
   type RetentionCounts,
 } from '../src/retention';
@@ -75,6 +76,41 @@ class RetentionFixtureDb implements TxClient {
   }
   messageLogIds(): string[] { return this.messageLogs.map(row => row.id); }
   consentEventIds(): string[] { return this.consentEvents.map(row => row.id); }
+  release() {}
+}
+
+type SessionFixture = { id: string; tenant_id: string; created_at: string; expires_at: string; revoked_at: string | null };
+
+/**
+ * DB-free fixture that applies EXACTLY the session predicate of the retention
+ * job (`src/retention.ts` runRetention) to artificial timestamps:
+ *   - not revoked and expires_at <= now()        -> deleted at expiry (12h TTL),
+ *   - revoked and revoked_at <= now() - 7 days   -> deleted 7 days after revocation.
+ * `created_at` documents the session "age"; the job decides on expires_at /
+ * revoked_at only (an "active" session cannot outlive 7 days under the 12h TTL).
+ */
+class SessionTtlFixtureDb implements TxClient {
+  readonly queries: Array<{ sql: string; params: unknown[] }> = [];
+  constructor(
+    private readonly now: Date,
+    private sessions: SessionFixture[],
+  ) {}
+  async query<T = unknown>(sql: string, params: unknown[] = []): Promise<{ rows: T[] }> {
+    this.queries.push({ sql, params });
+    const tenantId = params[0] as string | undefined;
+    if (sql.startsWith('delete from sessions')) {
+      const cutoff = new Date(this.now.getTime() - 7 * 24 * 60 * 60 * 1000);
+      const deleted = this.sessions.filter(session => {
+        if (tenantId && session.tenant_id !== tenantId) return false;
+        if (session.revoked_at === null) return new Date(session.expires_at) <= this.now;
+        return new Date(session.revoked_at) <= cutoff;
+      });
+      this.sessions = this.sessions.filter(session => !deleted.includes(session));
+      return { rows: deleted as T[] };
+    }
+    return { rows: [] as T[] };
+  }
+  remainingSessionIds(): string[] { return this.sessions.map(session => session.id).sort(); }
   release() {}
 }
 
@@ -236,6 +272,45 @@ describe('retention SQL contracts', () => {
     expect(sql).toContain(`max(p.withdrawn_at) <= now() - interval '${CONSENT_EVENT_RETENTION_AFTER_REVOCATION}'`);
     expect(sql).not.toContain('audit');
   });
+});
+
+test('session TTL matrix: active/expired/revoked x age <7d / >7d classifies exactly like the retention job', async () => {
+  const NOW = new Date('2026-09-08T00:00:00Z');
+  const daysAgo = (n: number) => new Date(NOW.getTime() - n * 24 * 60 * 60 * 1000).toISOString();
+  const hoursAhead = (n: number) => new Date(NOW.getTime() + n * 60 * 60 * 1000).toISOString();
+  const db = new SessionTtlFixtureDb(NOW, [
+    // Status aktiv, Alter <7 Tage: noch im 12-Stunden-TTL-Fenster -> ERHALTEN.
+    { id: 's-active-young', tenant_id: TENANT, created_at: daysAgo(0), expires_at: hoursAhead(6), revoked_at: null },
+    // Status aktiv/abgelaufen, Alter >7 Tage: 12h-TTL längst abgelaufen -> GELÖSCHT.
+    { id: 's-active-old', tenant_id: TENANT, created_at: daysAgo(9), expires_at: daysAgo(8), revoked_at: null },
+    // Status abgelaufen, Alter <7 Tage: Löschung sofort bei Ablauf, keine 7-Tage-Schonfrist
+    // (die 7-Tage-Frist gilt nur für widerrufene Sessions) -> GELÖSCHT.
+    { id: 's-expired-young', tenant_id: TENANT, created_at: daysAgo(1), expires_at: daysAgo(1), revoked_at: null },
+    // Status widerrufen, Alter <7 Tage: revoked_at vor 6 Tagen -> ERHALTEN.
+    { id: 's-revoked-young', tenant_id: TENANT, created_at: daysAgo(3), expires_at: hoursAhead(6), revoked_at: daysAgo(6) },
+    // Status widerrufen, Grenzwert: revoked_at genau 7 Tage (revoked_at <= now()-7d) -> GELÖSCHT.
+    { id: 's-revoked-boundary', tenant_id: TENANT, created_at: daysAgo(8), expires_at: hoursAhead(6), revoked_at: daysAgo(7) },
+    // Status widerrufen, Alter >7 Tage: revoked_at vor 8 Tagen -> GELÖSCHT.
+    { id: 's-revoked-old', tenant_id: TENANT, created_at: daysAgo(9), expires_at: hoursAhead(6), revoked_at: daysAgo(8) },
+    // Tenant-Isolation: identisch "widerrufen >7 Tage", aber anderer Tenant -> unberührt.
+    { id: 's-other-tenant', tenant_id: OTHER_TENANT, created_at: daysAgo(9), expires_at: hoursAhead(6), revoked_at: daysAgo(8) },
+  ]);
+
+  const counts = await runRetention(db, TENANT, wallet);
+  expect(counts.sessionsDeleted).toBe(4);
+  expect(db.remainingSessionIds()).toEqual(['s-active-young', 's-other-tenant', 's-revoked-young']);
+  expect(db.queries[0]?.sql).toContain("revoked_at <= now() - interval '7 days'");
+  expect(db.queries[0]?.sql).toContain(`revoked_at <= now() - interval '${REVOKED_SESSION_RETENTION}'`);
+
+  // Idempotenz: der zweite Lauf löscht nichts mehr.
+  const again = await runRetention(db, TENANT, wallet);
+  expect(again.sessionsDeleted).toBe(0);
+
+  // Globaler Lauf (ohne Tenant-Scope) entfernt auch die andere-Tenant-Zeile,
+  // lässt aber die beiden "Alive"-Sessions unangetastet.
+  const global = await runRetention(db, null, wallet);
+  expect(global.sessionsDeleted).toBe(1);
+  expect(db.remainingSessionIds()).toEqual(['s-active-young', 's-revoked-young']);
 });
 
 test('CLI is operator-only, takes the retention advisory lock, and logs anonymous duration', async () => {
