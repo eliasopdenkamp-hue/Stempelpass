@@ -19,8 +19,11 @@
  *       Vorher-Zustand per GET bestaetigt, dann laeuft der PRODUKTIONS-Job
  *       `runRetention()` mit dem ECHTEN Adapter: revoke() PATCHt das Objekt
  *       auf INACTIVE. Per GET wird INACTIVE verifiziert.
- *   (d) Aufraeumen: Wallet-Objekt per DELETE entfernen, Fixture-Zeilen
- *       (Karte/Kunde/Tenant/User) loeschen, damit Production sauber bleibt.
+ *   (d) Aufraeumen: Fixture-Zeilen (Karte/Kunde/Tenant/User) werden geloescht.
+ *       Das Wallet-Objekt wird per PATCH auf ACTIVE zurueckgesetzt: DELETE auf
+ *       ein per Issuer-API angelegtes loyaltyObject beantwortet die Wallet-API
+ *       immer mit HTTP 404 (Validierung 2026-09-10), das Objekt bleibt sonst
+ *       als unbenutztes Template bestehen.
  *
  * Sicherheitsvertrag (wie scripts/validate-retention.ts):
  *   - VERCEL=1 bricht vor jeder Aktion ab (nie auf dem Request-Pfad).
@@ -131,7 +134,9 @@ class WalletApiProbe {
     });
     if (!response.ok) return `HTTP_${response.status}`;
     const object = (await response.json()) as { state?: string };
-    return object.state ?? 'NO_STATE';
+    // Die Wallet-API serialisiert state-Enum-Werte in Kleinbuchstaben
+    // ("active"/"inactive"); fuer die Checks normalisieren wir auf Grossbuchstaben.
+    return (object.state ?? 'NO_STATE').toUpperCase();
   }
 
   async deleteObject(cardId: string): Promise<string> {
@@ -142,6 +147,25 @@ class WalletApiProbe {
     if (response.status === 404) return 'ABSENT';
     if (!response.ok) return `HTTP_${response.status}`;
     return 'DELETED';
+  }
+
+  /**
+   * Setzt das Wegwerf-Objekt (falls vorhanden) auf ACTIVE zurueck. Erkenntnis
+   * aus dem Validierungslauf 2026-09-10: DELETE auf ein per Issuer-API
+   * angelegtes loyaltyObject wird von der Google-Wallet-API immer mit HTTP 404
+   * beantwortet (generische HTML-404-Seite), das Objekt bleibt bestehen (GET
+   * liefert weiter 200). PATCH auf ACTIVE ist der zuverlaessige Reset- und
+   * Cleanup-Pfad; nicht vorhandene Objekte -> 404 -> ABSENT (kein Fehler).
+   */
+  async resetActive(cardId: string): Promise<string> {
+    const url = `https://walletobjects.googleapis.com/walletobjects/v1/loyaltyObject/${encodeURIComponent(`${this.issuerId}.${cardId}`)}`;
+    const headers = await this.headers();
+    const existing = await fetch(url, { headers });
+    if (existing.status === 404) return 'ABSENT';
+    if (!existing.ok) return `HTTP_${existing.status}`;
+    const response = await fetch(url, { method: 'PATCH', headers, body: JSON.stringify({ state: 'ACTIVE' }) });
+    if (!response.ok) return `HTTP_${response.status}`;
+    return 'ACTIVE';
   }
 }
 
@@ -267,6 +291,7 @@ async function main(): Promise<number> {
 
   let pool: PoolLike | null = null;
   let db: QueryConnection | null = null;
+  let probe: WalletApiProbe | null = null;
   try {
     pool = await prepareDatabase(url);
     db = await pool.reserve();
@@ -278,7 +303,12 @@ async function main(): Promise<number> {
     // Realer Produktions-Adapter (liest die Umgebung; service-account-json
     // bzw. keyless/external-account). Kein Mock, kein Fake-Fetch.
     const adapter: WalletAdapter = walletAdapter('google');
-    const probe = new WalletApiProbe(issuerId, resolution.provider!);
+    probe = new WalletApiProbe(issuerId, resolution.provider!);
+    // Selbstheilung: Wegwerf-Objekt auf ACTIVE zuruecksetzen (falls ein
+    // abgebrochener Vorlauf ein INACTIVE-Objekt hinterlassen hat). DELETE
+    // entfernt Issuer-Objekte nicht (API 404, siehe resetActive); PATCH ist
+    // der zuverlaessige Reset. Neues Objekt -> 404 -> ABSENT (kein Fehler).
+    await probe.resetActive(FIXTURE.card);
 
     // 1. Pass ausstellen (gleicher Pfad wie /card/.../wallet/google).
     const view: WalletCardView = { id: FIXTURE.card, stampCount: 0 };
@@ -318,12 +348,21 @@ async function main(): Promise<number> {
       pass: stateAfter === 'INACTIVE',
     });
 
-    // 5. Aufraeumen: Wallet-Objekt entfernen + Fixture-Zeilen loeschen.
+    // 5. Aufraeumen: Objekt-Reset per PATCH + Fixture-Zeilen loeschen. DELETE
+    //    wird von der Wallet-API fuer Issuer-Objekte mit 404 beantwortet
+    //    (Validierung 2026-09-10); der zuverlaessige Cleanup ist PATCH zurueck
+    //    auf ACTIVE (unbenutztes Template, keine Kartenrelation).
     const deleteResult = await probe.deleteObject(FIXTURE.card);
+    const resetResult = await probe.resetActive(FIXTURE.card);
     checks.push({
-      name: 'cleanup: throwaway wallet object removed from the issuer (DELETE)',
-      expected: 'DELETED', actual: deleteResult,
-      pass: deleteResult === 'DELETED' || deleteResult === 'ABSENT',
+      name: 'cleanup: delete attempt on throwaway object recorded (API returns 404 for issuer objects)',
+      expected: '404/ABSENT', actual: deleteResult,
+      pass: deleteResult === 'ABSENT' || deleteResult === 'DELETED',
+    });
+    checks.push({
+      name: 'cleanup: throwaway wallet object reset to ACTIVE via PATCH (verified by reset)',
+      expected: 'ACTIVE', actual: resetResult,
+      pass: resetResult === 'ACTIVE',
     });
     await cleanupFixtures(db);
     const leftover = await db.unsafe<{ count: number }[]>('select count(*)::int as count from cards where id = $1', [FIXTURE.card]);
@@ -352,6 +391,10 @@ async function main(): Promise<number> {
         await cleanupFixtures(db).catch(() => undefined);
         db.release();
       }
+      // Immer aufraeumen: auch bei fehlgeschlagenen Checks muss das Wegwerf-Objekt
+      // auf ACTIVE zurueckgesetzt sein (selbstheilender Revoke-Harness; DELETE
+      // entfernt Issuer-Objekte nicht — API 404, siehe resetActive).
+      await probe?.resetActive(FIXTURE.card).catch(() => undefined);
       await pool?.end({ timeout: 5 }).catch(() => undefined);
     } catch { /* best effort */ }
     console.log = previousLog;
@@ -359,8 +402,7 @@ async function main(): Promise<number> {
   }
 
   const failures = checks.filter(check => !check.pass).map(check => check.name);
-  const summary = capture({ checks, failures });
-  console.log(summary);
+  console.log(JSON.stringify({ checks, failures, capturedLogs }, null, 2));
   return failures.length ? 1 : 0;
 }
 
