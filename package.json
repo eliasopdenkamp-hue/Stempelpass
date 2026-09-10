@@ -14,6 +14,8 @@
     "db:rotate-owner-password": "bun run src/rotate-owner-password.ts",
     "db:cleanup": "bun run src/cleanup.ts",
     "db:retention": "bun run src/retention.ts",
+    "db:retention-validate": "bun run scripts/validate-retention.ts",
+    "db:wallet-revoke-validate": "bun run scripts/validate-wallet-revoke.ts",
     "rls-verify": "bun run src/rls-verify.ts",
     "production-preflight": "bun run src/production-preflight.ts"
   },

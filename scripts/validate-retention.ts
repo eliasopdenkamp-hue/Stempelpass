@@ -123,8 +123,12 @@ function directUrl(raw: string): string {
 }
 
 function openSql(rawUrl: string): HarnessSql {
+  // max: 2 — one connection stays reserved by runHarness for setup/snapshots,
+  // the second is the FRESH per-job transaction connection (PR #11 design:
+  // every retention run gets its own connection so no open transaction state
+  // leaks between job runs). A max of 1 would deadlock the fresh reserve().
   return postgres(directUrl(rawUrl), {
-    max: 1,
+    max: 2,
     connect_timeout: 10,
     idle_timeout: 20,
     prepare: false,
@@ -409,6 +413,115 @@ async function dropInvalidRole(db: QueryConnection): Promise<void> {
   await exec(db, `drop role if exists ${quoteIdentifier(INVALID_ROLE)}`);
 }
 
+/** Dedicated throwaway tenant for the explicit session-TTL subtest (§3.4). */
+const SESSION_TTL = {
+  tenant: '00000000-0000-4000-8000-000000000003',
+  user: '00000000-0000-4000-8000-000000000103',
+  member: '00000000-0000-4000-8000-000000000203',
+} as const;
+const SESSION_TTL_SESSION_IDS = [
+  '00000000-0000-4000-8000-000000000c01', // aktiv, Alter ~0 (12h-TTL-Fenster)  -> ERHALTEN
+  '00000000-0000-4000-8000-000000000c02', // aktiv/abgelaufen, Alter >7 Tage     -> GELÖSCHT
+  '00000000-0000-4000-8000-000000000c03', // abgelaufen, Alter <7 Tage           -> GELÖSCHT (sofort bei Ablauf)
+  '00000000-0000-4000-8000-000000000c04', // widerrufen, Alter <7 Tage           -> ERHALTEN
+  '00000000-0000-4000-8000-000000000c05', // widerrufen, genau 7 Tage (Grenzwert) -> GELÖSCHT
+  '00000000-0000-4000-8000-000000000c06', // widerrufen, Alter >7 Tage           -> GELÖSCHT
+] as const;
+
+async function cleanupSessionTtlTenant(db: QueryConnection): Promise<void> {
+  await exec(db, 'delete from sessions where tenant_id = $1', [SESSION_TTL.tenant]);
+  await exec(db, 'delete from tenant_memberships where tenant_id = $1', [SESSION_TTL.tenant]);
+  await exec(db, 'delete from tenants where id = $1', [SESSION_TTL.tenant]);
+  await exec(db, 'delete from users where id = $1', [SESSION_TTL.user]);
+}
+
+/**
+ * Explicit session-TTL subtest (§3.4): Status aktiv/abgelaufen/widerrufen x
+ * Alter <7 Tage (ERHALTEN) / >7 Tage (GELÖSCHT) auf einem dedizierten
+ * Wegwerf-Tenant mit künstlichen Zeitstempeln. `created_at` dokumentiert das
+ * Alter; der Job entscheidet über expires_at/revoked_at (eine "aktive"
+ * Session überlebt unter der 12h-TTL keine 7 Tage).
+ */
+async function runSessionTtlSubtest(
+  sql: HarnessSql,
+  checks: Check[],
+  allLogs: string[],
+  wallet: WalletAdapter & { revokeCalls: string[] },
+): Promise<void> {
+  const db = await sql.reserve();
+  const revokeCallsBefore = wallet.revokeCalls.length;
+  try {
+    await resetHarnessContext(db);
+    await cleanupSessionTtlTenant(db);
+
+    const now = new Date();
+    const d1 = minusDays(now, 1);
+    const d6 = minusDays(now, 6);
+    const d7 = minusDays(now, 7);
+    const d8 = minusDays(now, 8);
+    const d9 = minusDays(now, 9);
+    const future = new Date(now.getTime() + 6 * 60 * 60 * 1000);
+
+    await exec(db, 'insert into tenants(id, slug, legal_name, plan_code, customer_limit) values ($1,$2,$3,$4,$5)', [
+      SESSION_TTL.tenant, 'session-ttl-validation', 'Session TTL Validation', 'up_to_500', 500,
+    ]);
+    await exec(db, 'insert into users(id, email, display_name, auth_subject) values ($1,$2,$3,$4)', [
+      SESSION_TTL.user, 'session-ttl@example.invalid', 'Session TTL', 'session-ttl-subject',
+    ]);
+    await exec(db, 'insert into tenant_memberships(id, tenant_id, user_id, role) values ($1,$2,$3,\'staff\')', [
+      SESSION_TTL.member, SESSION_TTL.tenant, SESSION_TTL.user,
+    ]);
+    const insertSession = (id: string, created: Date, expires: Date, revoked: Date | null) =>
+      exec(db, 'insert into sessions(id, user_id, tenant_id, token_hash, csrf_token_hash, created_at, expires_at, revoked_at) values ($1,$2,$3,$4,$5,$6::timestamptz,$7::timestamptz,$8::timestamptz)', [
+        id, SESSION_TTL.user, SESSION_TTL.tenant, hash(`session-ttl-${id}`), hash(`csrf-ttl-${id}`), created, expires, revoked,
+      ]);
+    await insertSession(SESSION_TTL_SESSION_IDS[0], now, future, null);
+    await insertSession(SESSION_TTL_SESSION_IDS[1], d9, d8, null);
+    await insertSession(SESSION_TTL_SESSION_IDS[2], d1, d1, null);
+    await insertSession(SESSION_TTL_SESSION_IDS[3], d8, future, d6);
+    await insertSession(SESSION_TTL_SESSION_IDS[4], d8, future, d7);
+    await insertSession(SESSION_TTL_SESSION_IDS[5], d9, future, d8);
+
+    const before = (await query<{ count: number }>(db, 'select count(*)::int as count from sessions where tenant_id = $1', [SESSION_TTL.tenant]))[0];
+    checks.push({
+      name: 'session TTL: 6 fixture sessions (aktiv/abgelaufen/widerrufen x <7d/>7d) on dedicated tenant',
+      expected: 6, actual: before?.count ?? 'missing', pass: before?.count === 6,
+    });
+
+    const run = await invokeRetention(sql, SESSION_TTL.tenant, wallet);
+    allLogs.push(...run.logs);
+    checks.push({
+      name: 'session TTL: retention deletes exactly the 4 lapsed/revoked sessions',
+      expected: 4, actual: run.counts?.sessionsDeleted ?? run.errorCode,
+      pass: run.exitCode === 0 && run.counts?.sessionsDeleted === 4,
+    });
+
+    const remaining = (await query<{ id: string }>(db, 'select id from sessions where tenant_id = $1 order by id', [SESSION_TTL.tenant])).map(row => row.id);
+    checks.push({
+      name: 'session TTL: kept = active within 12h TTL + revoked <7d; deleted = expired (<7d & >7d) + revoked boundary 7d + revoked >7d',
+      expected: [SESSION_TTL_SESSION_IDS[0], SESSION_TTL_SESSION_IDS[3]], actual: remaining,
+      pass: remaining.length === 2 && remaining[0] === SESSION_TTL_SESSION_IDS[0] && remaining[1] === SESSION_TTL_SESSION_IDS[3],
+    });
+
+    const again = await invokeRetention(sql, SESSION_TTL.tenant, wallet);
+    allLogs.push(...again.logs);
+    checks.push({
+      name: 'session TTL: immediate second run is idempotent (sessions_deleted=0)',
+      expected: 0, actual: again.counts?.sessionsDeleted ?? again.errorCode,
+      pass: again.exitCode === 0 && again.counts?.sessionsDeleted === 0,
+    });
+    checks.push({
+      name: 'session TTL: no wallet revoke calls for a sessions-only subtest',
+      expected: 0, actual: wallet.revokeCalls.length - revokeCallsBefore,
+      pass: wallet.revokeCalls.length === revokeCallsBefore,
+    });
+  } finally {
+    await resetHarnessContext(db);
+    await cleanupSessionTtlTenant(db);
+    db.release();
+  }
+}
+
 function expectedA(): Partial<RetentionCounts> {
   return {
     sessionsDeleted: 2, messageLogsRetentionDeleted: 1, consentEventsRetentionDeleted: 1,
@@ -468,6 +581,10 @@ async function runHarness(url: string): Promise<{ checks: Check[]; tableCounts?:
     const vercel = await invokeCli(undefined, url, null, wallet, { vercel: true });
     allLogs.push(...vercel.logs);
     checks.push({ name: 'Vercel gate', expected: 'RETENTION_NOT_ALLOWED_ON_VERCEL', actual: vercel.errorCode ?? 'none', pass: vercel.exitCode === 1 && vercel.errorCode === 'RETENTION_NOT_ALLOWED_ON_VERCEL' });
+
+    // Explicit session-TTL subtest (§3.4) on a dedicated throwaway tenant,
+    // AFTER the global run so the main fixture counts stay untouched.
+    await runSessionTtlSubtest(sql, checks, allLogs, wallet);
 
     const after = await snapshot(db, [IDS.tenantA, IDS.tenantB]);
     checks.push({ name: 'wallet revoke exactly once per hard-deleted card', expected: 2, actual: wallet.revokeCalls.length, pass: wallet.revokeCalls.length === 2 && new Set(wallet.revokeCalls).size === 2 });
