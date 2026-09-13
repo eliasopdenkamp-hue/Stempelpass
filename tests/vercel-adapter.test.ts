@@ -191,6 +191,42 @@ test('toFetchRequest: JSON request stays parseable when the bridge set both body
   expect(await req.json()).toEqual({ email: 'a@b.de', password: 'secret' });
   expect(req.headers.get('content-length')).toBeNull();
 });
+test('toFetchRequest: urlencoded OBJECT body with NO rawBody becomes urlencoded wire format, not JSON text (the exact deployed Vercel case — red before fix)', async () => {
+  // The production runtime delivered urlencoded form POSTs with the fields
+  // pre-parsed as an OBJECT on `body` and NO rawBody. The old normalizeBody
+  // re-serialized that object as JSON text while the original
+  // `application/x-www-form-urlencoded` Content-Type stayed in place — the
+  // form branch of parseBody then saw JSON text, parsed it as urlencoded and
+  // produced {} → the live 400 CARD_FIELDS_REQUIRED (stamp) / 404
+  // REWARD_NOT_FOUND (redeem). This pins that such an object body is encoded
+  // back into the urlencoded wire format so the form branch can parse it.
+  const req = adapter.toFetchRequest(vercelFormPost(
+    { cardId: '66666666-6666-4666-8666-666666666666', quantity: '1' }, // bridge parse, no rawBody
+  ));
+  expect(req.headers.get('content-type')).toBe('application/x-www-form-urlencoded');
+  const text = await req.text();
+  // The wire format must be urlencoded — NOT JSON text under a urlencoded
+  // content-type (the old behavior: exactly the 400/404 live symptom).
+  expect(text).not.toContain('{');
+  expect(text).toBe(URLENCODED);
+  // And the form branch parse (new URLSearchParams) must recover the fields.
+  const body = new URLSearchParams(text);
+  expect(body.get('cardId')).toBe('66666666-6666-4666-8666-666666666666');
+  expect(body.get('quantity')).toBe('1');
+  // The re-encoded body may differ in length from the stale header.
+  expect(req.headers.get('content-length')).toBeNull();
+});
+test('toFetchRequest: JSON object body with NO rawBody still serializes as JSON (content-type honored)', async () => {
+  const req = adapter.toFetchRequest({
+    method: 'POST',
+    url: '/api/auth/login',
+    headers: { host: 'stempelpass.example', 'x-forwarded-proto': 'https', 'content-type': 'application/json' },
+    body: { email: 'a@b.de', password: 'secret' }, // no rawBody
+  });
+  expect(req.headers.get('content-type')).toBe('application/json');
+  expect(await req.json()).toEqual({ email: 'a@b.de', password: 'secret' });
+  expect(req.headers.get('content-length')).toBeNull();
+});
 test('toFetchRequest: body-less request stays body-less', async () => {
   const req = adapter.toFetchRequest({ method: 'GET', url: '/health', headers: { host: 'stempelpass.example' } });
   expect(await req.text()).toBe('');

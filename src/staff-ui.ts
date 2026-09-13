@@ -63,8 +63,9 @@ function page(title: string, bodyHtml: string, extraHead = ''): string {
 /**
  * Deterministic staff script (static — carries NO server state; the current
  * CSRF hash is delivered in a <meta name="sp-csrf"> tag in <head>). Mutating
- * actions run through fetch with the x-csrf-token header (the CSRF contract of
- * the JSON API); every mutating response rotates the session and therefore
+ * actions run through fetch as JSON with the x-csrf-token header (the CSRF
+ * contract of the JSON API — the content type live-verified working on every
+ * runtime); every mutating response rotates the session and therefore
  * carries a fresh x-csrf-token RESPONSE header, which is adopted here.
  * After a successful action the server re-renders the full #sp-app dashboard
  * (fresh CSRF embedded), which this script swaps in; document-level delegated
@@ -98,10 +99,30 @@ const STAFF_SCRIPT = `
     if (reward) out.rewardId = reward;
     return out;
   }
+  function toObject(data) {
+    var out = {};
+    if (typeof FormData !== 'undefined' && data instanceof FormData) {
+      data.forEach(function (v, k) { out[k] = typeof v === 'string' ? v : String(v); });
+      return out;
+    }
+    for (var k in data) {
+      if (Object.prototype.hasOwnProperty.call(data, k)) out[k] = data[k];
+    }
+    return out;
+  }
   function post(url, data) {
     hideError();
-    var body = new URLSearchParams(data || {});
-    return fetch(url, { method: 'POST', headers: { 'x-csrf-token': csrf || '' }, body: body }).then(function (res) {
+    // Actions are sent as JSON — the content type live-verified working on
+    // every runtime. The deployed Vercel Node runtime delivers urlencoded
+    // form bodies unusably (live 400 CARD_FIELDS_REQUIRED on stamp / 404
+    // REWARD_NOT_FOUND on redeem) while ALL JSON paths answer 200. The server
+    // parseBody accepts exactly the same fields (cardId | cardToken,
+    // quantity, rewardId) — only the wire format changes.
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'x-csrf-token': csrf || '', 'content-type': 'application/json' },
+      body: JSON.stringify(toObject(data || {}))
+    }).then(function (res) {
       var next = res.headers.get('x-csrf-token');
       if (next && /^[0-9a-f]{64}$/.test(next)) csrf = next;
       return res.text().then(function (html) {

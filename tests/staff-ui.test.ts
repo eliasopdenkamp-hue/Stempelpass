@@ -28,6 +28,9 @@ process.env.FRONTEND_ORIGIN_DEV = 'https://a1e91d0731cfc57ecf5a508e37635a85-dev.
 process.env.VERCEL = '1';
 
 const { fetchHandler, withTestDependencies } = await import('../src/server');
+// The Vercel Node adapter: its toFetchRequest() is the normalization layer a
+// legacy (req, res) invocation goes through before fetchHandler sees it.
+const { toFetchRequest } = await import('../api/index');
 
 // --- fixtures (valid UUID shapes) ---
 const TENANT = '11111111-1111-4111-8111-111111111111';
@@ -559,6 +562,207 @@ test('POST staff redeem: urlencoded form body redeems, double redemption stays 4
       expect(res.status).toBe(409);
       expect(await res.text()).toContain('Diese Prämie wurde bereits eingelöst.');
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (5c) JSON action-POST regression (staff UI wire format, PR #21)
+// The staff dashboard script now submits stamp/redeem/logout as JSON — the
+// content type live-verified working on every runtime (the deployed Vercel
+// Node runtime delivers urlencoded bodies unusably: live 400/404, while ALL
+// JSON paths answer 200). These tests pin that the JSON payloads the UI
+// produces (cardId | cardToken, quantity, rewardId — strings, exactly like
+// the data-attributes/FormData the script collects) drive the REAL
+// fetchHandler the same way the urlencoded tests do: stamp +1, redeem 200,
+// second redemption 409, logout 302. The urlencoded tests above stay in
+// place for native/curl form-POSTs (adapter layer rewrites them).
+// ---------------------------------------------------------------------------
+test('dashboard HTML embeds a JSON-only staff script (no urlencoded client fetch)', async () => {
+  const pool = new FakePool([...sessionHandlers(validSession), ...dashboardHandlers()]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("'content-type': 'application/json'");
+    expect(html).toContain('JSON.stringify(toObject(data || {}))');
+    expect(html).not.toContain('new URLSearchParams');
+  });
+});
+
+test('POST staff stamp with the UI JSON payload (cardId) stamps once and rotates the session', async () => {
+  stampLimiter.clear();
+  const pool = new FakePool(stampFlowHandlers());
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/stamp`, {
+      method: 'POST',
+      headers: authedHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ cardId: CARD, quantity: '1' }),
+    }));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('Stempel vergeben');
+    expect(html).toContain('hat jetzt 4 Stempel');
+    const rotatedCsrf = res.headers.get('x-csrf-token');
+    expect(rotatedCsrf).toMatch(/^[0-9a-f]{64}$/);
+    expect(rotatedCsrf).not.toBe(CSRF_VALUE);
+    expect(html).toContain(`name="sp-csrf" content="${rotatedCsrf}"`);
+    const inserts = pool.queries.filter(q => q.sql.startsWith('insert into stamp_events'));
+    expect(inserts).toHaveLength(1);
+  });
+});
+
+test('POST staff stamp with the UI JSON payload (raw card token) resolves via token hash, never the raw token', async () => {
+  stampLimiter.clear();
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('public_token_hash'), rows: [{ id: CARD, tenantId: TENANT, customerId: '22222222-2222-4222-8222-222222222222', publicTokenHash: 'f'.repeat(64), status: 'active', stampCount: 3, revision: 2, ruleId: RULE, createdAt: null, updatedAt: null }] },
+    { match: contains('from stamp_events where'), rows: [] },
+    { match: contains('from cards where'), rows: [{ id: CARD, stampCount: 3, revision: 2, ruleId: RULE }] },
+    { match: contains('insert into stamp_events'), rows: [] },
+    { match: contains('update cards set stamp_count'), rows: [{ id: CARD, stampCount: 4, revision: 3 }] },
+    { match: contains('stamps_required from stamp_rules'), rows: [{ id: RULE, stamps_required: 5 }] },
+    { match: contains('(select 1 from rewards'), rows: [] },
+    ...dashboardHandlers(),
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/stamp`, {
+      method: 'POST',
+      headers: authedHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ cardId: CARD_TOKEN, quantity: '1' }),
+    }));
+    expect(res.status).toBe(200);
+    const lookup = pool.queries.find(q => q.sql.includes('public_token_hash'));
+    expect(lookup).toBeDefined();
+    expect(String(lookup!.params[1])).toMatch(/^[a-f0-9]{64}$/);
+    expect(String(lookup!.params[1])).not.toBe(CARD_TOKEN);
+    expect(JSON.stringify(pool.queries)).not.toContain(CARD_TOKEN);
+  });
+});
+
+test('POST staff redeem with the UI JSON payload issues the redemption and rotates the session', async () => {
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed' }] },
+    ...dashboardHandlers({ rewards: [{ id: REWARD, cardId: CARD, status: 'redeemed' }] }),
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/redeem`, {
+      method: 'POST',
+      headers: authedHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ rewardId: REWARD }),
+    }));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('Prämie erfolgreich eingelöst.');
+    expect(res.headers.get('x-csrf-token')).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+test('POST staff redeem with the UI JSON payload: second redemption stays 409 REWARD_ALREADY_REDEEMED', async () => {
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('update rewards set status'), rows: [] },
+    { match: contains('select id,status from rewards'), rows: [{ id: REWARD, status: 'redeemed' }] },
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/redeem`, {
+      method: 'POST',
+      headers: authedHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ rewardId: REWARD }),
+    }));
+    expect(res.status).toBe(409);
+    expect(await res.text()).toContain('Diese Prämie wurde bereits eingelöst.');
+    expect(res.headers.get('set-cookie')).toBeNull();
+  });
+});
+
+test('POST staff logout with the UI JSON payload revokes the session, clears the cookie and redirects to /login', async () => {
+  const pool = new FakePool([...sessionHandlers(validSession)]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/logout`, {
+      method: 'POST',
+      headers: authedHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({}),
+    }));
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+    const setCookie = res.headers.get('set-cookie') ?? '';
+    expect(setCookie).toContain('__Host-sp_session=;');
+    expect(setCookie).toContain('Max-Age=0');
+    const revoke = pool.queries.find(q => q.sql.includes('update sessions set revoked_at=now() where token_hash'));
+    expect(revoke).toBeDefined();
+    expect(revoke!.params).toEqual([SESSION_HASH]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (5d) Full production chain (the live-verified Vercel shape): the legacy
+// Node request arrives with the urlencoded form PRE-PARSED as an OBJECT on
+// `body` and NO `rawBody`. The adapter's toFetchRequest() must rebuild the
+// urlencoded wire format (URLSearchParams), after which fetchHandler's form
+// branch of parseBody parses the fields and stamps +1. Before the adapter
+// fix this chain produced JSON text under a urlencoded content-type → the
+// form branch parsed {} → live 400 CARD_FIELDS_REQUIRED.
+// ---------------------------------------------------------------------------
+test('production chain: legacy urlencoded req (object body, no rawBody) → adapter → fetchHandler stamps +1', async () => {
+  stampLimiter.clear();
+  const pool = new FakePool(stampFlowHandlers());
+  await runWith(pool, async () => {
+    const req = toFetchRequest({
+      method: 'POST',
+      url: `/staff/${TENANT}/stamp`,
+      headers: {
+        host: 'test.local',
+        'x-forwarded-proto': 'https',
+        cookie: `__Host-sp_session=${SESSION_TOKEN}`,
+        'x-csrf-token': CSRF_VALUE,
+        'content-type': 'application/x-www-form-urlencoded',
+        'content-length': '999', // stale (rewritten) — must be dropped
+      },
+      body: { cardId: CARD, quantity: '1' }, // bridge parse; NO rawBody
+    });
+    const res = await fetchHandler(req);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('Stempel vergeben');
+    expect(html).toContain('hat jetzt 4 Stempel');
+    expect(res.headers.get('x-csrf-token')).toMatch(/^[0-9a-f]{64}$/);
+    const inserts = pool.queries.filter(q => q.sql.startsWith('insert into stamp_events'));
+    expect(inserts).toHaveLength(1);
+  });
+});
+
+test('production chain: legacy urlencoded redeem req (object body, no rawBody) → adapter → fetchHandler redeems 200, second 409', async () => {
+  const successPool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed' }] },
+    ...dashboardHandlers({ rewards: [{ id: REWARD, cardId: CARD, status: 'redeemed' }] }),
+  ]);
+  const legacyRedeem = () => toFetchRequest({
+    method: 'POST',
+    url: `/staff/${TENANT}/redeem`,
+    headers: {
+      host: 'test.local',
+      'x-forwarded-proto': 'https',
+      cookie: `__Host-sp_session=${SESSION_TOKEN}`,
+      'x-csrf-token': CSRF_VALUE,
+      'content-type': 'application/x-www-form-urlencoded',
+    },
+    body: { rewardId: REWARD }, // bridge parse; NO rawBody
+  });
+  await runWith(successPool, async () => {
+    const res = await fetchHandler(legacyRedeem());
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('Prämie erfolgreich eingelöst.');
+  });
+  const conflictPool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('update rewards set status'), rows: [] },
+    { match: contains('select id,status from rewards'), rows: [{ id: REWARD, status: 'redeemed' }] },
+  ]);
+  await runWith(conflictPool, async () => {
+    const res = await fetchHandler(legacyRedeem());
+    expect(res.status).toBe(409);
+    expect(await res.text()).toContain('Diese Prämie wurde bereits eingelöst.');
   });
 });
 
