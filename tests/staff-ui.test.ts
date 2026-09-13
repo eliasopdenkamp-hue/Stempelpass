@@ -1,0 +1,517 @@
+import { test, expect } from 'bun:test';
+import { CardRepository, type DbPool, type TxClient } from '../src/repository';
+import { hashSessionToken, randomToken, stampLimiter } from '../src/security';
+
+/**
+ * Staff web UI contract tests against the REAL fetchHandler — same DB-free
+ * pattern as tests/http-contract.test.ts: scrubbed environment, VERCEL=1, and
+ * a scripted in-memory FakePool injected via withTestDependencies. Covers the
+ * new HTML routes: GET /login, GET /staff (session-based tenant resolution),
+ * GET /staff/:tenantId dashboard, POST /staff/:tenantId/{stamp,redeem,logout},
+ * CSRF/role/cross-tenant gates and HTML escaping. No database, no secrets.
+ */
+
+// --- boot: scrub every secret/config var BEFORE importing the server module ---
+const SCRUBBED_KEYS = [
+  'DATABASE_URL', 'TEST_DATABASE_URL', 'SESSION_SECRET', 'MFA_ENCRYPTION_KEY',
+  'GOOGLE_ISSUER_ID', 'GOOGLE_SERVICE_ACCOUNT_JSON', 'GOOGLE_SERVICE_ACCOUNT_EMAIL',
+  'GOOGLE_PRIVATE_KEY', 'GOOGLE_EXTERNAL_ACCOUNT_JSON', 'GOOGLE_APPLICATION_CREDENTIALS',
+  'VERCEL_OIDC_TOKEN', 'APPLE_TEAM_IDENTIFIER', 'APPLE_PASS_TYPE_IDENTIFIER', 'APPLE_PRIVATE_KEY',
+  'TIGER_PUBLIC_KEY', 'TIGER_SECRET_KEY', 'TIGER_PROJECT_ID',
+  'EMAIL_SMTP_HOST', 'EMAIL_SMTP_PORT', 'EMAIL_SMTP_USER', 'EMAIL_SMTP_PASSWORD', 'EMAIL_FROM',
+  'COMMUNICATION_HASH_SECRET', 'PORT', 'PILOT_READY', 'FRONTEND_ORIGIN',
+  'FRONTEND_ORIGIN_DEV', 'PUBLIC_SITE_ORIGIN',
+];
+for (const key of SCRUBBED_KEYS) delete process.env[key];
+process.env.FRONTEND_ORIGIN = 'https://a1e91d0731cfc57ecf5a508e37635a85.ctonew.app';
+process.env.FRONTEND_ORIGIN_DEV = 'https://a1e91d0731cfc57ecf5a508e37635a85-dev.ctonew.app';
+process.env.VERCEL = '1';
+
+const { fetchHandler, withTestDependencies } = await import('../src/server');
+
+// --- fixtures (valid UUID shapes) ---
+const TENANT = '11111111-1111-4111-8111-111111111111';
+const OTHER_TENANT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const CARD = '66666666-6666-4666-8666-666666666666';
+const REWARD = '77777777-7777-4777-8777-777777777777';
+const RULE = '33333333-3333-4333-8333-333333333333';
+const USER_ID = '44444444-4444-4444-8444-444444444444';
+const MEMBERSHIP = '55555555-5555-4555-8555-555555555555';
+
+const SESSION_TOKEN = randomToken();
+const SESSION_HASH = hashSessionToken(SESSION_TOKEN);
+/** The CSRF value the client holds — identical to the stored hash. */
+const CSRF_VALUE = hashSessionToken(randomToken());
+/** Raw card token shape (base64url, as returned once at card creation). */
+const CARD_TOKEN = 'M'.repeat(43);
+
+interface FakeHandler { match: (sql: string, params: unknown[]) => boolean; rows: unknown[] | ((sql: string, params: unknown[]) => unknown[]); }
+class FakePool implements DbPool {
+  queries: Array<{ sql: string; params: unknown[] }> = [];
+  constructor(private readonly handlers: FakeHandler[]) {}
+  async connect(): Promise<TxClient> {
+    const self = this;
+    return {
+      async query<T = unknown>(sql: string, params: unknown[] = []): Promise<{ rows: T[] }> {
+        self.queries.push({ sql, params });
+        const handler = self.handlers.find((h) => h.match(sql, params));
+        if (!handler) return { rows: [] };
+        const rows = typeof handler.rows === 'function' ? handler.rows(sql, params) : handler.rows;
+        return { rows: rows as T[] };
+      },
+      release() {},
+    };
+  }
+}
+const contains = (needle: string): FakeHandler['match'] => (sql) => sql.includes(needle);
+
+function sessionRow(overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'sess-1', user_id: USER_ID, csrf_token_hash: CSRF_VALUE, tenant_id: TENANT,
+    role: 'staff', membership_id: MEMBERSHIP, mfa_required: false, mfa_verified: true,
+    ...overrides,
+  };
+}
+function sessionHandlers(sessionSource: (sql: string, params: unknown[]) => unknown[]): FakeHandler[] {
+  return [
+    { match: contains('resolve_session_user'), rows: (_s, p) => p[0] === SESSION_HASH ? [{ user_id: USER_ID }] : [] },
+    { match: contains('from sessions'), rows: sessionSource },
+    { match: contains('update sessions set revoked_at=now() where token_hash'), rows: [] },
+    { match: contains('insert into sessions'), rows: [] },
+  ];
+}
+const validSession: (sql: string, params: unknown[]) => unknown[] = (_s, p) =>
+  p[0] === SESSION_HASH ? [sessionRow()] : [];
+
+/** Query order for the /staff tenantless entry (no tenant context). */
+function entryHandlers(tenants: Array<Record<string, unknown>>): FakeHandler[] {
+  return [
+    { match: contains('resolve_session_user'), rows: (_s, p) => p[0] === SESSION_HASH ? [{ user_id: USER_ID }] : [] },
+    { match: contains('from sessions'), rows: (_s, p) => p[0] === SESSION_HASH ? [{ id: 'sess-1' }] : [] },
+    { match: contains('resolve_user_tenants'), rows: tenants },
+  ];
+}
+
+function runWith(pool: DbPool, fn: () => Promise<unknown>): Promise<unknown> {
+  const restore = withTestDependencies({ configured: true, pool, repository: new CardRepository(pool) });
+  return fn().finally(restore);
+}
+function authedHeaders(overrides: Record<string, string> = {}): Headers {
+  return new Headers({
+    cookie: `__Host-sp_session=${SESSION_TOKEN}`,
+    'x-csrf-token': CSRF_VALUE,
+    'content-type': 'application/x-www-form-urlencoded',
+    ...overrides,
+  });
+}
+
+/** Dashboard queries + preconditions shared by GET /staff/:tid and the
+ *  re-rendered dashboard inside POST responses. The rule hander order keeps
+ *  the repository.stamp() rule read (stamps_required from stamp_rules) apart
+ *  from the dashboard rule read (created_at desc limit 1). */
+function dashboardHandlers(overrides: { tenant?: unknown[]; cards?: unknown[]; events?: unknown[]; rewards?: unknown[]; branding?: unknown[] } = {}): FakeHandler[] {
+  return [
+    { match: contains('from tenants where'), rows: overrides.tenant === undefined
+      ? [{ id: TENANT, legalName: 'Beispiel GmbH', planCode: 'up_to_500', customerLimit: 500 }] : overrides.tenant },
+    { match: contains('from tenant_branding'), rows: overrides.branding === undefined
+      ? [{ cardTitle: 'Meine Karte', cardText: 'Sammel mit!', primaryColor: '#155e75', secondaryColor: '#f8fafc', version: 1 }] : overrides.branding },
+    { match: contains('from stamp_rules'), rows: [{ id: RULE, tenantId: TENANT, name: 'Pilot-Regel', stampsRequired: 5, rewardTitle: 'Kaffee', rewardDescription: 'Ein Kaffee gratis', active: true, version: 1 }] },
+    { match: contains('from tenant_entry_points'), rows: [{ joinPath: '/join/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }] },
+    { match: contains('count(distinct customer_id)'), rows: [{ n: '1' }] },
+    { match: contains('order by c.updated_at desc'), rows: overrides.cards === undefined
+      ? [{ id: CARD, customerRef: 'Kunde-42', stampCount: 3, updatedAt: '2026-08-26T10:00:00.000Z' }] : overrides.cards },
+    { match: contains('order by e.created_at desc'), rows: overrides.events === undefined
+      ? [{ id: 'evt-1', cardId: CARD, customerRef: 'Kunde-42', quantity: 1, createdAt: '2026-08-26T10:00:00.000Z' }] : overrides.events },
+    { match: contains('order by issued_at asc'), rows: overrides.rewards === undefined
+      ? [{ id: REWARD, cardId: CARD, status: 'issued' }] : overrides.rewards },
+  ];
+}
+
+/** Shared assertions: the dashboard HTML renders staff-relevant data and
+ *  never leaks session/token internals. */
+function expectDashboardHtml(html: string) {
+  expect(html).toContain('Beispiel GmbH');
+  expect(html).toContain('Meine Karte');
+  expect(html).toContain('Kaffee');
+  expect(html).toContain('Kunde-42');
+  expect(html).toContain('/join/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+  expect(html).toContain(`name="sp-csrf" content="`);
+  expect(html).toContain(`data-action="logout"`);
+  expect(html).toContain('/staff/11111111-1111-4111-8111-111111111111/stamp');
+  for (const marker of ['publicTokenHash', 'public_token_hash', 'employeeMembershipId', 'employee_membership_id', 'csrf_token_hash']) {
+    expect(html).not.toContain(marker);
+  }
+  expect(html).not.toContain(SESSION_TOKEN);
+}
+
+// ---------------------------------------------------------------------------
+// (1) GET /login — static staff login form
+// ---------------------------------------------------------------------------
+test('GET /login renders the staff login form without any server state', async () => {
+  const pool = new FakePool([]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request('http://test.local/login'));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/html');
+    const html = await res.text();
+    expect(html).toContain('<form id="login-form">');
+    expect(html).toContain('name="email"');
+    expect(html).toContain('type="password"');
+    expect(html).toContain('name="mfaCode"');
+    expect(html).toContain('/api/auth/login');
+    expect(html).toContain('location.href = \'/staff\'');
+    // No session/CSRF/secrets are ever embedded in the login page.
+    expect(html).not.toContain('csrf');
+    expect(html).not.toContain(SESSION_TOKEN);
+    expect(pool.queries).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (2) GET /staff — session-based tenant resolution
+// ---------------------------------------------------------------------------
+test('GET /staff without a session redirects to /login without touching the database', async () => {
+  const pool = new FakePool([]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request('http://test.local/staff'));
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+    expect(pool.queries).toHaveLength(0);
+  });
+});
+
+test('GET /staff with a valid single-tenant session redirects to the tenant dashboard', async () => {
+  const pool = new FakePool([...entryHandlers([{ tenantId: TENANT, role: 'owner' }])]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request('http://test.local/staff', { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe(`/staff/${TENANT}`);
+  });
+});
+
+test('GET /staff with multiple tenants renders a chooser with tenant names', async () => {
+  const pool = new FakePool([
+    ...entryHandlers([
+      { tenantId: TENANT, role: 'owner' },
+      { tenantId: OTHER_TENANT, role: 'staff' },
+    ]),
+    { match: contains('from tenants where id = any'), rows: [{ id: TENANT, legalName: 'Firma A' }, { id: OTHER_TENANT, legalName: 'Firma B' }] },
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request('http://test.local/staff', { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('Unternehmen wählen');
+    expect(html).toContain(`href="/staff/${TENANT}"`);
+    expect(html).toContain('Firma A');
+    expect(html).toContain('Firma B');
+  });
+});
+
+test('GET /staff with a session without tenants renders the no-access page', async () => {
+  const pool = new FakePool([...entryHandlers([])]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request('http://test.local/staff', { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('Kein aktiver Zugang');
+  });
+});
+
+test('GET /staff with an invalid session redirects to /login (no tenant data leaked)', async () => {
+  const pool = new FakePool([...entryHandlers([])]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request('http://test.local/staff', { headers: { cookie: '__Host-sp_session=forged' } }));
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (3) GET /staff/:tenantId — dashboard
+// ---------------------------------------------------------------------------
+test('GET /staff/:tenantId without a session redirects to /login', async () => {
+  const pool = new FakePool([]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}`));
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+  });
+});
+
+test('GET /staff/:tenantId renders the dashboard with tenant/branding/rule/cards/events and a CSRF meta', async () => {
+  const pool = new FakePool([...sessionHandlers(validSession), ...dashboardHandlers()]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/html');
+    const html = await res.text();
+    expectDashboardHtml(html);
+    // The CSRF meta carries exactly the stored hash the client must submit.
+    expect(html).toContain(`name="sp-csrf" content="${CSRF_VALUE}"`);
+    // Staff stamp form present (role staff can stamp).
+    expect(html).toContain('data-staff-form');
+    expect(html).toContain('Prämie einlösen');
+  });
+});
+
+test('GET /staff/:tenantId escapes all dynamic values (XSS-safe HTML)', async () => {
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    ...dashboardHandlers({
+      tenant: [{ id: TENANT, legalName: '<script>alert(1)</script>', planCode: 'up_to_500', customerLimit: 500 }],
+      branding: [{ cardTitle: 'Karte <b>fett</b>', cardText: 'Text "mit" \'quotes\' & mehr', primaryColor: '#155e75', secondaryColor: '#f8fafc', version: 1 }],
+      cards: [{ id: CARD, customerRef: '<img src=x onerror=alert(1)>', stampCount: 1, updatedAt: null }],
+    }),
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain('Karte &lt;b&gt;fett&lt;/b&gt;');
+    expect(html).not.toContain('<b>fett</b>');
+    expect(html).toContain('Text &quot;mit&quot; &#39;quotes&#39; &amp; mehr');
+    expect(html).toContain('&lt;img src=x onerror=alert(1)&gt;');
+    expect(html).not.toContain('<img src=x');
+  });
+});
+
+test('GET /staff/:tenantId for a foreign tenant session redirects to /login (tenant-scoped lookup)', async () => {
+  const tenantScoped: (sql: string, params: unknown[]) => unknown[] = (_s, p) =>
+    p[0] === SESSION_HASH && p[2] === TENANT ? [sessionRow()] : [];
+  const pool = new FakePool([...sessionHandlers(tenantScoped)]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${OTHER_TENANT}`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+  });
+});
+
+test('GET /staff/:tenantId with a malformed tenant id answers a friendly 404', async () => {
+  const pool = new FakePool([]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request('http://test.local/staff/not-a-uuid'));
+    expect(res.status).toBe(404);
+    expect((await res.text())).toContain('Unternehmen nicht gefunden oder deaktiviert.');
+  });
+});
+
+test('GET /staff/:tenantId hides stamp actions for viewer roles', async () => {
+  const viewerRow = sessionRow({ role: 'viewer' });
+  const viewerSession: (sql: string, params: unknown[]) => unknown[] = (_s, p) => p[0] === SESSION_HASH ? [viewerRow] : [];
+  const pool = new FakePool([...sessionHandlers(viewerSession), ...dashboardHandlers()]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('Diese Rolle kann keine Stempel vergeben');
+    expect(html).not.toContain('data-action="stamp"');
+    expect(html).not.toContain('data-action="redeem"');
+    expect(html).not.toContain('<form data-staff-form');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (4) POST /staff/:tenantId/stamp — card id and card token, CSRF, rotation
+// ---------------------------------------------------------------------------
+function stampFlowHandlers(): FakeHandler[] {
+  return [
+    ...sessionHandlers(validSession),
+    { match: contains('from stamp_events where'), rows: [] }, // no replay
+    { match: contains('from cards where'), rows: [{ id: CARD, stampCount: 3, revision: 2, ruleId: RULE }] },
+    { match: contains('insert into stamp_events'), rows: [] },
+    { match: contains('update cards set stamp_count'), rows: [{ id: CARD, stampCount: 4, revision: 3 }] },
+    { match: contains('stamps_required from stamp_rules'), rows: [{ id: RULE, stamps_required: 5 }] },
+    { match: contains('(select 1 from rewards'), rows: [] }, // threshold not crossed
+    ...dashboardHandlers(),
+  ];
+}
+
+test('POST staff stamp by card id stamps once, rotates the session and re-renders the dashboard with the new count', async () => {
+  stampLimiter.clear();
+  const pool = new FakePool(stampFlowHandlers());
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/stamp`, {
+      method: 'POST',
+      headers: authedHeaders(),
+      body: new URLSearchParams({ cardId: CARD, quantity: '1' }),
+    }));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/html');
+    const html = await res.text();
+    // Flash shows the new stamp count.
+    expect(html).toContain('Stempel vergeben');
+    expect(html).toContain('hat jetzt 4 Stempel');
+    // Session rotation: fresh cookie + fresh CSRF header + freshly embedded CSRF.
+    expect(res.headers.get('set-cookie')).toContain('__Host-sp_session=');
+    const rotatedCsrf = res.headers.get('x-csrf-token');
+    expect(rotatedCsrf).toMatch(/^[0-9a-f]{64}$/);
+    expect(rotatedCsrf).not.toBe(CSRF_VALUE);
+    expect(html).toContain(`name="sp-csrf" content="${rotatedCsrf}"`);
+    // Exactly one stamp_events insert with an idempotency key (fresh UUID).
+    const inserts = pool.queries.filter(q => q.sql.startsWith('insert into stamp_events'));
+    expect(inserts).toHaveLength(1);
+    expect(String(inserts[0]!.params[4])).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    // Re-render keeps the dashboard exclusive fields.
+    expectDashboardHtml(html);
+  });
+});
+
+test('POST staff stamp by card token resolves through findByPublicTokenHash (hash only, never the raw token)', async () => {
+  stampLimiter.clear();
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('public_token_hash'), rows: [{ id: CARD, tenantId: TENANT, customerId: '22222222-2222-4222-8222-222222222222', publicTokenHash: 'f'.repeat(64), status: 'active', stampCount: 3, revision: 2, ruleId: RULE, createdAt: null, updatedAt: null }] },
+    { match: contains('from stamp_events where'), rows: [] },
+    { match: contains('from cards where'), rows: [{ id: CARD, stampCount: 3, revision: 2, ruleId: RULE }] },
+    { match: contains('insert into stamp_events'), rows: [] },
+    { match: contains('update cards set stamp_count'), rows: [{ id: CARD, stampCount: 4, revision: 3 }] },
+    { match: contains('stamps_required from stamp_rules'), rows: [{ id: RULE, stamps_required: 5 }] },
+    { match: contains('(select 1 from rewards'), rows: [] },
+    ...dashboardHandlers(),
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/stamp`, {
+      method: 'POST',
+      headers: authedHeaders(),
+      body: new URLSearchParams({ cardId: CARD_TOKEN, quantity: '1' }),
+    }));
+    expect(res.status).toBe(200);
+    // The lookup only ever saw the SHA-256 hash, never the raw token.
+    const lookup = pool.queries.find(q => q.sql.includes('public_token_hash'));
+    expect(lookup).toBeDefined();
+    expect(String(lookup!.params[1])).toMatch(/^[a-f0-9]{64}$/);
+    expect(String(lookup!.params[1])).not.toBe(CARD_TOKEN);
+    expect(JSON.stringify(pool.queries)).not.toContain(CARD_TOKEN);
+  });
+});
+
+test('POST staff stamp without a CSRF token is rejected with a friendly HTML 403 and no insert', async () => {
+  const pool = new FakePool([...sessionHandlers(validSession), ...dashboardHandlers()]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/stamp`, {
+      method: 'POST',
+      headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}`, 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ cardId: CARD }),
+    }));
+    expect(res.status).toBe(403);
+    const html = await res.text();
+    expect(html).toContain('Sitzung abgelaufen. Bitte neu anmelden.');
+    expect(pool.queries.some(q => q.sql.startsWith('insert into stamp_events'))).toBe(false);
+  });
+});
+
+test('POST staff stamp by a viewer is rejected with FORBIDDEN', async () => {
+  const viewerRow = sessionRow({ role: 'viewer' });
+  const viewerSession: (sql: string, params: unknown[]) => unknown[] = (_s, p) => p[0] === SESSION_HASH ? [viewerRow] : [];
+  const pool = new FakePool([...sessionHandlers(viewerSession)]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/stamp`, {
+      method: 'POST',
+      headers: authedHeaders(),
+      body: new URLSearchParams({ cardId: CARD }),
+    }));
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain('Keine Berechtigung für diese Aktion.');
+    expect(pool.queries.some(q => q.sql.startsWith('insert into stamp_events'))).toBe(false);
+  });
+});
+
+test('POST staff stamp without a card id is rejected with CARD_FIELDS_REQUIRED', async () => {
+  stampLimiter.clear();
+  const pool = new FakePool([...sessionHandlers(validSession)]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/stamp`, {
+      method: 'POST',
+      headers: authedHeaders(),
+      body: new URLSearchParams({ quantity: '1' }),
+    }));
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('Bitte eine Karten-ID oder einen Karten-Token angeben.');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (5) POST /staff/:tenantId/redeem
+// ---------------------------------------------------------------------------
+test('POST staff redeem issues the redemption and rotates the session', async () => {
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed' }] },
+    ...dashboardHandlers({ rewards: [{ id: REWARD, cardId: CARD, status: 'redeemed' }] }),
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/redeem`, {
+      method: 'POST',
+      headers: authedHeaders(),
+      body: new URLSearchParams({ rewardId: REWARD }),
+    }));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('Prämie erfolgreich eingelöst.');
+    expect(res.headers.get('set-cookie')).toContain('__Host-sp_session=');
+    expect(res.headers.get('x-csrf-token')).toMatch(/^[0-9a-f]{64}$/);
+    expect(html).toContain('badge redeemed');
+  });
+});
+
+test('POST staff redeem of an already-redeemed reward answers a friendly 409 without rotation', async () => {
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('update rewards set status'), rows: [] },
+    { match: contains('select id,status from rewards'), rows: [{ id: REWARD, status: 'redeemed' }] },
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/redeem`, {
+      method: 'POST',
+      headers: authedHeaders(),
+      body: new URLSearchParams({ rewardId: REWARD }),
+    }));
+    expect(res.status).toBe(409);
+    expect(await res.text()).toContain('Diese Prämie wurde bereits eingelöst.');
+    expect(res.headers.get('set-cookie')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (6) POST /staff/:tenantId/logout
+// ---------------------------------------------------------------------------
+test('POST staff logout revokes the session, clears the cookie and redirects to /login', async () => {
+  const pool = new FakePool([...sessionHandlers(validSession)]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/logout`, {
+      method: 'POST',
+      headers: authedHeaders(),
+      body: new URLSearchParams({}),
+    }));
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+    const setCookie = res.headers.get('set-cookie') ?? '';
+    expect(setCookie).toContain('__Host-sp_session=;');
+    expect(setCookie).toContain('Max-Age=0');
+    // The revoke ran under the actor user context.
+    const revoke = pool.queries.find(q => q.sql.includes('update sessions set revoked_at=now() where token_hash'));
+    expect(revoke).toBeDefined();
+    expect(revoke!.params).toEqual([SESSION_HASH]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (7) Error rendering — never internal details, request id only for 500s
+// ---------------------------------------------------------------------------
+test('staff routes render internal failures as friendly HTML 500 with a request id, no internals', async () => {
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('from tenants where'), rows: () => { throw new Error('secret dsn postgres://u:p@host/db'); } },
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(500);
+    const html = await res.text();
+    expect(html).toContain('Ein unerwarteter Fehler ist aufgetreten.');
+    expect(html).toContain('Fehlerkennung:');
+    expect(html).not.toContain('postgres://');
+    expect(html).not.toContain('secret');
+  });
+});

@@ -29,6 +29,18 @@ export interface StampResult {
 /** Deliberately minimal card shape safe for public rendering/wallet issuance. */
 export interface PublicCard { id: string; stampCount: number; revision: number; ruleId: string; }
 
+/** Staff-UI dashboard views (server-rendered HTML, staff-authenticated). */
+export interface StaffDashboardCard { id: string; customerRef: string | null; stampCount: number; rewardId: string | null; rewardStatus: 'issued' | 'redeemed' | null; updatedAt: string | null; }
+export interface StaffDashboardEvent { id: string; cardId: string; customerRef: string | null; quantity: number; createdAt: string | null; }
+export interface StaffDashboardData {
+  tenant: { id: string; legalName: string | null; planCode: string; customerLimit: number; usedCards: number } | null;
+  branding: Branding | null;
+  rule: StampRule | null;
+  joinPath: string | null;
+  cards: StaffDashboardCard[];
+  events: StaffDashboardEvent[];
+}
+
 export interface DbClient { query<T = unknown>(sql: string, params?: unknown[]): Promise<{ rows: T[] }> }
 export interface TxClient extends DbClient { release(): void }
 export interface DbPool { connect(): Promise<TxClient> }
@@ -159,6 +171,34 @@ export class CardRepository {
    * sweep); null = all tenants.
    */
   async cleanupExpiredSessions(tenantId:string|null):Promise<number>{const db=await this.pool.connect();try{await db.query('begin');if(tenantId)await db.query("select set_config('app.tenant_id', $1, true)",[tenantId]);const r=tenantId?await db.query<{id:string}>(`delete from sessions where tenant_id=$1 and ((revoked_at is null and expires_at<=now()) or (revoked_at is not null and revoked_at<=now() - interval '7 days')) returning id`,[tenantId]):await db.query<{id:string}>("delete from sessions where (revoked_at is null and expires_at<=now()) or (revoked_at is not null and revoked_at<=now() - interval '7 days') returning id");await db.query('commit');return r.rows.length;}catch(e){try{await db.query('rollback');}catch{}throw e;}finally{db.release();}}
+
+  /**
+   * Staff-UI dashboard projection (server-rendered HTML only). All reads run
+   * in ONE tenant transaction under the normal tenant-isolation RLS; the
+   * returned shape carries only what the dashboard renders — never anything
+   * about owners/employees/sessions and never raw card tokens (the DB stores
+   * only public_token_hash). Customer display uses the tenant-chosen
+   * customers.external_ref (staff-facing identifier, e.g. a loyalty number or
+   * internal ref) — the staff legitimately needs it to identify a customer's
+   * card; the public card/API payloads stay minimized as before.
+   */
+  async staffDashboard(tenantId:string):Promise<StaffDashboardData> { return this.transaction(tenantId, async db => {
+    const t=(await db.query<{id:string;legalName:string;planCode:string;customerLimit:number}>('select id, legal_name as "legalName", plan_code as "planCode", customer_limit as "customerLimit" from tenants where id=$1 and status=$2',[tenantId,'active'])).rows[0];
+    if(!t) return {tenant:null,branding:null,rule:null,joinPath:null,cards:[],events:[]};
+    const b=(await db.query<Branding>('select card_title as "cardTitle",card_text as "cardText",primary_color as "primaryColor",secondary_color as "secondaryColor",version from tenant_branding where tenant_id=$1',[tenantId])).rows[0] ?? null;
+    const rule=(await db.query<StampRule>('select id,tenant_id as "tenantId",name,stamps_required as "stampsRequired",reward_title as "rewardTitle",reward_description as "rewardDescription",active,version from stamp_rules where tenant_id=$1 and active=true order by created_at desc limit 1',[tenantId])).rows[0] ?? null;
+    const entry=(await db.query<{joinPath:string}>('select join_path as "joinPath" from tenant_entry_points where tenant_id=$1',[tenantId])).rows[0] ?? null;
+    const used=(await db.query<{n:string}>('select count(distinct customer_id) as n from cards where tenant_id=$1 and status=$2',[tenantId,'active'])).rows[0] ?? {n:'0'};
+    const cards=(await db.query<{id:string;customerRef:string|null;stampCount:number;updatedAt:string|null}>('select c.id, cu.external_ref as "customerRef", c.stamp_count as "stampCount", c.updated_at as "updatedAt" from cards c join customers cu on cu.id=c.customer_id and cu.tenant_id=c.tenant_id where c.tenant_id=$1 and c.status=$2 and c.deleted_at is null order by c.updated_at desc limit $3',[tenantId,'active',100])).rows;
+    const events=(await db.query<{id:string;cardId:string;customerRef:string|null;quantity:number;createdAt:string|null}>('select e.id, e.card_id as "cardId", e.quantity, e.created_at as "createdAt", cu.external_ref as "customerRef" from stamp_events e join cards c on c.id=e.card_id join customers cu on cu.id=c.customer_id where e.tenant_id=$1 order by e.created_at desc limit $2',[tenantId,20])).rows;
+    // Latest reward per card (issued_at ascending → last write wins): the
+    // dashboard shows the current reward status and the redeemable reward id.
+    const rewards=(await db.query<{id:string;cardId:string;status:'issued'|'redeemed'}>('select id, card_id as "cardId", status from rewards where tenant_id=$1 order by issued_at asc',[tenantId])).rows;
+    const lastReward=new Map<string,{id:string;status:'issued'|'redeemed'}>();
+    for(const r of rewards) lastReward.set(r.cardId,{id:r.id,status:r.status});
+    const viewCards=cards.map(c=>{const rw=lastReward.get(c.id);return {...c,rewardId:rw?.id??null,rewardStatus:rw?.status??null};});
+    return {tenant:{id:t.id,legalName:t.legalName,planCode:t.planCode,customerLimit:t.customerLimit,usedCards:Number(used.n??0)},branding:b,rule,joinPath:entry?.joinPath??null,cards:viewCards,events};
+  }); }
 }
 export interface AuditEvent { tenantId?:string;actorUserId?:string;action:string;entityType:string;entityId?:string;metadata?:Record<string,unknown> }
 export async function appendAudit(db:DbClient,event:AuditEvent){await db.query('insert into audit_log(tenant_id,actor_user_id,action,entity_type,entity_id,metadata) values($1,$2,$3,$4,$5,$6)',[event.tenantId??null,event.actorUserId??null,event.action,event.entityType,event.entityId??null,JSON.stringify(event.metadata??{})]);}

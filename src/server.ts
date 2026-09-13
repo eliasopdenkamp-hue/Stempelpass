@@ -1,13 +1,14 @@
 import { assertTenant, canStamp, hashToken } from './domain.js';
 import { cardResolveLimiter, clientIpKey, csrfValid, joinResolveKey, loginAccountKey, loginAccountLimiter, loginFailureReason, loginIpLimiter, stampLimiter, verifyPassword, verifyPasswordAgainstDummy, randomToken, hashSessionToken } from './security.js';
 import { createPostgresPool, runMigrations, type DbPool } from './db.js';
-import { CardRepository } from './repository.js';
+import { CardRepository, type StaffDashboardData } from './repository.js';
 import { configurationStatus } from './config.js';
 import { EncryptedMfaSecretStore, verifyTotp } from './mfa.js';
 import { walletAdapter } from './wallet.js';
 import { classifyError } from './http-error.js';
 import { DEFAULT_PRIMARY_CARD_COLOR, DEFAULT_SECONDARY_CARD_COLOR, safeBranding, toPublicCardResponse, toWalletCardView } from './public-card.js';
 import { publicHealthResponse } from './health.js';
+import { loginPage, tenantChooserPage, noTenantPage, dashboardPage, staffErrorPage, type DashboardView } from './staff-ui.js';
 import { requireVerifiedMfaBootstrap } from './mfa-bootstrap.js';
 import { toCreateCardResponse, toDeleteResponse, toJoinResponse, toLoginResponse, toPilotResponse, toRedeemResponse, toStaffResponse, toStampResponse } from './contracts.js';
 import type { Branding, StampRule } from './domain.js';
@@ -115,8 +116,155 @@ async function waitForReadiness(): Promise<void> {
 const json=(value:unknown,status=200,id=crypto.randomUUID(),headers:HeadersInit={})=>Response.json({request_id:id,data:value},{status,headers:{'Cache-Control':'no-store',...headers}});
 function error(e:unknown,id:string){const {code,status,detail}=classifyError(e);if(detail)console.error(`request_failed request_id=${id} error=${detail}`);return json({error:code},status,id as `${string}-${string}-${string}-${string}-${string}`)}
 function cookie(req:Request,name:string){return req.headers.get('cookie')?.split(';').map(x=>x.trim()).find(x=>x.startsWith(`${name}=`))?.slice(name.length+1)}
-async function auth(req:Request,tenantId:string,mutating=true){if(!pool||!repository)throw new Error('DATABASE_REQUIRED');const token=cookie(req,'__Host-sp_session');if(!token)throw new Error('UNAUTHENTICATED');const db=await pool.connect();try{await db.query('begin');await db.query("select set_config('app.tenant_id', $1, true)",[tenantId]);const resolved=await db.query<{user_id:string}>('select user_id from public.resolve_session_user($1)',[hashSessionToken(token)]);if(!resolved.rows[0]?.user_id)throw new Error('UNAUTHENTICATED');await db.query("select set_config('app.user_id', $1, true)",[resolved.rows[0].user_id]);const rows=await db.query<{id:string,user_id:string,csrf_token_hash:string,tenant_id:string,role:string;membership_id:string;mfa_required:boolean;mfa_verified:boolean}>('select s.id,s.user_id,s.csrf_token_hash,s.mfa_verified,m.id as membership_id,m.tenant_id,m.role,(u.mfa_required or m.mfa_required) as mfa_required from sessions s join users u on u.id=s.user_id join tenant_memberships m on m.user_id=s.user_id and m.status=$2 where s.token_hash=$1 and s.revoked_at is null and s.expires_at>now() and m.tenant_id=$3 and u.status=$4',[hashSessionToken(token),'active',tenantId,'active']);const s=rows.rows[0];if(!s)throw new Error('UNAUTHENTICATED');if(s.mfa_required&&!s.mfa_verified)throw new Error('MFA_REQUIRED');if(mutating&&!csrfValid(req,s.csrf_token_hash))throw new Error('CSRF_INVALID');assertTenant(tenantId,s.tenant_id);const actor={userId:s.user_id,role:s.role as any,sessionId:s.id,membershipId:s.membership_id,token,mfaVerified:s.mfa_verified};await db.query('commit');return actor;}catch(e){try{await db.query('rollback');}catch{}throw e;}finally{db.release();}}
+async function auth(req:Request,tenantId:string,mutating=true){if(!pool||!repository)throw new Error('DATABASE_REQUIRED');const token=cookie(req,'__Host-sp_session');if(!token)throw new Error('UNAUTHENTICATED');const db=await pool.connect();try{await db.query('begin');await db.query("select set_config('app.tenant_id', $1, true)",[tenantId]);const resolved=await db.query<{user_id:string}>('select user_id from public.resolve_session_user($1)',[hashSessionToken(token)]);if(!resolved.rows[0]?.user_id)throw new Error('UNAUTHENTICATED');await db.query("select set_config('app.user_id', $1, true)",[resolved.rows[0].user_id]);const rows=await db.query<{id:string,user_id:string,csrf_token_hash:string,tenant_id:string,role:string;membership_id:string;mfa_required:boolean;mfa_verified:boolean}>('select s.id,s.user_id,s.csrf_token_hash,s.mfa_verified,m.id as membership_id,m.tenant_id,m.role,(u.mfa_required or m.mfa_required) as mfa_required from sessions s join users u on u.id=s.user_id join tenant_memberships m on m.user_id=s.user_id and m.status=$2 where s.token_hash=$1 and s.revoked_at is null and s.expires_at>now() and m.tenant_id=$3 and u.status=$4',[hashSessionToken(token),'active',tenantId,'active']);const s=rows.rows[0];if(!s)throw new Error('UNAUTHENTICATED');if(s.mfa_required&&!s.mfa_verified)throw new Error('MFA_REQUIRED');if(mutating&&!csrfValid(req,s.csrf_token_hash))throw new Error('CSRF_INVALID');assertTenant(tenantId,s.tenant_id);const actor={userId:s.user_id,role:s.role as any,sessionId:s.id,membershipId:s.membership_id,token,mfaVerified:s.mfa_verified,csrfTokenHash:s.csrf_token_hash};await db.query('commit');return actor;}catch(e){try{await db.query('rollback');}catch{}throw e;}finally{db.release();}}
 async function rotate(a:{userId:string;token:string;mfaVerified:boolean}){if(!pool||!repository)throw new Error('DATABASE_REQUIRED');const db=await pool.connect();try{await db.query('begin');await db.query("select set_config('app.user_id', $1, true)",[a.userId]);await db.query('update sessions set revoked_at=now() where token_hash=$1',[hashSessionToken(a.token)]);const raw=randomToken(),csrf=randomToken();await db.query("insert into sessions(user_id,token_hash,csrf_token_hash,mfa_verified,expires_at) values($1,$2,$3,$4,now()+interval '12 hours')",[a.userId,hashSessionToken(raw),hashSessionToken(csrf),a.mfaVerified]);await db.query('commit');return {csrf,header:{'Set-Cookie':sessionCookie(raw, 43200),'x-csrf-token':hashSessionToken(csrf)}}}catch(e){try{await db.query('rollback');}catch{}throw e;}finally{db.release();}}
+/** Strict tenant/card UUID format guard (early 404, avoids bad DB casts). */
+const UUID_RE=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const htmlResponse=(html:string,status=200,headers:HeadersInit={})=>new Response(html,{status,headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store',...headers}});
+const staffRedirect=(location:string,headers:HeadersInit={})=>new Response(null,{status:302,headers:{Location:location,'Cache-Control':'no-store',...headers}});
+/** Friendly HTML error page for the staff UI (never internal details). */
+function staffError(e:unknown,id:string):Response{const {code,status}=classifyError(e);return htmlResponse(staffErrorPage(status,code,id),status);}
+/** Parse a staff POST body: JSON or form-urlencoded, strings only. */
+async function parseBody(req:Request):Promise<Record<string,string>>{
+  const ct=req.headers.get('content-type')??'';
+  try{
+    if(ct.includes('application/json')){
+      const raw=await req.json() as Record<string,unknown>;
+      const out:Record<string,string>={};
+      for(const [k,v] of Object.entries(raw))out[k]=typeof v==='string'?v:(typeof v==='number'||typeof v==='boolean')?String(v):'';
+      return out;
+    }
+    const form=await req.formData();
+    const out:Record<string,string>={};
+    for(const [k,v] of form.entries())out[k]=typeof v==='string'?v:'';
+    return out;
+  }catch{return{};}
+}
+/** Resolve a stamp target: card UUID directly, or a raw card token via the
+ *  existing findByPublicTokenHash lookup (hashToken, never the raw token). */
+async function resolveCardId(tenantId:string,input:string):Promise<string>{
+  if(UUID_RE.test(input))return input;
+  const card=await repository!.findByPublicTokenHash(tenantId,hashToken(input));
+  if(!card)throw new Error('CARD_NOT_FOUND');
+  return card.id;
+}
+function dashboardView(tenantId:string,role:string,dash:StaffDashboardData,csrf:string):DashboardView{
+  const branding=dash.branding;
+  const rule=dash.rule;
+  return {
+    tenantId,
+    legalName:dash.tenant?.legalName??null,
+    planCode:dash.tenant?.planCode??'up_to_500',
+    customerLimit:dash.tenant?.customerLimit??0,
+    usedCards:dash.tenant?.usedCards??0,
+    role,
+    canStamp:canStamp(role as any),
+    cardTitle:branding?.cardTitle??'StempelPass',
+    cardText:branding?.cardText??'',
+    primaryColor:branding?.primaryColor??DEFAULT_PRIMARY_CARD_COLOR,
+    ruleName:rule?.name??null,
+    stampsRequired:rule?.stampsRequired??null,
+    rewardTitle:rule?.rewardTitle??null,
+    rewardDescription:rule?.rewardDescription??null,
+    joinPath:dash.joinPath,
+    csrf,
+    cards:dash.cards,
+    events:dash.events,
+  };
+}
+/**
+ * Tenantless /staff entry: validate the session (user-scoped RLS, same
+ * bootstrap as auth()) and list the user's ACTIVE tenants via the migration
+ * 016 resolver. Returns null when the session is missing/invalid/expired —
+ * the caller redirects to /login. Named lookups for the >1-tenant chooser use
+ * tenants (no RLS) by the already-authorized membership ids.
+ */
+async function resolveStaffContext(req:Request):Promise<{userId:string;sessionId:string;tenants:{tenantId:string;role:string;legalName:string|null}[]}|null>{
+  if(!pool||!repository)throw new Error('DATABASE_REQUIRED');
+  const token=cookie(req,'__Host-sp_session');if(!token)return null;
+  const db=await pool.connect();
+  try{
+    await db.query('begin');
+    const resolved=await db.query<{user_id:string}>('select user_id from public.resolve_session_user($1)',[hashSessionToken(token)]);
+    if(!resolved.rows[0]?.user_id){await db.query('rollback');return null;}
+    await db.query("select set_config('app.user_id', $1, true)",[resolved.rows[0].user_id]);
+    const s=await db.query<{id:string}>('select s.id from sessions s join users u on u.id=s.user_id where s.token_hash=$1 and s.revoked_at is null and s.expires_at>now() and u.status=$2',[hashSessionToken(token),'active']);
+    if(!s.rows[0]){await db.query('rollback');return null;}
+    const rows=await db.query<{tenantId:string;role:string}>('select tenant_id as "tenantId", role from public.resolve_user_tenants($1)',[resolved.rows[0].user_id]);
+    let tenants:{tenantId:string;role:string;legalName:string|null}[]=rows.rows.map(r=>({tenantId:r.tenantId,role:r.role,legalName:null}));
+    if(tenants.length>1){
+      const names=await db.query<{id:string;legalName:string|null}>('select id, legal_name as "legalName" from tenants where id = any($1::uuid[])',[tenants.map(t=>t.tenantId)]);
+      const byId=new Map(names.rows.map(r=>[r.id,r.legalName??null]));
+      tenants=tenants.map(t=>({...t,legalName:byId.get(t.tenantId)??null}));
+    }
+    await db.query('commit');
+    return {userId:resolved.rows[0].user_id,sessionId:s.rows[0].id,tenants};
+  }catch(e){try{await db.query('rollback');}catch{}throw e;}finally{db.release();}
+}
+async function handleStaffEntry(req:Request,id:string):Promise<Response>{
+  try{
+    const ctx=await resolveStaffContext(req);
+    if(!ctx)return staffRedirect('/login');
+    if(ctx.tenants.length===0)return htmlResponse(noTenantPage());
+    if(ctx.tenants.length===1)return staffRedirect(`/staff/${ctx.tenants[0].tenantId}`);
+    return htmlResponse(tenantChooserPage(ctx.tenants));
+  }catch(e){return staffError(e,id);}
+}
+async function handleStaffDashboard(req:Request,tenantId:string,id:string):Promise<Response>{
+  try{
+    if(!UUID_RE.test(tenantId))return htmlResponse(staffErrorPage(404,'TENANT_NOT_FOUND',id),404);
+    if(!pool||!repository)throw new Error('DATABASE_REQUIRED');
+    const actor=await auth(req,tenantId,false);
+    const dash=await repository.staffDashboard(tenantId);
+    if(!dash.tenant)throw new Error('TENANT_NOT_FOUND');
+    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,actor.csrfTokenHash)));
+  }catch(e){
+    if(e instanceof Error&&e.message==='UNAUTHENTICATED')return staffRedirect('/login');
+    return staffError(e,id);
+  }
+}
+async function handleStaffStamp(req:Request,tenantId:string,id:string):Promise<Response>{
+  try{
+    if(!UUID_RE.test(tenantId))return htmlResponse(staffErrorPage(404,'TENANT_NOT_FOUND',id),404);
+    if(!pool||!repository)throw new Error('DATABASE_REQUIRED');
+    const actor=await auth(req,tenantId,true);
+    if(!canStamp(actor.role))throw new Error('FORBIDDEN');
+    if(!stampLimiter.allow(`${tenantId}:${actor.userId}`))throw new Error('RATE_LIMITED');
+    const body=await parseBody(req);
+    const input=String(body.cardId??body.cardToken??'').trim();if(!input)throw new Error('CARD_FIELDS_REQUIRED');
+    const quantityRaw=Number(body.quantity??1);const quantity=Number.isInteger(quantityRaw)?quantityRaw:1;
+    const cardId=await resolveCardId(tenantId,input);
+    const value=await repository.stamp(tenantId,cardId,quantity,actor.membershipId,crypto.randomUUID());
+    const rotated=await rotate(actor);
+    const dash=await repository.staffDashboard(tenantId);
+    const flash=`Stempel vergeben: Karte ${cardId.slice(0,8)} hat jetzt ${value.card.stampCount} Stempel.`+(value.reward?' Die Prämie ist jetzt einlösbar.':'');
+    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,rotated.header['x-csrf-token']),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
+  }catch(e){return staffError(e,id);}
+}
+async function handleStaffRedeem(req:Request,tenantId:string,id:string):Promise<Response>{
+  try{
+    if(!UUID_RE.test(tenantId))return htmlResponse(staffErrorPage(404,'TENANT_NOT_FOUND',id),404);
+    if(!pool||!repository)throw new Error('DATABASE_REQUIRED');
+    const actor=await auth(req,tenantId,true);
+    if(!canStamp(actor.role))throw new Error('FORBIDDEN');
+    const body=await parseBody(req);
+    const rewardId=String(body.rewardId??'').trim();if(!rewardId)throw new Error('REWARD_NOT_FOUND');
+    const value=await repository.redeem(tenantId,rewardId);
+    const rotated=await rotate(actor);
+    const dash=await repository.staffDashboard(tenantId);
+    const flash=value.status==='redeemed'?'Prämie erfolgreich eingelöst.':'Prämie eingelöst.';
+    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,rotated.header['x-csrf-token']),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
+  }catch(e){return staffError(e,id);}
+}
+async function handleStaffLogout(req:Request,tenantId:string,id:string):Promise<Response>{
+  try{
+    if(!UUID_RE.test(tenantId))return htmlResponse(staffErrorPage(404,'TENANT_NOT_FOUND',id),404);
+    if(!pool||!repository)throw new Error('DATABASE_REQUIRED');
+    const actor=await auth(req,tenantId,true);
+    await repository.revokeSession(actor.userId,hashSessionToken(actor.token));
+    return staffRedirect('/login',{'Set-Cookie':sessionCookie('',0)});
+  }catch(e){return staffError(e,id);}
+}
 async function handleRequest(req: Request): Promise<Response> {const id=crypto.randomUUID();const headers=corsHeaders(req);if(req.method==='OPTIONS')return new Response(null,{status:204,headers});try{const u=new URL(req.url),parts=u.pathname.split('/').filter(Boolean);if(req.method==='GET'&&u.pathname==='/health')return publicHealthResponse(configured&&!initializationError&&dbReady&&pilotReady,headers);await waitForReadiness();
 if(parts[0]==='api'&&parts[1]==='auth'&&parts[2]==='login'&&req.method==='POST'){if(!pool)throw new Error('DATABASE_REQUIRED');const ipKey=clientIpKey(req);if(!loginIpLimiter.allow(ipKey))throw new Error('RATE_LIMITED');const body=await req.json() as {email?:string,password?:string,mfaCode?:string};if(!body.email||!body.password)throw new Error('CREDENTIALS_REQUIRED');const accountKey=loginAccountKey(body.email);if(!loginAccountLimiter.allow(accountKey))throw new Error('RATE_LIMITED');const db=await pool.connect();try{await db.query('begin');const user=(await db.query<{id:string,password_hash:string,mfa_required:boolean,mfa_enabled:boolean,mfa_secret_ciphertext:string|null}>('select id,password_hash,mfa_required,mfa_enabled,mfa_secret_ciphertext from users where lower(email)=lower($1) and status=$2',[body.email,'active'])).rows[0];const passwordOk=user?.password_hash?await verifyPassword(body.password,user.password_hash):await verifyPasswordAgainstDummy(body.password);if(!user||!passwordOk)throw new Error('INVALID_CREDENTIALS');const mfaRow=(await db.query<{required:boolean|null}>('select public.membership_mfa_required($1) as required',[user.id])).rows[0];const required=requireVerifiedMfaBootstrap(mfaRow);if(required){if(!mfaStore||!user.mfa_secret_ciphertext)throw new Error('MFA_NOT_CONFIGURED');let secret:string;try{secret=await mfaStore.decrypt(user.mfa_secret_ciphertext);}catch{throw new Error('MFA_SECRET_DECRYPT_FAILED');}if(!body.mfaCode||!verifyTotp(secret,body.mfaCode))throw new Error('MFA_INVALID');}await db.query("select set_config('app.user_id', $1, true)",[user.id]);await db.query('update sessions set revoked_at=now() where user_id=$1 and revoked_at is null',[user.id]);const raw=randomToken(),csrf=randomToken();await db.query("insert into sessions(user_id,token_hash,csrf_token_hash,mfa_verified,expires_at) values($1,$2,$3,$4,now()+interval '12 hours')",[user.id,hashSessionToken(raw),hashSessionToken(csrf),required]);await db.query('commit');return json(toLoginResponse(hashSessionToken(csrf),required),200,id,{'Set-Cookie':sessionCookie(raw, 43200)});}catch(e){try{await db.query('rollback');}catch{}const reason=loginFailureReason(e);if(reason){console.warn(`login_failed request_id=${id} reason=${reason} account=${accountKey} ip=${ipKey}`);throw new Error('INVALID_CREDENTIALS');}throw e;}finally{db.release();}}
 if(parts[0]==='api'&&!configured)throw new Error('CONFIGURATION_REQUIRED');
@@ -127,6 +275,19 @@ if(parts[0]==='api'&&!configured)throw new Error('CONFIGURATION_REQUIRED');
         return json(toPublicCardResponse(result,parts[3]),200,id);}
     if(parts[0]==='card'&&parts.length===3&&req.method==='GET'){if(!repository||!cardResolveLimiter.allow(clientIpKey(req)))throw new Error(!repository?'DATABASE_REQUIRED':'RATE_LIMITED');const result=await repository.publicCard(parts[1],hashToken(parts[2]));if(!result)throw new Error('CARD_NOT_FOUND');const b: Branding=safeBranding(result.branding) ?? {cardTitle:'StempelPass',cardText:'',primaryColor:DEFAULT_PRIMARY_CARD_COLOR,secondaryColor:DEFAULT_SECONDARY_CARD_COLOR,version:1};const r: StampRule=result.rule ?? {id:'',tenantId:parts[1],name:'',stampsRequired:1,rewardTitle:'Prämie',rewardDescription:'',active:true,version:1};const esc=(v:unknown)=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]!));const progress=Math.min(100,Math.round((result.card.stampCount/Math.max(1,Number(r.stampsRequired||1)))*100));return new Response(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(b.cardTitle||'StempelPass')}</title><style>body{font:16px system-ui;margin:0;padding:2rem;background:${esc(b.secondaryColor||'#f8fafc')};color:#172033}.card{max-width:28rem;margin:auto;padding:2rem;border-radius:1.5rem;background:white;border-top:1rem solid ${esc(b.primaryColor||'#155e75')};box-shadow:0 8px 30px #0002}progress{width:100%;accent-color:${esc(b.primaryColor||'#155e75')}}.privacy{margin-top:1.5rem;padding-top:1rem;border-top:1px solid #e2e8f0;font-size:.85rem;color:#475569}.privacy h3{margin:0 0 .4rem;font-size:inherit;color:#334155}.privacy p{margin:.4rem 0}</style><main class="card"><h1>${esc(b.cardTitle)}</h1><p>${esc(b.cardText)}</p><p><strong>${result.card.stampCount}</strong> / ${esc(r.stampsRequired)} Stempel</p><progress max="100" value="${progress}"></progress><h2>${esc(r.rewardTitle)}</h2><p>${esc(r.rewardDescription)}</p><a style="display:block;width:100%;box-sizing:border-box;text-align:center;background:${esc(b.primaryColor)};color:#fff;text-decoration:none;padding:.9rem 1rem;border-radius:.75rem;font-weight:600;margin-top:1.5rem" href="/api/public/tenants/${esc(parts[1])}/cards/${esc(parts[2])}/wallet/google/redirect">Zu Google Wallet hinzufügen</a><p style="margin:.5rem 0 0;font-size:.8rem;color:#475569;text-align:center">Auf dem Handy öffnen, um die Karte ins Wallet zu legen.</p><section class="privacy"><h3>Datenschutz</h3><p>${esc('Verantwortlich für die Verarbeitung: '+(result.controllerName||'<Tenant>'))}</p><p>${esc('Diese Stempelkarte speichert nur den Stempelstand und den Fortschritt zur Prämie. StempelPass Deutschland verarbeitet die Daten als Auftragsverarbeiter (Art. 28 DSGVO).')}</p><p>${esc('Die Karte wird nach 12 Monaten ohne Stempelaktivität deaktiviert. Kundendaten werden 30 Tage nach der Soft-Löschung endgültig gelöscht. Falls Sie Kommunikationsnachrichten erhalten oder eine Einwilligung erteilen, wird die Kommunikationshistorie 24 Monate gespeichert; der Nachweis Ihrer Einwilligung wird für einen Zeitraum von 3 Jahren nach Ihrem Widerruf gespeichert. Audit-Aufzeichnungen werden zur Beweissicherung dauerhaft aufbewahrt.')}</p>${result.privacyContact?'<p>'+esc('Sie haben das Recht auf Auskunft, Berichtigung, Löschung und Widerspruch. Kontakt für Anfragen: '+result.privacyContact)+'</p>':''}</section></main>`,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'}});}
     if(parts[0]==='join'&&parts.length===2&&req.method==='GET'){if(!/^[a-f0-9]{32}$/i.test(parts[1]))throw new Error('ENTRY_POINT_NOT_FOUND');if(!repository||!cardResolveLimiter.allow(joinResolveKey(req,parts[1])))throw new Error(!repository?'DATABASE_REQUIRED':'RATE_LIMITED');const entry=await repository.resolveEntryPoint(parts[1]);if(!entry)throw new Error('ENTRY_POINT_NOT_FOUND');return json(toJoinResponse({tenantId:entry.tenant_id,joinPath:entry.join_path,customerLoginRequired:false,customerAccountRequired:false}),200,id);}
+    // -----------------------------------------------------------------
+    // Staff web UI (server-rendered HTML, same auth/CSRF/rotation as the API)
+    // -----------------------------------------------------------------
+    if(parts[0]==='login'&&parts.length===1&&req.method==='GET')return new Response(loginPage(),{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'}});
+    if(parts[0]==='staff'&&req.method==='GET'){
+      if(parts.length===1)return handleStaffEntry(req,id);
+      if(parts.length===2)return handleStaffDashboard(req,parts[1],id);
+    }
+    if(parts[0]==='staff'&&parts.length===3&&req.method==='POST'){
+      if(parts[2]==='stamp')return handleStaffStamp(req,parts[1],id);
+      if(parts[2]==='redeem')return handleStaffRedeem(req,parts[1],id);
+      if(parts[2]==='logout')return handleStaffLogout(req,parts[1],id);
+    }
     if(parts[0]!=='api'||parts[1]!=='tenants')return json({error:'NOT_FOUND'},404,id);const tenantId=parts[2];const actor=await auth(req,tenantId,req.method!=='GET');
     if(parts.length===3&&req.method==='DELETE'){if(actor.role!=='owner')throw new Error('FORBIDDEN');const value=await repository!.deleteTenant(tenantId);return json(toDeleteResponse(value),200,id);}
     if(parts[3]==='pilot'&&req.method==='PUT'){if(actor.role!=='owner'&&actor.role!=='admin')throw new Error('FORBIDDEN');const body=await req.json() as any;const value=await repository!.configurePilot(tenantId,actor.userId,{planCode:body.planCode,cardTitle:body.cardTitle||'',cardText:body.cardText||'',primaryColor:body.primaryColor||'',secondaryColor:body.secondaryColor||'',iconAssetId:body.iconAssetId,logoAssetId:body.logoAssetId,stampsRequired:body.stampsRequired,rewardTitle:body.rewardTitle||'',rewardDescription:body.rewardDescription||''});return json(toPilotResponse(value),200,id);}
