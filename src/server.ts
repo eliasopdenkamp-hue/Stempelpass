@@ -140,16 +140,23 @@ async function parseBody(req: Request): Promise<Record<string, string>> {
       return {};
     }
   }
-  // Form branch. req.formData() is unreliable on the deployed (Vercel) runtime
-  // for application/x-www-form-urlencoded — it throws, and the old blanket
-  // catch{} converted that into {}, so staff stamp/redeem failed with
-  // CARD_FIELDS_REQUIRED / REWARD_NOT_FOUND while JSON bodies kept working.
-  // URLSearchParams over the raw text parses urlencoded bodies identically on
-  // every runtime; an empty or non-urlencoded body yields an empty record and
-  // the caller's field validation applies unchanged. A genuine body read error
-  // (stream/consumed) propagates and surfaces as a 500 — never silently
-  // becomes a misleading missing-field error.
-  const text = await req.text();
+  // Form branch. The Request body stream is ONE-SHOT: text()/formData() and
+  // arrayBuffer() all consume it, so a fallback chain of method calls would
+  // double-read (the second read fails with "body already read"). Read the raw
+  // bytes exactly once via arrayBuffer() — the primitive every other Body
+  // reader is built on — and derive the urlencoded parse from that single
+  // read. On the deployed (Vercel) runtime req.formData() throws and
+  // req.text() returns an EMPTY body for application/x-www-form-urlencoded
+  // (form-POST stamp then fails with CARD_FIELDS_REQUIRED, redeem with
+  // REWARD_NOT_FOUND — verified live on the production alias) while
+  // req.json() keeps working; arrayBuffer() reaches the same buffered bytes
+  // the working json() path reads, bypassing whatever shadows the
+  // higher-level readers. An empty or non-urlencoded body yields an empty
+  // record and the caller's field validation applies unchanged. A genuine
+  // read failure (stream already consumed/errored) propagates and surfaces
+  // as a 500 — never silently becomes a misleading missing-field error.
+  const raw = await req.arrayBuffer();
+  const text = new TextDecoder().decode(raw);
   const out: Record<string, string> = {};
   for (const [k, v] of new URLSearchParams(text)) out[k] = v;
   return out;

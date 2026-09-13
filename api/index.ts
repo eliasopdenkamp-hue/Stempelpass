@@ -56,9 +56,23 @@ function absoluteUrl(vercelReq: VercelRequestLike): string {
  * Normalize the legacy body. Vercel delivers a string, a raw Buffer/Uint8Array,
  * or a pre-parsed JSON value. The copy via `new Uint8Array(...)` decouples the
  * Request from any pooled Buffer memory the runtime may reuse.
+ *
+ * The RAW bytes buffered by the runtime on `rawBody` always take precedence
+ * over the content-type-specific parse on `body`: re-serializing a
+ * bridge-parsed OBJECT changes the wire format while the ORIGINAL
+ * Content-Type header stays in place — an urlencoded request whose parsed
+ * body is an object would reach fetchHandler as JSON text under a urlencoded
+ * content-type and the form parser would see an empty record (the live 400
+ * CARD_FIELDS_REQUIRED on staff stamp, while JSON kept working).
  */
 function normalizeBody(vercelReq: VercelRequestLike): BodyInit | null {
-  const incoming = vercelReq.body ?? vercelReq.rawBody;
+  const raw = vercelReq.rawBody;
+  if (raw !== undefined && raw !== null) {
+    if (typeof raw === 'string') return raw;
+    // Buffers subclass Uint8Array, so this branch covers both.
+    if (raw instanceof Uint8Array) return new Uint8Array(raw) as BodyInit;
+  }
+  const incoming = vercelReq.body;
   if (incoming === undefined || incoming === null) return null;
   if (typeof incoming === 'string') return incoming;
   // Buffers subclass Uint8Array, so this branch covers both.
@@ -68,7 +82,8 @@ function normalizeBody(vercelReq: VercelRequestLike): BodyInit | null {
   return JSON.stringify(incoming) as string;
 }
 
-function toFetchRequest(vercelReq: VercelRequestLike): Request {
+/** Exported for the DB-free adapter tests (see tests/vercel-adapter.test.ts). */
+export function toFetchRequest(vercelReq: VercelRequestLike): Request {
   const method = (vercelReq.method ?? 'GET').toUpperCase();
   const headers = new Headers();
   for (const [key, value] of Object.entries(vercelReq.headers ?? {})) {
