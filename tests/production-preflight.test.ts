@@ -334,8 +334,8 @@ describe('migrationCheck (filesystem only, exact 001–015 set)', () => {
   test('real migrations directory: complete contiguous set', async () => {
     const check = await migrationCheck(join(ROOT, 'migrations'));
     expect(check.ok).toBe(true);
-    expect(check.present).toBe(15);
-    expect(check.expected).toBe(15);
+    expect(check.present).toBe(16);
+    expect(check.expected).toBe(16);
     expect(check.missing).toEqual([]);
     expect(check.files).toEqual([...EXPECTED_MIGRATIONS]);
   });

@@ -44,7 +44,7 @@
 import postgres from 'postgres';
 
 // ---------------------------------------------------------------------------
-// Expected schema and runtime grants (derived from migrations/001..014)
+// Expected schema and runtime grants (derived from migrations/001..016)
 // ---------------------------------------------------------------------------
 
 /** Tables that MUST have row-level security enabled: tenant-scoped tables
@@ -104,6 +104,7 @@ export const REQUIRED_FUNCTION_GRANTS: readonly { name: string; identityArgument
   { name: 'resolve_entry_point', identityArguments: 'text' },
   { name: 'resolve_session_user', identityArguments: 'text' },
   { name: 'membership_mfa_required', identityArguments: 'uuid' },
+  { name: 'resolve_user_tenants', identityArguments: 'uuid' },
 ];
 
 // ---------------------------------------------------------------------------

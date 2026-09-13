@@ -32,6 +32,7 @@ const EXPECTED = [
   '013_card_idempotency.sql',
   '014_app_role_grants.sql',
   '015_customer_legal_retention_hold.sql',
+  '016_staff_tenant_resolver.sql',
 ];
 
 test('migration files: exact expected set, runner-compatible names, stable order', async () => {
@@ -339,6 +340,33 @@ test('012 adds tenant_branding.privacy_email only — nullable Art. 13 contact, 
   expect(m012).not.toMatch(/create or replace function/i);
   expect(m012).not.toMatch(/grant|revoke/i);
   expect(m012).not.toMatch(/force row level security/i);
+});
+
+test('016 staff tenant resolver: minimal SECURITY DEFINER membership lookup', async () => {
+  const m016 = await readFile(join(MIGRATIONS_DIR, '016_staff_tenant_resolver.sql'), 'utf8');
+  // Function signature: uuid parameter, (tenant_id, role) table return.
+  expect(m016).toMatch(/create or replace function public\.resolve_user_tenants\(p_user_id uuid\)/);
+  expect(m016).toMatch(/returns table \(tenant_id uuid, role text\)/);
+  expect(m016).toMatch(/\bsecurity definer\b/i);
+  expect(m016).toMatch(/set search_path = pg_catalog/i);
+  // Fully qualified table reference; no search_path-dependent resolution.
+  expect(m016).toMatch(/from public\.tenant_memberships/);
+  expect(m016).toMatch(/m\.user_id = p_user_id/);
+  // Column minimization: only tenant_id, role, status, created_at — never
+  // email, password material, MFA state or other user columns; no select *.
+  expect(m016).toMatch(/m\.tenant_id, m\.role::text/);
+  expect(m016).not.toMatch(/select \*/i);
+  // No dynamic SQL in the body. The PII-negative checks run against the
+  // function BODY only (the header comment legitimately names the columns).
+  const body = m016.match(/as \$\$\n?([\s\S]*?)\n?\$\$/)?.[1] ?? '';
+  expect(body).not.toMatch(/\bexecute\b/i);
+  expect(body).not.toMatch(/format\(/i);
+  expect(body).not.toMatch(/email|password|mfa_|csrf|token_hash/i);
+  expect(body).not.toMatch(/select \*/i);
+  // No PUBLIC access; explicit conditional grant only to the app role.
+  expect(m016).toMatch(/revoke all on function public\.resolve_user_tenants\(uuid\) from public/);
+  expect(m016).toMatch(/grant execute on function public\.resolve_user_tenants\(uuid\) to app_role/);
+  expect(m016).toMatch(/if exists \(select 1 from pg_roles where rolname = 'app_role'\)/);
 });
 
 /* ------------------------------------------------------------------ *
