@@ -52,18 +52,31 @@ function absoluteUrl(vercelReq: VercelRequestLike): string {
   return `https://${authority}${rawUrl.startsWith('/') ? rawUrl : `/${rawUrl}`}`;
 }
 
+/** Case-insensitive header lookup on the legacy plain-object headers. */
+function headerValue(headers: Record<string, string | string[] | undefined>, name: string): string | undefined {
+  const value = headers[name] ?? headers[name.toLowerCase()];
+  if (value === undefined) return undefined;
+  return Array.isArray(value) ? value[0] : value;
+}
+
 /**
  * Normalize the legacy body. Vercel delivers a string, a raw Buffer/Uint8Array,
- * or a pre-parsed JSON value. The copy via `new Uint8Array(...)` decouples the
+ * or a pre-parsed value. The copy via `new Uint8Array(...)` decouples the
  * Request from any pooled Buffer memory the runtime may reuse.
  *
  * The RAW bytes buffered by the runtime on `rawBody` always take precedence
  * over the content-type-specific parse on `body`: re-serializing a
  * bridge-parsed OBJECT changes the wire format while the ORIGINAL
- * Content-Type header stays in place — an urlencoded request whose parsed
- * body is an object would reach fetchHandler as JSON text under a urlencoded
- * content-type and the form parser would see an empty record (the live 400
- * CARD_FIELDS_REQUIRED on staff stamp, while JSON kept working).
+ * Content-Type header stays in place.
+ *
+ * For an urlencoded request whose parsed body arrives as an OBJECT with NO
+ * rawBody (the live-verified shape of the Vercel Node runtime for
+ * application/x-www-form-urlencoded form POSTs — staff stamp/redeem), the
+ * object must be encoded BACK into the urlencoded wire format via
+ * URLSearchParams. The old JSON re-serialization produced JSON text under the
+ * original urlencoded content-type, so the form branch of parseBody parsed it
+ * as an empty record — the live 400 CARD_FIELDS_REQUIRED on staff stamp and
+ * 404 REWARD_NOT_FOUND on redeem, while JSON requests kept working.
  */
 function normalizeBody(vercelReq: VercelRequestLike): BodyInit | null {
   const raw = vercelReq.rawBody;
@@ -77,6 +90,18 @@ function normalizeBody(vercelReq: VercelRequestLike): BodyInit | null {
   if (typeof incoming === 'string') return incoming;
   // Buffers subclass Uint8Array, so this branch covers both.
   if (incoming instanceof Uint8Array) return new Uint8Array(incoming) as BodyInit;
+  const contentType = headerValue(vercelReq.headers ?? {}, 'content-type') ?? '';
+  if (contentType.includes('application/x-www-form-urlencoded')) {
+    // Pre-parsed form fields (no rawBody): rebuild the urlencoded wire format
+    // so the shared form branch of parseBody can parse them. Non-scalar values
+    // (should not occur for form fields) stringify; undefined/null are skipped.
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(incoming as Record<string, unknown>)) {
+      if (value === undefined || value === null) continue;
+      params.set(key, typeof value === 'string' ? value : String(value));
+    }
+    return params.toString();
+  }
   // Pre-parsed JSON: re-serialize. The re-serialized length may differ from the
   // original header, so the caller must drop `content-length`.
   return JSON.stringify(incoming) as string;
