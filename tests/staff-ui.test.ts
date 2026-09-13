@@ -475,32 +475,44 @@ test('POST staff redeem of an already-redeemed reward answers a friendly 409 wit
 });
 
 // ---------------------------------------------------------------------------
-// (5b) Form-POST regression (Vercel runtime): the deployed runtime rejects
-// req.formData() for application/x-www-form-urlencoded (the exact content type
-// the staff UI sends). The old parseBody blanket catch{} silently turned that
-// into {} — stamp failed with CARD_FIELDS_REQUIRED, redeem with
-// REWARD_NOT_FOUND, while JSON bodies kept working (the 26.08. recheck gap:
-// only JSON paths were exercised). Simulate the broken runtime by patching
-// Request.prototype.formData to throw, then drive the REAL fetchHandler with
-// urlencoded bodies.
+// (5b) Form-POST regression (Vercel runtime): for
+// application/x-www-form-urlencoded (the exact content type the staff UI
+// sends) the deployed runtime delivers an unusable body on BOTH higher-level
+// readers while req.json() keeps working:
+//   - req.formData() THROWS ('Could not parse content as FormData.'),
+//   - req.text() returns an EMPTY string (live evidence: form-POST stamp
+//     answers 400 CARD_FIELDS_REQUIRED and redeem 404 REWARD_NOT_FOUND — a
+//     400/404, not a 500, so the read itself does not throw).
+// The old parseBody blanket catch{} turned the formData throw into {}; the
+// URLSearchParams-over-text variant (PR #19) turned the empty text into {} —
+// same 400, verified live on the production alias. Simulate the broken
+// runtime by patching Request.prototype.formData to throw AND
+// Request.prototype.text to return '' , then drive the REAL fetchHandler with
+// urlencoded bodies. Request.prototype.arrayBuffer() — the primitive read
+// both methods are built on, and the one the working req.json() path reaches
+// the buffered bytes through — is deliberately NOT patched, mirroring Vercel
+// where urlencoded bodies are only readable at that primitive level.
 // ---------------------------------------------------------------------------
-async function withBrokenFormData(fn: () => Promise<unknown>): Promise<unknown> {
-  const original = Request.prototype.formData;
+async function withBrokenFormReaders(fn: () => Promise<unknown>): Promise<unknown> {
+  const originalFormData = Request.prototype.formData;
+  const originalText = Request.prototype.text;
   Request.prototype.formData = async function () {
     throw new TypeError('Could not parse content as FormData.');
-  } as typeof original;
+  } as typeof originalFormData;
+  Request.prototype.text = async function () { return ''; } as typeof originalText;
   try {
     return await fn();
   } finally {
-    Request.prototype.formData = original;
+    Request.prototype.formData = originalFormData;
+    Request.prototype.text = originalText;
   }
 }
 
-test('POST staff stamp: urlencoded form body still stamps when req.formData() is broken (Vercel regression)', async () => {
+test('POST staff stamp: urlencoded form body still stamps when req.formData()/req.text() are broken (Vercel regression)', async () => {
   stampLimiter.clear();
   const pool = new FakePool(stampFlowHandlers());
   await runWith(pool, async () => {
-    await withBrokenFormData(async () => {
+    await withBrokenFormReaders(async () => {
       const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/stamp`, {
         method: 'POST',
         headers: authedHeaders(),
@@ -515,14 +527,14 @@ test('POST staff stamp: urlencoded form body still stamps when req.formData() is
   });
 });
 
-test('POST staff redeem: urlencoded form body redeems, double redemption stays 409 when req.formData() is broken (Vercel regression)', async () => {
+test('POST staff redeem: urlencoded form body redeems, double redemption stays 409 when req.formData()/req.text() are broken (Vercel regression)', async () => {
   const successPool = new FakePool([
     ...sessionHandlers(validSession),
     { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed' }] },
     ...dashboardHandlers({ rewards: [{ id: REWARD, cardId: CARD, status: 'redeemed' }] }),
   ]);
   await runWith(successPool, async () => {
-    await withBrokenFormData(async () => {
+    await withBrokenFormReaders(async () => {
       const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/redeem`, {
         method: 'POST',
         headers: authedHeaders(),
@@ -538,7 +550,7 @@ test('POST staff redeem: urlencoded form body redeems, double redemption stays 4
     { match: contains('select id,status from rewards'), rows: [{ id: REWARD, status: 'redeemed' }] },
   ]);
   await runWith(conflictPool, async () => {
-    await withBrokenFormData(async () => {
+    await withBrokenFormReaders(async () => {
       const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/redeem`, {
         method: 'POST',
         headers: authedHeaders(),

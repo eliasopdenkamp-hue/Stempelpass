@@ -28,6 +28,7 @@ process.env.VERCEL = '1';
 interface AdapterModule {
   default: (req: unknown, res: unknown) => Promise<void>;
   writeNodeResponse: (res: unknown, response: Response) => Promise<void>;
+  toFetchRequest: (req: Record<string, unknown>) => Request;
 }
 const adapter = (await import('../api/index')) as AdapterModule;
 
@@ -135,4 +136,62 @@ test('writeNodeResponse passes a single Set-Cookie as a plain string', async () 
   });
   await adapter.writeNodeResponse(res, response);
   expect(res.header('set-cookie')).toBe('__Host-sp_session=x; HttpOnly; Secure; Path=/');
+});
+// ---------------------------------------------------------------------------
+// toFetchRequest body normalization (Vercel form-POST quirk)
+//
+// The Vercel Node runtime delivers the legacy request with BOTH a
+// content-type-specific parse on `body` and the untouched wire bytes on
+// `rawBody`. `body` wins in the current adapter, so a urlencoded request
+// whose bridge-parsed body is an OBJECT gets re-serialized to JSON while the
+// ORIGINAL `content-type: application/x-www-form-urlencoded` header stays in
+// place — the shared parseBody then reads JSON text through its form branch
+// and yields an empty record (the live 400 CARD_FIELDS_REQUIRED on staff
+// stamp, while JSON requests keep working). These tests pin that the RAW
+// bytes always take precedence so the wire format survives into the fetch
+// Request unchanged.
+// ---------------------------------------------------------------------------
+const URLENCODED = 'cardId=66666666-6666-4666-8666-666666666666&quantity=1';
+function vercelFormPost(body: unknown, rawBody?: unknown): Record<string, unknown> {
+  return {
+    method: 'POST',
+    url: '/staff/11111111-1111-4111-8111-111111111111/stamp',
+    headers: {
+      host: 'stempelpass.example',
+      'x-forwarded-proto': 'https',
+      'content-type': 'application/x-www-form-urlencoded',
+      'content-length': '17',
+    },
+    body,
+    ...(rawBody === undefined ? {} : { rawBody }),
+  };
+}
+test('toFetchRequest: raw urlencoded bytes win over the bridge-parsed object (Vercel form-POST quirk)', async () => {
+  const req = adapter.toFetchRequest(vercelFormPost(
+    { cardId: '66666666-6666-4666-8666-666666666666', quantity: '1' }, // bridge parse (object)
+    Buffer.from(URLENCODED, 'utf8'),                                    // untouched wire bytes
+  ));
+  expect(await req.text()).toBe(URLENCODED);
+  expect(req.headers.get('content-type')).toBe('application/x-www-form-urlencoded');
+  // The body was re-formulated from bytes → the stale header must not survive.
+  expect(req.headers.get('content-length')).toBeNull();
+});
+test('toFetchRequest: urlencoded string body without rawBody passes through unchanged', async () => {
+  const req = adapter.toFetchRequest(vercelFormPost(URLENCODED));
+  expect(await req.text()).toBe(URLENCODED);
+});
+test('toFetchRequest: JSON request stays parseable when the bridge set both body and rawBody', async () => {
+  const req = adapter.toFetchRequest({
+    method: 'POST',
+    url: '/api/auth/login',
+    headers: { host: 'stempelpass.example', 'x-forwarded-proto': 'https', 'content-type': 'application/json' },
+    body: { email: 'a@b.de', password: 'secret' },
+    rawBody: Buffer.from('{"email":"a@b.de","password":"secret"}', 'utf8'),
+  });
+  expect(await req.json()).toEqual({ email: 'a@b.de', password: 'secret' });
+  expect(req.headers.get('content-length')).toBeNull();
+});
+test('toFetchRequest: body-less request stays body-less', async () => {
+  const req = adapter.toFetchRequest({ method: 'GET', url: '/health', headers: { host: 'stempelpass.example' } });
+  expect(await req.text()).toBe('');
 });
