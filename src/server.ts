@@ -125,20 +125,34 @@ const staffRedirect=(location:string,headers:HeadersInit={})=>new Response(null,
 /** Friendly HTML error page for the staff UI (never internal details). */
 function staffError(e:unknown,id:string):Response{const {code,status}=classifyError(e);return htmlResponse(staffErrorPage(status,code,id),status);}
 /** Parse a staff POST body: JSON or form-urlencoded, strings only. */
-async function parseBody(req:Request):Promise<Record<string,string>>{
-  const ct=req.headers.get('content-type')??'';
-  try{
-    if(ct.includes('application/json')){
-      const raw=await req.json() as Record<string,unknown>;
-      const out:Record<string,string>={};
-      for(const [k,v] of Object.entries(raw))out[k]=typeof v==='string'?v:(typeof v==='number'||typeof v==='boolean')?String(v):'';
+async function parseBody(req: Request): Promise<Record<string, string>> {
+  const ct = req.headers.get('content-type') ?? '';
+  if (ct.includes('application/json')) {
+    try {
+      const raw = await req.json() as Record<string, unknown>;
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(raw)) out[k] = typeof v === 'string' ? v : (typeof v === 'number' || typeof v === 'boolean') ? String(v) : '';
       return out;
+    } catch {
+      // Malformed JSON is treated as an empty body so the caller's field
+      // validation (CARD_FIELDS_REQUIRED / REWARD_NOT_FOUND) reports the
+      // missing fields instead of leaking a parser detail.
+      return {};
     }
-    const form=await req.formData();
-    const out:Record<string,string>={};
-    for(const [k,v] of form.entries())out[k]=typeof v==='string'?v:'';
-    return out;
-  }catch{return{};}
+  }
+  // Form branch. req.formData() is unreliable on the deployed (Vercel) runtime
+  // for application/x-www-form-urlencoded — it throws, and the old blanket
+  // catch{} converted that into {}, so staff stamp/redeem failed with
+  // CARD_FIELDS_REQUIRED / REWARD_NOT_FOUND while JSON bodies kept working.
+  // URLSearchParams over the raw text parses urlencoded bodies identically on
+  // every runtime; an empty or non-urlencoded body yields an empty record and
+  // the caller's field validation applies unchanged. A genuine body read error
+  // (stream/consumed) propagates and surfaces as a 500 — never silently
+  // becomes a misleading missing-field error.
+  const text = await req.text();
+  const out: Record<string, string> = {};
+  for (const [k, v] of new URLSearchParams(text)) out[k] = v;
+  return out;
 }
 /** Resolve a stamp target: card UUID directly, or a raw card token via the
  *  existing findByPublicTokenHash lookup (hashToken, never the raw token). */

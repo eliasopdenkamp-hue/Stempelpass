@@ -475,6 +475,82 @@ test('POST staff redeem of an already-redeemed reward answers a friendly 409 wit
 });
 
 // ---------------------------------------------------------------------------
+// (5b) Form-POST regression (Vercel runtime): the deployed runtime rejects
+// req.formData() for application/x-www-form-urlencoded (the exact content type
+// the staff UI sends). The old parseBody blanket catch{} silently turned that
+// into {} — stamp failed with CARD_FIELDS_REQUIRED, redeem with
+// REWARD_NOT_FOUND, while JSON bodies kept working (the 26.08. recheck gap:
+// only JSON paths were exercised). Simulate the broken runtime by patching
+// Request.prototype.formData to throw, then drive the REAL fetchHandler with
+// urlencoded bodies.
+// ---------------------------------------------------------------------------
+async function withBrokenFormData(fn: () => Promise<unknown>): Promise<unknown> {
+  const original = Request.prototype.formData;
+  Request.prototype.formData = async function () {
+    throw new TypeError('Could not parse content as FormData.');
+  } as typeof original;
+  try {
+    return await fn();
+  } finally {
+    Request.prototype.formData = original;
+  }
+}
+
+test('POST staff stamp: urlencoded form body still stamps when req.formData() is broken (Vercel regression)', async () => {
+  stampLimiter.clear();
+  const pool = new FakePool(stampFlowHandlers());
+  await runWith(pool, async () => {
+    await withBrokenFormData(async () => {
+      const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/stamp`, {
+        method: 'POST',
+        headers: authedHeaders(),
+        body: new URLSearchParams({ cardId: CARD, quantity: '1' }),
+      }));
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain('Stempel vergeben');
+      expect(html).toContain('hat jetzt 4 Stempel');
+      expect(res.headers.get('x-csrf-token')).toMatch(/^[0-9a-f]{64}$/);
+    });
+  });
+});
+
+test('POST staff redeem: urlencoded form body redeems, double redemption stays 409 when req.formData() is broken (Vercel regression)', async () => {
+  const successPool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed' }] },
+    ...dashboardHandlers({ rewards: [{ id: REWARD, cardId: CARD, status: 'redeemed' }] }),
+  ]);
+  await runWith(successPool, async () => {
+    await withBrokenFormData(async () => {
+      const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/redeem`, {
+        method: 'POST',
+        headers: authedHeaders(),
+        body: new URLSearchParams({ rewardId: REWARD }),
+      }));
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain('Prämie erfolgreich eingelöst.');
+    });
+  });
+  const conflictPool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('update rewards set status'), rows: [] },
+    { match: contains('select id,status from rewards'), rows: [{ id: REWARD, status: 'redeemed' }] },
+  ]);
+  await runWith(conflictPool, async () => {
+    await withBrokenFormData(async () => {
+      const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/redeem`, {
+        method: 'POST',
+        headers: authedHeaders(),
+        body: new URLSearchParams({ rewardId: REWARD }),
+      }));
+      expect(res.status).toBe(409);
+      expect(await res.text()).toContain('Diese Prämie wurde bereits eingelöst.');
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // (6) POST /staff/:tenantId/logout
 // ---------------------------------------------------------------------------
 test('POST staff logout revokes the session, clears the cookie and redirects to /login', async () => {
