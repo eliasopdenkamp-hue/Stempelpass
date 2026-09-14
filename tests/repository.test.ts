@@ -683,3 +683,127 @@ test('publicCard and findByPublicTokenHash never find soft-deleted cards (delete
   expect(findSelect?.sql).toContain('deleted_at is null');
   expect(findSelect?.params).toEqual([TENANT, 'a'.repeat(64), 'active']);
 });
+
+// ---------------------------------------------------------------------------
+// staffStats — tenant-scoped dashboard statistics (one transaction, aggregates)
+// ---------------------------------------------------------------------------
+
+/** Query answer script for a staffStats tenant-transaction (begin, set_config,
+ *  7 aggregate reads; commit consumes nothing). */
+function statsScript(rows: {
+  active?: unknown; redeemed?: unknown; trend?: unknown; fresh?: unknown;
+  avg?: unknown; ready?: unknown; near?: unknown;
+} = {}) {
+  return [
+    [], // begin
+    [], // set_config app.tenant_id
+    [rows.active ?? { n: '0' }],
+    [rows.redeemed ?? { n: '0' }],
+    [rows.trend ?? { last30: '0', prev30: '0' }],
+    [rows.fresh ?? { n: '0' }],
+    [rows.avg ?? { avg: null }],
+    [rows.ready ?? { n: '0' }],
+    [rows.near ?? { n: '0' }],
+  ];
+}
+
+test('staffStats computes all metrics from one tenant transaction (2 active/1 inactive card, redeemed+issued rewards, events in both windows)', async () => {
+  const pool = new FakePool(statsScript({
+    active: { n: '2' },        // 2 active cards (1 inactive excluded)
+    redeemed: { n: '1' },      // 1 redeemed reward (all time, incl. inactive card's)
+    trend: { last30: '12', prev30: '8' }, // +50% delta in the current window
+    fresh: { n: '1' },         // 1 card created in the last 30 days
+    avg: { avg: '4.5' },       // (5 + 4) / 2 active cards
+    ready: { n: '1' },         // card at 5/5 with an open issued reward
+    near: { n: '1' },          // card at 4/5 (last quarter before the threshold)
+  }));
+  const repo = new CardRepository(pool);
+  const result = await repo.staffStats(TENANT);
+  expect(result).toEqual({
+    activeCards: 2,
+    redeemedRewards: 1,
+    stampsLast30d: 12,
+    stampsPrev30d: 8,
+    trendDeltaPct: 50,
+    newCardsLast30d: 1,
+    avgStampCount: 4.5,
+    readyRewards: 1,
+    nearReward: 1,
+  });
+  // One tenant transaction: begin → set_config(TENANT) → reads → commit.
+  expect(pool.queries[0]?.sql).toBe('begin');
+  expect(pool.queries[1]?.sql).toContain("set_config('app.tenant_id'");
+  expect(pool.queries[1]?.params).toEqual([TENANT]);
+  expect(pool.queries.some(q => q.sql === 'commit')).toBe(true);
+  // Every aggregate is tenant-scoped and the readiness/progress queries carry
+  // the exact active/deleted/issued conditions.
+  const sql = pool.queries.map(q => q.sql).join('\n');
+  expect(sql).toContain("status=$2 and c.deleted_at is null");
+  expect(sql).toContain("from rewards where tenant_id=$1 and status=$2");
+  expect(sql).toContain("interval '30 days'");
+  expect(sql).toContain("interval '60 days'");
+  expect(sql).toContain('avg(c.stamp_count)');
+  expect(sql).toContain('c.stamp_count >= r.stamps_required');
+  expect(sql).toContain("w.status=$3");
+  expect(sql).toContain('c.stamp_count >= 0.75 * r.stamps_required');
+  expect(sql).toContain('c.stamp_count < r.stamps_required');
+  // No row-shaped leaks: the result is aggregates only.
+  expectNoInternalFields(result);
+});
+
+test('staffStats returns null trend delta when the previous 30-day window has no data (no division by zero)', async () => {
+  const pool = new FakePool(statsScript({
+    active: { n: '2' },
+    trend: { last30: '6', prev30: '0' },
+    avg: { avg: '2.5' },
+  }));
+  const repo = new CardRepository(pool);
+  const result = await repo.staffStats(TENANT);
+  expect(result.trendDeltaPct).toBeNull();
+  expect(result.stampsLast30d).toBe(6);
+  expect(result.stampsPrev30d).toBe(0);
+  expect(result.avgStampCount).toBe(2.5);
+});
+
+test('staffStats on an empty tenant returns zeros instead of errors', async () => {
+  const pool = new FakePool(statsScript()); // every query answers zero rows
+  const repo = new CardRepository(pool);
+  const result = await repo.staffStats(TENANT);
+  expect(result).toEqual({
+    activeCards: 0,
+    redeemedRewards: 0,
+    stampsLast30d: 0,
+    stampsPrev30d: 0,
+    trendDeltaPct: null,
+    newCardsLast30d: 0,
+    avgStampCount: 0,
+    readyRewards: 0,
+    nearReward: 0,
+  });
+  expect(pool.queries.some(q => q.sql === 'commit')).toBe(true);
+  expect(pool.queries.some(q => q.sql === 'rollback')).toBe(false);
+});
+
+test('staffStats is tenant-isolated: each tenant sees only its own aggregates', async () => {
+  const poolA = new FakePool(statsScript({ active: { n: '3' }, redeemed: { n: '2' }, trend: { last30: '9', prev30: '3' } }));
+  const repoA = new CardRepository(poolA);
+  const a = await repoA.staffStats(TENANT);
+  expect(a.activeCards).toBe(3);
+  expect(a.redeemedRewards).toBe(2);
+  expect(a.trendDeltaPct).toBe(200);
+  expect(poolA.queries[1]?.params).toEqual([TENANT]);
+
+  const OTHER = '99999998-9998-4998-8998-999999999998';
+  const poolB = new FakePool(statsScript({ active: { n: '7' }, redeemed: { n: '5' }, trend: { last30: '2', prev30: '4' } }));
+  const repoB = new CardRepository(poolB);
+  const b = await repoB.staffStats(OTHER);
+  expect(b.activeCards).toBe(7);
+  expect(b.redeemedRewards).toBe(5);
+  expect(b.trendDeltaPct).toBe(-50);
+  expect(poolB.queries[1]?.params).toEqual([OTHER]);
+  // Tenant A's numbers never appear in tenant B's aggregates (separate pools/
+  // transactions — each tenant's set_config pins only its own id).
+  expect(JSON.stringify(b)).not.toContain('"activeCards":3');
+  expect(JSON.stringify(b)).not.toContain('"stampsLast30d":9');
+  expect(JSON.stringify(a)).not.toContain('"activeCards":7');
+});

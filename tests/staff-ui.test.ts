@@ -112,7 +112,7 @@ function authedHeaders(overrides: Record<string, string> = {}): Headers {
  *  re-rendered dashboard inside POST responses. The rule hander order keeps
  *  the repository.stamp() rule read (stamps_required from stamp_rules) apart
  *  from the dashboard rule read (created_at desc limit 1). */
-function dashboardHandlers(overrides: { tenant?: unknown[]; cards?: unknown[]; events?: unknown[]; rewards?: unknown[]; branding?: unknown[] } = {}): FakeHandler[] {
+function dashboardHandlers(overrides: { tenant?: unknown[]; cards?: unknown[]; events?: unknown[]; rewards?: unknown[]; branding?: unknown[]; stats?: { active?: unknown[]; redeemed?: unknown[]; trend?: unknown[]; fresh?: unknown[]; avg?: unknown[]; ready?: unknown[]; near?: unknown[] } } = {}): FakeHandler[] {
   return [
     { match: contains('from tenants where'), rows: overrides.tenant === undefined
       ? [{ id: TENANT, legalName: 'Beispiel GmbH', planCode: 'up_to_500', customerLimit: 500 }] : overrides.tenant },
@@ -127,6 +127,18 @@ function dashboardHandlers(overrides: { tenant?: unknown[]; cards?: unknown[]; e
       ? [{ id: 'evt-1', cardId: CARD, customerRef: 'Kunde-42', quantity: 1, createdAt: '2026-08-26T10:00:00.000Z' }] : overrides.events },
     { match: contains('order by issued_at asc'), rows: overrides.rewards === undefined
       ? [{ id: REWARD, cardId: CARD, status: 'issued' }] : overrides.rewards },
+    // staffStats aggregate reads (distinct match fragments; defaults mirror the
+    // repository fixture: 2 active cards, 1 redeemed reward, +50% trend, 1 new
+    // card, avg 2.5, 1 ready + 1 near reward). Each card-based aggregate shares
+    // the 'from cards c where' fragment, so the active-card match additionally
+    // excludes the avg/fresh queries.
+    { match: (sql) => sql.includes('from cards c where') && !sql.includes('avg(') && !sql.includes('c.created_at'), rows: overrides.stats?.active === undefined ? [{ n: '2' }] : overrides.stats.active },
+    { match: contains('from rewards where'), rows: overrides.stats?.redeemed === undefined ? [{ n: '1' }] : overrides.stats.redeemed },
+    { match: contains('sum(quantity) filter'), rows: overrides.stats?.trend === undefined ? [{ last30: '12', prev30: '8' }] : overrides.stats.trend },
+    { match: contains('c.created_at >= now()'), rows: overrides.stats?.fresh === undefined ? [{ n: '1' }] : overrides.stats.fresh },
+    { match: contains('avg(c.stamp_count)'), rows: overrides.stats?.avg === undefined ? [{ avg: '2.5' }] : overrides.stats.avg },
+    { match: contains('w.status=$3'), rows: overrides.stats?.ready === undefined ? [{ n: '1' }] : overrides.stats.ready },
+    { match: contains('0.75 * r.stamps_required'), rows: overrides.stats?.near === undefined ? [{ n: '1' }] : overrides.stats.near },
   ];
 }
 
@@ -141,6 +153,9 @@ function expectDashboardHtml(html: string) {
   expect(html).toContain(`name="sp-csrf" content="`);
   expect(html).toContain(`data-action="logout"`);
   expect(html).toContain('/staff/11111111-1111-4111-8111-111111111111/stamp');
+  // Statistics section (all roles see it, aggregates only).
+  expect(html).toContain('<h2>Statistik</h2>');
+  expect(html).toContain('Stempelaktivität als Verkaufsindikator.');
   for (const marker of ['publicTokenHash', 'public_token_hash', 'employeeMembershipId', 'employee_membership_id', 'csrf_token_hash']) {
     expect(html).not.toContain(marker);
   }
@@ -312,6 +327,43 @@ test('GET /staff/:tenantId hides stamp actions for viewer roles', async () => {
     expect(html).not.toContain('data-action="stamp"');
     expect(html).not.toContain('data-action="redeem"');
     expect(html).not.toContain('<form data-staff-form');
+  });
+});
+
+test('GET /staff/:tenantId renders the statistics section: KPIs, trend with German formatting and reward-progress rows (visible to every role)', async () => {
+  const pool = new FakePool([...sessionHandlers(validSession), ...dashboardHandlers()]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // KPI boxes (labels + values).
+    expect(html).toContain('<div class="kpi"><div class="v">2</div><div class="l">Aktive Karten</div>');
+    expect(html).toContain('<div class="kpi"><div class="v">1</div><div class="l">Eingelöste Prämien</div>');
+    expect(html).toContain('<div class="kpi"><div class="v">2,5</div><div class="l">Ø Stempelstand</div>');
+    expect(html).toContain('<div class="kpi"><div class="v">1</div><div class="l">Neue Karten (30 Tage)</div>');
+    // Compact table: windows, trend (+50 % → German comma, signed), progress.
+    expect(html).toContain('Stempelaktivität (letzte 30 Tage)</td><td><strong>12</strong>');
+    expect(html).toContain('Stempelaktivität (30 Tage davor)</td><td><strong>8</strong>');
+    expect(html).toContain('Trend</td><td><strong>+50,0 %</strong>');
+    expect(html).toContain('Prämien bereit zur Einlösung</td><td><strong>1</strong>');
+    expect(html).toContain('Kurz vor der Prämie</td><td><strong>1</strong>');
+    // Hint text marks stamp activity as the sales indicator.
+    expect(html).toContain('Stempelaktivität als Verkaufsindikator.');
+  });
+});
+
+test('GET /staff/:tenantId renders an em dash trend when the previous 30-day window has no data', async () => {
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    ...dashboardHandlers({ stats: { trend: [{ last30: '3', prev30: '0' }] } }),
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('Trend</td><td><strong>—</strong>');
+    // The current window still shows its value.
+    expect(html).toContain('Stempelaktivität (letzte 30 Tage)</td><td><strong>3</strong>');
   });
 });
 
