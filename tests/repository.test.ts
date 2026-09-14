@@ -5,6 +5,7 @@ const TENANT = '11111111-1111-4111-8111-111111111111';
 const CUSTOMER = '22222222-2222-4222-8222-222222222222';
 const OTHER_TENANT_CUSTOMER = '99999999-9999-4999-8999-999999999999';
 const RULE = '33333333-3333-4333-8333-333333333333';
+const CARD = '66666666-6666-4666-8666-666666666666';
 const TOKEN_HASH = 'a'.repeat(64);
 
 /** Minimal in-memory DbPool: each query consumes the next canned row set. */
@@ -286,7 +287,8 @@ test('redeem returns only rewardId and status, never the full reward row', async
   const pool = new FakePool([
     [], // begin
     [], // set_config
-    [{ id: 'reward-1', status: 'redeemed' }], // update rewards returning
+    [{ id: 'reward-1', status: 'redeemed', card_id: CARD }], // update rewards returning
+    [], // update cards reset
     [], // commit
   ]);
   const repo = new CardRepository(pool);
@@ -294,8 +296,127 @@ test('redeem returns only rewardId and status, never the full reward row', async
   expect(result).toEqual({ rewardId: 'reward-1', status: 'redeemed' });
   expectNoInternalFields(result);
   const update = pool.queries.find(q => q.sql.startsWith('update rewards'));
-  expect(update?.sql).toContain('returning id,status');
+  expect(update?.sql).toContain('returning id,status,card_id');
   expect(update?.sql).not.toContain('returning *');
+});
+
+// ---------------------------------------------------------------------------
+// Redeem counter reset (owner decision 2026-09-13): a successful redemption
+// starts a NEW collection round — the card's stamp counter is reset to 0 so
+// the next reward only appears after stampsRequired FRESH stamps. The 409
+// behavior for an already-redeemed reward id stays untouched.
+// ---------------------------------------------------------------------------
+test('redeem resets the card stamp counter to 0 in the same tenant transaction', async () => {
+  const pool = new FakePool([
+    [], // begin
+    [], // set_config app.tenant_id
+    [{ id: 'reward-1', status: 'redeemed', card_id: CARD }], // update rewards returning
+    [], // update cards reset
+    [], // commit
+  ]);
+  const repo = new CardRepository(pool);
+  const result = await repo.redeem(TENANT, 'reward-1');
+  expect(result).toEqual({ rewardId: 'reward-1', status: 'redeemed' });
+  const reset = pool.queries.find(q => q.sql.startsWith('update cards'));
+  expect(reset?.sql).toContain('stamp_count=0');
+  expect(reset?.sql).toContain('revision=revision+1');
+  expect(reset?.sql).toContain('updated_at=now()');
+  expect(reset?.params).toEqual([TENANT, CARD]);
+  // Same transaction, tenant-scoped: rewards update -> cards reset -> commit.
+  const idxRewards = pool.queries.findIndex(q => q.sql.startsWith('update rewards'));
+  const idxReset = pool.queries.findIndex(q => q.sql.startsWith('update cards'));
+  const ctxIdx = pool.queries.findIndex(q => q.sql.includes("set_config('app.tenant_id'"));
+  const idxCommit = pool.queries.findIndex(q => q.sql === 'commit');
+  expect(idxRewards).toBeGreaterThan(ctxIdx);
+  expect(idxReset).toBeGreaterThan(idxRewards);
+  expect(idxCommit).toBeGreaterThan(idxReset);
+});
+
+test('redeem of an already redeemed reward stays REWARD_ALREADY_REDEEMED and never touches the card counter', async () => {
+  const pool = new FakePool([
+    [], // begin
+    [], // set_config
+    [], // update rewards -> no row (status already redeemed)
+    [{ id: 'reward-1', status: 'redeemed' }], // select id,status -> confirmed redeemed
+  ]);
+  const repo = new CardRepository(pool);
+  await expect(repo.redeem(TENANT, 'reward-1')).rejects.toThrow('REWARD_ALREADY_REDEEMED');
+  expect(pool.queries.some(q => q.sql.startsWith('update cards'))).toBe(false);
+  expect(pool.queries.some(q => q.sql === 'commit')).toBe(false);
+  expect(pool.queries.some(q => q.sql === 'rollback')).toBe(true);
+});
+
+test('redeem of an unknown reward id stays REWARD_NOT_FOUND and never touches the card counter', async () => {
+  const pool = new FakePool([
+    [], // begin
+    [], // set_config
+    [], // update rewards -> no row
+    [], // select id,status -> no row
+  ]);
+  const repo = new CardRepository(pool);
+  await expect(repo.redeem(TENANT, 'reward-1')).rejects.toThrow('REWARD_NOT_FOUND');
+  expect(pool.queries.some(q => q.sql.startsWith('update cards'))).toBe(false);
+});
+
+test('after a redeem reset exactly stampsRequired FRESH stamps mint the next reward (endless-rewards regression)', async () => {
+  // Full story: a 5/5 card redeems (counter -> 0), then four stamps stay below
+  // the threshold (no reward), and only the FIFTH fresh stamp creates the next
+  // reward. Scripted against one FakePool; each repository call opens its own
+  // transaction (begin/set_config/commit rows).
+  const pool = new FakePool([
+    // redeem: reset the counter
+    [], // begin
+    [], // set_config
+    [{ id: 'reward-1', status: 'redeemed', card_id: CARD }], // update rewards returning
+    [], // update cards reset
+    [], // commit
+    // stamp 1 (0 -> 1, below 5)
+    [], [], // begin, set_config
+    [{ id: CARD, stampCount: 0, revision: 2, ruleId: RULE }], // card select for update
+    [], // insert stamp_event
+    [{ id: CARD, stampCount: 1, revision: 3 }], // update cards returning
+    [{ id: RULE, stamps_required: 5 }], // rule select
+    [], // commit
+    // stamp 2 (1 -> 2)
+    [], [],
+    [{ id: CARD, stampCount: 1, revision: 3, ruleId: RULE }],
+    [],
+    [{ id: CARD, stampCount: 2, revision: 4 }],
+    [{ id: RULE, stamps_required: 5 }],
+    [],
+    // stamp 3 (2 -> 3)
+    [], [],
+    [{ id: CARD, stampCount: 2, revision: 4, ruleId: RULE }],
+    [],
+    [{ id: CARD, stampCount: 3, revision: 5 }],
+    [{ id: RULE, stamps_required: 5 }],
+    [],
+    // stamp 4 (3 -> 4, still below 5: no reward row scripted -> none)
+    [], [],
+    [{ id: CARD, stampCount: 3, revision: 5, ruleId: RULE }],
+    [],
+    [{ id: CARD, stampCount: 4, revision: 6 }],
+    [{ id: RULE, stamps_required: 5 }],
+    [],
+    // stamp 5 (4 -> 5, threshold reached -> reward inserted)
+    [], [],
+    [{ id: CARD, stampCount: 4, revision: 6, ruleId: RULE }],
+    [],
+    [{ id: CARD, stampCount: 5, revision: 7 }],
+    [{ id: RULE, stamps_required: 5 }],
+    [{ id: 'reward-2', status: 'issued' }], // reward insert returning
+    [], // commit
+  ]);
+  const repo = new CardRepository(pool);
+  await repo.redeem(TENANT, 'reward-1');
+  for (let i = 1; i <= 4; i++) {
+    const result = await repo.stamp(TENANT, CARD, 1, 'member-1', null);
+    expect(result.card.stampCount).toBe(i);
+    expect(result).not.toHaveProperty('reward');
+  }
+  const fifth = await repo.stamp(TENANT, CARD, 1, 'member-1', null);
+  expect(fifth.card.stampCount).toBe(5);
+  expect(fifth.reward).toEqual({ id: 'reward-2', status: 'issued' });
 });
 
 // ---------------------------------------------------------------------------

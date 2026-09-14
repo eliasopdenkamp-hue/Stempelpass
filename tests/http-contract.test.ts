@@ -392,27 +392,73 @@ test('public card HTML shows the Save-to-Wallet button before the Art. 13 privac
 });
 
 // ---------------------------------------------------------------------------
-// (2b) GET /join/:publicKey — RLS-safe resolution through the resolver function
+// (2b) GET /join/:publicKey — branded customer HTML page (owner fix 2026-09-13).
+// Resolution still goes through the SECURITY DEFINER resolver function
+// (migration 008); the render is the tenant-branded join page with the
+// DSGVO Art. 13 footer — never raw JSON.
 // ---------------------------------------------------------------------------
 const JOIN_KEY = 'c'.repeat(32); // valid 32-hex public key
-test('GET /join/:publicKey returns exactly the join contract for the given key', async () => {
+/** joinContext handlers: entry-point resolution + branding + controller + rule. */
+function joinContextHandlers(): FakeHandler[] {
+  return [
+    { match: contains('resolve_entry_point'), rows: [{ tenant_id: TENANT, join_path: `/join/${JOIN_KEY}` }] },
+    { match: contains('from tenant_branding'), rows: [{ cardTitle: 'StempelPass Demo', cardText: 'Deine Karte', primaryColor: '#155e75', secondaryColor: '#f8fafc', privacyEmail: 'datenschutz@beispiel.de', version: 1 }] },
+    { match: contains('select legal_name from tenants'), rows: [{ legal_name: 'Beispiel GmbH' }] },
+    { match: contains('from stamp_rules'), rows: [{ id: RULE, tenantId: TENANT, name: 'R', stampsRequired: 5, rewardTitle: 'Prämie', rewardDescription: 'D', active: true, version: 1 }] },
+  ];
+}
+test('GET /join/:publicKey renders a branded HTML customer page, never raw JSON', async () => {
+  const pool = new FakePool(joinContextHandlers());
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/join/${JOIN_KEY}`));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/html');
+    const html = await res.text();
+    // Branded page: title, card text, controller line, stamp rule.
+    expect(html).toContain('<!doctype html');
+    expect(html).toContain('StempelPass Demo');
+    expect(html).toContain('Deine Karte');
+    expect(html).toContain('Beispiel GmbH');
+    expect(html).toContain('5 Stempel');
+    expect(html).toContain('Prämie');
+    expect(html).toContain('&middot; D'); // reward description
+    // Solution A instruction (no card token exists on the join link).
+    expect(html).toContain('Diese Karte wird an der Kasse erstellt. Zeigen Sie diesen QR an der Kasse vor.');
+    // DSGVO Art. 13 footer identical to the webcard.
+    expect(html).toContain('<section class="privacy">');
+    expect(html).toContain('Verantwortlich für die Verarbeitung: Beispiel GmbH');
+    expect(html).toContain('datenschutz@beispiel.de');
+    // Sanitized brand color reaches the CSS.
+    expect(html).toContain('#155e75');
+    // No card token -> no save-to-wallet button; no JSON envelope; no internals.
+    expect(html).not.toContain('Zu Google Wallet hinzufügen');
+    expect(html).not.toContain('request_id');
+    expect(html).not.toContain('customerId');
+    expect(html).not.toContain('publicTokenHash');
+    // Resolution used the RLS-safe resolver function, never a direct table read,
+    // and the tenant context is set before any branding read.
+    const sqls = pool.queries.map(q => q.sql);
+    expect(sqls.some(s => s.includes('resolve_entry_point'))).toBe(true);
+    expect(sqls.some(s => s.includes('from tenant_entry_points'))).toBe(false);
+    const ctxIdx = sqls.findIndex(s => s.includes("set_config('app.tenant_id'"));
+    const brandingIdx = sqls.findIndex(s => s.includes('from tenant_branding'));
+    expect(ctxIdx).toBeGreaterThan(-1);
+    expect(brandingIdx).toBeGreaterThan(ctxIdx);
+  });
+});
+test('GET /join/:publicKey without branding/rule falls back to neutral defaults', async () => {
   const pool = new FakePool([
     { match: contains('resolve_entry_point'), rows: [{ tenant_id: TENANT, join_path: `/join/${JOIN_KEY}` }] },
   ]);
   await runWith(pool, async () => {
     const res = await fetchHandler(new Request(`http://test.local/join/${JOIN_KEY}`));
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { request_id: string; data: Record<string, unknown> };
-    expect(Object.keys(body).sort()).toEqual(['data', 'request_id']);
-    expect(body.data).toEqual({
-      tenantId: TENANT,
-      joinPath: `/join/${JOIN_KEY}`,
-      customerLoginRequired: false,
-      customerAccountRequired: false,
-    });
-    const raw = JSON.stringify(body);
-    expect(raw).not.toContain('public_key');
-    expect(raw).not.toContain('resolve_entry_point');
+    const html = await res.text();
+    expect(html).toContain('<h1>StempelPass</h1>');
+    expect(html).toContain('Diese Karte wird an der Kasse erstellt.');
+    // No configured controller: only the escaped privacy fallback, no tenant line.
+    expect(html).toContain('&lt;Tenant&gt;');
+    expect(html).not.toContain('<p class="tenant">');
   });
 });
 test('GET /join/:publicKey with an unknown key yields 404 ENTRY_POINT_NOT_FOUND', async () => {
@@ -450,9 +496,7 @@ test('GET /join/:publicKey database failure maps to INTERNAL_ERROR without leaki
 });
 test('GET /join/:publicKey is rate limited per client+path (429 RATE_LIMITED)', async () => {
   cardResolveLimiter.clear();
-  const pool = new FakePool([
-    { match: contains('resolve_entry_point'), rows: [{ tenant_id: TENANT, join_path: `/join/${JOIN_KEY}` }] },
-  ]);
+  const pool = new FakePool(joinContextHandlers());
   await runWith(pool, async () => {
     let statuses: number[] = [];
     for (let i = 0; i < 61; i++) {
@@ -675,10 +719,11 @@ test('stamp idempotency replay returns the identical minimal response without st
 // ---------------------------------------------------------------------------
 // (7) Redeem — minimal response, never a full rewards row
 // ---------------------------------------------------------------------------
-test('redeem returns only rewardId and status', async () => {
+test('redeem returns only rewardId and status and resets the card counter to 0', async () => {
   const pool = new FakePool([
     ...sessionHandlers(validSession),
-    { match: contains('update rewards set status'), rows: [{ id: 'reward-1', status: 'redeemed' }] },
+    { match: contains('update rewards set status'), rows: [{ id: 'reward-1', status: 'redeemed', card_id: 'card-1' }] },
+    { match: contains('update cards set stamp_count=0'), rows: [] },
   ]);
   await runWith(pool, async () => {
     const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}/rewards/reward-1/redeem`, {
@@ -689,6 +734,11 @@ test('redeem returns only rewardId and status', async () => {
     const body = (await res.json()) as { data: unknown };
     expect(body.data).toEqual({ rewardId: 'reward-1', status: 'redeemed' });
     expectNoInternalFields(body);
+    // Owner fix 2026-09-13: the same transaction resets the card's stamp
+    // counter so a new collection round starts (no endless rewards).
+    const reset = pool.queries.find(q => q.sql.includes('update cards set stamp_count=0'));
+    expect(reset?.params).toEqual([TENANT, 'card-1']);
+    expect(reset?.sql).toContain('revision=revision+1');
   });
 });
 
@@ -1109,7 +1159,8 @@ test('redeem rotation of an MFA-verified session also persists mfa_verified=true
     params[0] === SESSION_HASH ? [sessionRow({ mfa_required: true, mfa_verified: true })] : [];
   const pool = new FakePool([
     ...sessionHandlers(mfaSession),
-    { match: contains('update rewards set status'), rows: [{ id: 'reward-1', status: 'redeemed' }] },
+    { match: contains('update rewards set status'), rows: [{ id: 'reward-1', status: 'redeemed', card_id: 'card-1' }] },
+    { match: contains('update cards set stamp_count=0'), rows: [] },
   ]);
   await runWith(pool, async () => {
     const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}/rewards/reward-1/redeem`, {

@@ -51,10 +51,6 @@ export function toPilotResponse(value: PilotResponse): PilotResponse { return va
 export interface StaffResponse { membershipId: string; status: 'active' | 'inactive'; role: 'admin' | 'staff' | 'viewer'; }
 export function toStaffResponse(value: StaffResponse): StaffResponse { return value; }
 
-/** GET /join/:publicKey — unchanged shape, centralized contract. */
-export interface JoinResponse { tenantId: string; joinPath: string; customerLoginRequired: boolean; customerAccountRequired: boolean; }
-export function toJoinResponse(value: JoinResponse): JoinResponse { return value; }
-
 /**
  * DELETE .../cards/:cardId, .../customers/:customerId, .../tenants/:tenantId —
  * minimal acknowledgement of a soft-delete: only `deleted:true` and the
