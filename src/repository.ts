@@ -11,6 +11,22 @@ export interface RewardView { id: string; status: 'issued' | 'redeemed'; }
 export type CreatedCard = Pick<Card, 'id' | 'ruleId' | 'stampCount' | 'revision'>;
 /** Strictly minimized redeem result; never a full rewards row. */
 export interface RedeemResult { rewardId: string; status: 'issued' | 'redeemed'; }
+/**
+ * Join-page view model for GET /join/:publicKey (unauthenticated customer
+ * landing page, Solution A — the card itself is created by staff at the
+ * register). Strictly minimized: never a customers/cards/rewards row and
+ * never an entry-point public_key beyond the join path itself.
+ */
+export interface JoinPageData {
+  tenantId: string;
+  joinPath: string;
+  branding: Branding | null;
+  rule: StampRule | null;
+  /** DSGVO Art. 13: controller display name (tenants.legal_name), null when unset. */
+  controllerName: string | null;
+  /** DSGVO Art. 13: optional contact for data-subject requests (tenant_branding.privacy_email). */
+  privacyContact: string | null;
+}
 /** Minimal soft-delete acknowledgement: only the deleted entity id, never a full row. */
 export interface DeleteResult { id: string; }
 /**
@@ -109,6 +125,36 @@ export class CardRepository {
    * which returns exactly (tenant_id, join_path) for the exact public key.
    */
   async resolveEntryPoint(publicKey:string){if(!/^[a-f0-9]{32}$/i.test(publicKey)) return null; const db=await this.pool.connect(); try { const r=await db.query<{tenant_id:string;join_path:string}>('select tenant_id,join_path from public.resolve_entry_point($1)',[publicKey]); return r.rows[0]??null; } finally { db.release(); }}
+  /**
+   * Public join-page context for GET /join/:publicKey — RLS-safe by
+   * construction, single round trip.
+   *
+   * Resolution goes through the SECURITY DEFINER function
+   * public.resolve_entry_point (migration 008) exactly like resolveEntryPoint
+   * (never a direct tenant_entry_points read). Only AFTER the entry point
+   * resolved to a tenant does the transaction set app.tenant_id to THAT
+   * tenant — the caller is then able to read only the branding/rule/controller
+   * rows of the tenant whose public key they presented (tenant_isolation RLS),
+   * which is the same public-read trust model as the webcard route. The result
+   * is minimized to what the public join page renders: no entry-point
+   * public_key, no customers/cards/rewards rows.
+   */
+  async joinContext(publicKey:string):Promise<JoinPageData|null>{
+    if(!/^[a-f0-9]{32}$/i.test(publicKey)) return null;
+    const db=await this.pool.connect();
+    try{
+      await db.query('begin');
+      const entry=(await db.query<{tenant_id:string;join_path:string}>('select tenant_id,join_path from public.resolve_entry_point($1)',[publicKey])).rows[0];
+      if(!entry){await db.query('rollback');return null;}
+      await db.query("select set_config('app.tenant_id', $1, true)",[entry.tenant_id]);
+      const brandingRow=(await db.query<Branding & {privacyEmail?:string|null}>('select card_title as "cardTitle",card_text as "cardText",primary_color as "primaryColor",secondary_color as "secondaryColor",privacy_email as "privacyEmail",version from tenant_branding where tenant_id=$1',[entry.tenant_id])).rows[0] ?? null;
+      const branding:Branding|null=brandingRow?{cardTitle:brandingRow.cardTitle,cardText:brandingRow.cardText,primaryColor:brandingRow.primaryColor,secondaryColor:brandingRow.secondaryColor,version:brandingRow.version}:null;
+      const tenant=(await db.query<{legal_name:string|null}>('select legal_name from tenants where id=$1',[entry.tenant_id])).rows[0] ?? null;
+      const rule=(await db.query<StampRule>('select id,tenant_id as "tenantId",name,stamps_required as "stampsRequired",reward_title as "rewardTitle",reward_description as "rewardDescription",active,version from stamp_rules where tenant_id=$1 and active=true order by created_at desc limit 1',[entry.tenant_id])).rows[0] ?? null;
+      await db.query('commit');
+      return {tenantId:entry.tenant_id,joinPath:entry.join_path,branding,rule,controllerName:tenant?.legal_name??null,privacyContact:brandingRow?.privacyEmail??null};
+    }catch(e){try{await db.query('rollback');}catch{}throw e;}finally{db.release();}
+  }
   async stamp(tenantId:string,cardId:string,quantity:number,employeeMembershipId:string,idempotencyKey:string|null):Promise<StampResult>{if(!Number.isInteger(quantity)||quantity<1||quantity>10)throw new Error('INVALID_STAMP_QUANTITY');return this.transaction(tenantId,async db=>{
     // Idempotency replay runs only when the client supplied a key. The replay
     // returns the same minimized shape as a normal stamp — never the raw
@@ -124,7 +170,21 @@ export class CardRepository {
     return {card:{id:updated.id,stampCount:updated.stampCount,revision:updated.revision},...(reward?{reward}:{}),...(idempotencyKey?{idempotencyKey}:{})};});}
   /** Replay of an already-applied stamp: minimized current state, never the raw event row. */
   private async replayStampResult(db:TxClient,tenantId:string,cardId:string,idempotencyKey:string):Promise<StampResult>{const card=(await db.query<CardView>('select id,stamp_count as "stampCount",revision from cards where tenant_id=$1 and id=$2',[tenantId,cardId])).rows[0];if(!card)throw new Error('CARD_NOT_FOUND');const reward=(await db.query<RewardView>("select id,status from rewards where tenant_id=$1 and card_id=$2 and status='issued'",[tenantId,cardId])).rows[0];return {card,...(reward?{reward}:{}),idempotencyKey};}
-  async redeem(tenantId:string,rewardId:string):Promise<RedeemResult>{return this.transaction(tenantId,async db=>{const r=(await db.query<{id:string;status:'issued'|'redeemed'}>("update rewards set status='redeemed',redeemed_at=now() where tenant_id=$1 and id=$2 and status='issued' returning id,status",[tenantId,rewardId])).rows[0];if(!r){const exists=await db.query<{id:string;status:string}>('select id,status from rewards where tenant_id=$1 and id=$2',[tenantId,rewardId]);if(exists.rows[0]?.status==='redeemed')throw new Error('REWARD_ALREADY_REDEEMED');throw new Error('REWARD_NOT_FOUND');}return {rewardId:r.id,status:r.status};});}
+  /**
+   * Redeem an issued reward. Owner decision (2026-09-13): a successful
+   * redemption starts a NEW collection round — the card's stamp counter is
+   * reset to 0 (revision bumped, mirroring stamp()) so the next reward only
+   * appears after `stampsRequired` FRESH stamps. Without the reset a card at
+   * 14/11 would keep satisfying `stampCount >= stampsRequired` after redeeming
+   * and every further stamp would mint another instantly-redeemable reward
+   * (the endless-rewards bug). The reset runs in the same tenant transaction
+   * and RLS context (app.tenant_id) as the rewards update; the reward's
+   * card_id belongs to this tenant, so the cards row is visible and updatable
+   * under the tenant_isolation policy. The 409 behavior for an already
+   * redeemed reward id (REWARD_ALREADY_REDEEMED) is unchanged and never
+   * touches the card.
+   */
+  async redeem(tenantId:string,rewardId:string):Promise<RedeemResult>{return this.transaction(tenantId,async db=>{const r=(await db.query<{id:string;status:'issued'|'redeemed';card_id:string}>("update rewards set status='redeemed',redeemed_at=now() where tenant_id=$1 and id=$2 and status='issued' returning id,status,card_id",[tenantId,rewardId])).rows[0];if(!r){const exists=await db.query<{id:string;status:string}>('select id,status from rewards where tenant_id=$1 and id=$2',[tenantId,rewardId]);if(exists.rows[0]?.status==='redeemed')throw new Error('REWARD_ALREADY_REDEEMED');throw new Error('REWARD_NOT_FOUND');}await db.query('update cards set stamp_count=0,revision=revision+1,updated_at=now() where tenant_id=$1 and id=$2',[tenantId,r.card_id]);return {rewardId:r.id,status:r.status};});}
   /** Revoke all of a user's sessions (login bootstrap). Runs under app.user_id RLS context. */
   async revokeSessions(userId:string,exceptHash?:string){return this.userTransaction(userId,async db=>{await db.query('update sessions set revoked_at=now() where user_id=$1 and revoked_at is null and ($2 is null or token_hash<>$2)',[userId,exceptHash??null]);})}
   /** Revoke one session by token hash (logout/rotation). Runs under app.user_id RLS context. */

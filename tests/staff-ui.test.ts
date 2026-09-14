@@ -441,8 +441,13 @@ test('POST staff stamp without a card id is rejected with CARD_FIELDS_REQUIRED',
 test('POST staff redeem issues the redemption and rotates the session', async () => {
   const pool = new FakePool([
     ...sessionHandlers(validSession),
-    { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed' }] },
-    ...dashboardHandlers({ rewards: [{ id: REWARD, cardId: CARD, status: 'redeemed' }] }),
+    { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed', card_id: CARD }] },
+    { match: contains('update cards set stamp_count=0'), rows: [] },
+    // Post-redeem dashboard: the card counter is back to 0 (new collection round).
+    ...dashboardHandlers({
+      rewards: [{ id: REWARD, cardId: CARD, status: 'redeemed' }],
+      cards: [{ id: CARD, customerRef: 'Kunde-42', stampCount: 0, updatedAt: '2026-08-26T10:00:00.000Z' }],
+    }),
   ]);
   await runWith(pool, async () => {
     const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/redeem`, {
@@ -456,6 +461,11 @@ test('POST staff redeem issues the redemption and rotates the session', async ()
     expect(res.headers.get('set-cookie')).toContain('__Host-sp_session=');
     expect(res.headers.get('x-csrf-token')).toMatch(/^[0-9a-f]{64}$/);
     expect(html).toContain('badge redeemed');
+    // Owner fix 2026-09-13: redemption resets the counter — the dashboard shows
+    // 0 / 5 instead of 5 / 5, so the next reward needs five fresh stamps.
+    expect(html).toContain('0 / 5');
+    const reset = pool.queries.find(q => q.sql.includes('update cards set stamp_count=0'));
+    expect(reset?.params).toEqual([TENANT, CARD]);
   });
 });
 
@@ -533,7 +543,8 @@ test('POST staff stamp: urlencoded form body still stamps when req.formData()/re
 test('POST staff redeem: urlencoded form body redeems, double redemption stays 409 when req.formData()/req.text() are broken (Vercel regression)', async () => {
   const successPool = new FakePool([
     ...sessionHandlers(validSession),
-    { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed' }] },
+    { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed', card_id: CARD }] },
+    { match: contains('update cards set stamp_count=0'), rows: [] },
     ...dashboardHandlers({ rewards: [{ id: REWARD, cardId: CARD, status: 'redeemed' }] }),
   ]);
   await runWith(successPool, async () => {
@@ -642,8 +653,12 @@ test('POST staff stamp with the UI JSON payload (raw card token) resolves via to
 test('POST staff redeem with the UI JSON payload issues the redemption and rotates the session', async () => {
   const pool = new FakePool([
     ...sessionHandlers(validSession),
-    { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed' }] },
-    ...dashboardHandlers({ rewards: [{ id: REWARD, cardId: CARD, status: 'redeemed' }] }),
+    { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed', card_id: CARD }] },
+    { match: contains('update cards set stamp_count=0'), rows: [] },
+    ...dashboardHandlers({
+      rewards: [{ id: REWARD, cardId: CARD, status: 'redeemed' }],
+      cards: [{ id: CARD, customerRef: 'Kunde-42', stampCount: 0, updatedAt: '2026-08-26T10:00:00.000Z' }],
+    }),
   ]);
   await runWith(pool, async () => {
     const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/redeem`, {
@@ -652,8 +667,13 @@ test('POST staff redeem with the UI JSON payload issues the redemption and rotat
       body: JSON.stringify({ rewardId: REWARD }),
     }));
     expect(res.status).toBe(200);
-    expect(await res.text()).toContain('Prämie erfolgreich eingelöst.');
+    const html = await res.text();
+    expect(html).toContain('Prämie erfolgreich eingelöst.');
     expect(res.headers.get('x-csrf-token')).toMatch(/^[0-9a-f]{64}$/);
+    // Owner fix 2026-09-13: the redeemed card renders 0 / 5 (new round).
+    expect(html).toContain('0 / 5');
+    const reset = pool.queries.find(q => q.sql.includes('update cards set stamp_count=0'));
+    expect(reset?.params).toEqual([TENANT, CARD]);
   });
 });
 

@@ -83,3 +83,95 @@ test('migration 008 defines the minimal resolver contract (DB-free pin)', async 
   expect(m008).toMatch(/revoke all on function public\.resolve_entry_point\(text\) from public/);
   expect(m008).toMatch(/grant execute on function public\.resolve_entry_point\(text\) to app_role/);
 });
+
+// ---------------------------------------------------------------------------
+// joinContext (GET /join/:publicKey customer page) — same RLS-safe resolver,
+// then a tenant-scoped read of branding/rule/controller for the join page
+// (owner fix 2026-09-13: the join route renders branded HTML, no raw JSON).
+// ---------------------------------------------------------------------------
+test('joinContext resolves the entry point, sets tenant context, then reads branding/rule/controller', async () => {
+  const pool = new FakePool([
+    [], // begin
+    [{ tenant_id: TENANT, join_path: `/join/${PUBLIC_KEY}` }], // resolve_entry_point
+    [], // set_config app.tenant_id
+    [{ cardTitle: 'Café', cardText: 'Treuekarte', primaryColor: '#123456', secondaryColor: '#ffffff', privacyEmail: 'ds@beispiel.de', version: 1 }], // tenant_branding
+    [{ legal_name: 'Beispiel GmbH' }], // tenants
+    [{ id: 'rule-1', tenantId: TENANT, name: 'R', stampsRequired: 8, rewardTitle: 'Kaffee', rewardDescription: 'Gratis', active: true, version: 1 }], // stamp_rules
+    [], // commit
+  ]);
+  const repo = new CardRepository(pool);
+  const ctx = await repo.joinContext(PUBLIC_KEY);
+  expect(ctx).not.toBeNull();
+  expect(ctx?.tenantId).toBe(TENANT);
+  expect(ctx?.joinPath).toBe(`/join/${PUBLIC_KEY}`);
+  expect(ctx?.branding?.cardTitle).toBe('Café');
+  // The privacy email never leaks into the branding object — it is surfaced
+  // only as the separate allowlisted privacyContact field.
+  expect(ctx?.branding).not.toHaveProperty('privacyContact');
+  expect(ctx?.rule?.stampsRequired).toBe(8);
+  expect(ctx?.controllerName).toBe('Beispiel GmbH');
+  expect(ctx?.privacyContact).toBe('ds@beispiel.de');
+  const sqls = pool.queries.map(q => q.sql);
+  const resolverIdx = sqls.findIndex(s => s.includes('resolve_entry_point'));
+  const ctxIdx = sqls.findIndex(s => s.includes("set_config('app.tenant_id'"));
+  const brandingIdx = sqls.findIndex(s => s.includes('from tenant_branding'));
+  const ruleIdx = sqls.findIndex(s => s.includes('from stamp_rules'));
+  const commitIdx = sqls.findIndex(s => s === 'commit');
+  expect(ctxIdx).toBeGreaterThan(resolverIdx);
+  expect(brandingIdx).toBeGreaterThan(ctxIdx);
+  expect(ruleIdx).toBeGreaterThan(brandingIdx);
+  expect(commitIdx).toBeGreaterThan(ruleIdx);
+  // RLS-safe: never a direct tenant_entry_points table read.
+  expect(sqls.some(s => s.includes('from tenant_entry_points'))).toBe(false);
+  // Minimized view model: no public_key, no cards/customers/rewards rows.
+  expect(JSON.stringify(ctx)).not.toContain('public_key');
+  expect(JSON.stringify(ctx)).not.toContain('publicKey');
+  expect(JSON.stringify(ctx)).not.toContain('customers');
+});
+
+test('joinContext aliases branding/rule columns snake_case→camelCase (no select *)', async () => {
+  const pool = new FakePool([
+    [], // begin
+    [{ tenant_id: TENANT, join_path: `/join/${PUBLIC_KEY}` }],
+    [], // set_config
+    [{ cardTitle: 'Café', cardText: '', primaryColor: '#123456', secondaryColor: '#ffffff', privacyEmail: null, version: 1 }],
+    [{ legal_name: null }],
+    [{ id: 'rule-1', tenantId: TENANT, name: 'R', stampsRequired: 8, rewardTitle: 'K', rewardDescription: '', active: true, version: 1 }],
+    [], // commit
+  ]);
+  const repo = new CardRepository(pool);
+  const ctx = await repo.joinContext(PUBLIC_KEY);
+  expect(ctx?.branding?.cardTitle).toBe('Café');
+  expect(ctx?.controllerName).toBeNull();
+  expect(ctx?.privacyContact).toBeNull();
+  const brandingSql = pool.queries.find(q => q.sql.includes('from tenant_branding'));
+  expect(brandingSql?.sql).toContain('card_title as "cardTitle"');
+  expect(brandingSql?.sql).toContain('privacy_email as "privacyEmail"');
+  expect(brandingSql?.sql).not.toMatch(/select \*/i);
+  const ruleSql = pool.queries.find(q => q.sql.includes('from stamp_rules'));
+  expect(ruleSql?.sql).toContain('stamps_required as "stampsRequired"');
+  expect(ruleSql?.sql).not.toMatch(/select \*/i);
+});
+
+test('joinContext returns null for an unknown key without setting tenant context or reading branding', async () => {
+  const pool = new FakePool([
+    [], // begin
+    [], // resolve_entry_point -> no row
+    [], // rollback
+  ]);
+  const repo = new CardRepository(pool);
+  expect(await repo.joinContext('b'.repeat(32))).toBeNull();
+  expect(pool.queries.some(q => q.sql === 'rollback')).toBe(true);
+  expect(pool.queries.some(q => q.sql.includes("set_config('app.tenant_id'"))).toBe(false);
+  expect(pool.queries.some(q => q.sql.includes('from tenant_branding'))).toBe(false);
+  expect(pool.queries.length).toBe(3);
+});
+
+test('joinContext rejects malformed keys before any database interaction', async () => {
+  const pool = new FakePool([]);
+  const repo = new CardRepository(pool);
+  for (const bad of ['', 'short', 'a'.repeat(31), 'a'.repeat(33), 'g'.repeat(32), 'a'.repeat(32).toUpperCase() + '!']) {
+    expect(await repo.joinContext(bad)).toBeNull();
+  }
+  expect(pool.queries.length).toBe(0); // format guard: no DB query at all
+});
