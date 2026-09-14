@@ -10,7 +10,7 @@
  * event delegation on `document`, so swapping #sp-app content keeps the page
  * interactive without re-binding listeners.
  */
-import type { StaffDashboardCard, StaffDashboardEvent } from './repository.js';
+import type { StaffDashboardCard, StaffDashboardEvent, StaffStats } from './repository.js';
 import { DEFAULT_PRIMARY_CARD_COLOR, DEFAULT_SECONDARY_CARD_COLOR, safeCardColor } from './public-card.js';
 
 /** HTML-escape a dynamic value (same character set as the public webcard). */
@@ -49,6 +49,10 @@ code{font-size:.8rem;background:#f1f5f9;padding:.1rem .35rem;border-radius:.3rem
 .hint{font-size:.85rem;color:#64748b;margin-top:.35rem}
 .row{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center}
 .spacer{flex:1}
+.kpis{display:flex;flex-wrap:wrap;gap:.75rem;margin:.5rem 0 .25rem}
+.kpi{flex:1 1 7.5rem;min-width:7.5rem;background:#f1f5f9;border-radius:.75rem;padding:.55rem .8rem}
+.kpi .v{font-size:1.3rem;font-weight:700;color:#172033;line-height:1.2}
+.kpi .l{font-size:.72rem;color:#64748b;text-transform:uppercase;letter-spacing:.03em;margin-top:.15rem}
 @media(max-width:640px){body{padding:1rem}.card{padding:1.2rem;border-radius:1rem}}
 `.trim();
 
@@ -263,9 +267,22 @@ export interface DashboardView {
   csrf: string;
   cards: StaffDashboardCard[];
   events: StaffDashboardEvent[];
+  /** Tenant-scoped statistics (aggregates only — no PII). */
+  stats: StaffStats;
 }
 
 const PLAN_LABEL: Record<string, string> = { up_to_500: 'Bis 500 Kunden', up_to_1000: 'Bis 1.000 Kunden' };
+
+/** One-decimal German number (comma) for averages/percentages. */
+function fmtOne(v: number): string { return v.toFixed(1).replace('.', ','); }
+
+/** Trend label: signed percent with one decimal; em dash when the previous
+ *  30-day period has no data (trendDeltaPct === null). */
+function trendLabel(delta: number | null): string {
+  if (delta === null) return '—';
+  const sign = delta > 0 ? '+' : delta < 0 ? '-' : '';
+  return `${sign}${fmtOne(Math.abs(delta))} %`;
+}
 
 /** GET /staff/:tenantId — dashboard. `csrf` must be the current session's
  *  stored CSRF hash (the exact value the client submits in x-csrf-token). */
@@ -280,6 +297,24 @@ export function dashboardPage(v: DashboardView, flash?: { kind: 'ok' | 'error'; 
   const joinHtml = v.joinPath
     ? `<p><a href="${esc(v.joinPath)}">Kunden-Join-Link öffnen</a> <span class="hint">(${esc(v.joinPath)})</span></p>`
     : '<p class="meta">Noch kein Join-Link eingerichtet.</p>';
+  const s = v.stats;
+  const kpiBoxes = [
+    { label: 'Aktive Karten', value: String(s.activeCards) },
+    { label: 'Eingelöste Prämien', value: String(s.redeemedRewards) },
+    { label: 'Ø Stempelstand', value: fmtOne(s.avgStampCount) },
+    { label: 'Neue Karten (30 Tage)', value: String(s.newCardsLast30d) },
+  ].map(k => `<div class="kpi"><div class="v">${esc(k.value)}</div><div class="l">${esc(k.label)}</div></div>`).join('');
+  const statRows = [
+    ['Stempelaktivität (letzte 30 Tage)', String(s.stampsLast30d)],
+    ['Stempelaktivität (30 Tage davor)', String(s.stampsPrev30d)],
+    ['Trend', trendLabel(s.trendDeltaPct)],
+    ['Prämien bereit zur Einlösung', String(s.readyRewards)],
+    ['Kurz vor der Prämie', String(s.nearReward)],
+  ].map(r => `<tr><td>${esc(r[0])}</td><td><strong>${esc(r[1])}</strong></td></tr>`).join('');
+  const statsHtml = `<h2>Statistik</h2>
+<div class="kpis">${kpiBoxes}</div>
+<table><thead><tr><th>Kennzahl</th><th>Wert</th></tr></thead><tbody>${statRows}</tbody></table>
+<p class="hint">Stempelaktivität als Verkaufsindikator.</p>`;
   const cardRows = v.cards.length
     ? v.cards.map(c => {
         const progress = Math.min(100, Math.round((c.stampCount / Math.max(1, Number(v.stampsRequired ?? 1))) * 100));
@@ -312,6 +347,7 @@ ${flashHtml}<p id="sp-errbox" class="flash error" style="display:none" role="ale
 <div class="row"><h1 style="margin:0">${esc(tenantName)}</h1><span class="spacer"></span><button type="button" class="ghost" data-action="logout" data-url="/staff/${esc(v.tenantId)}/logout">Abmelden</button></div>${v.cardText ? `<p class="meta">${esc(v.cardText)}</p>` : ""}
 <p class="meta">Tarif: ${esc(PLAN_LABEL[v.planCode] ?? v.planCode)} · ${esc(v.usedCards)} von ${esc(v.customerLimit)} Kunden belegt · Rolle: ${esc(v.role)}</p>
 <h2>Stempelregel &amp; Prämie</h2>${rewardHtml}
+${statsHtml}
 <h2>Links für die Demo</h2>${joinHtml}<p class="hint">Kunden-Webkarte: <code>/card/${esc(v.tenantId)}/{Karten-Token}</code> — der Karten-Token wird bei der Kartenerstellung einmalig ausgegeben und ist nur dem Kunden/Personal bekannt.</p>
 <h2>Karten</h2>
 <table><thead><tr><th>Karte / Kunde</th><th>Stempel</th><th>Fortschritt</th><th>Prämie</th><th>Aktion</th></tr></thead><tbody>${cardRows}</tbody></table>${stampForm}

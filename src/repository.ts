@@ -56,6 +56,34 @@ export interface StaffDashboardData {
   cards: StaffDashboardCard[];
   events: StaffDashboardEvent[];
 }
+/**
+ * Staff-dashboard statistics (server-rendered HTML only). Pure tenant-scoped
+ * aggregates — never a row of any kind, so the shape carries no customer/card/
+ * token/reward internals and no PII: only counts, sums, averages and one
+ * percentage. `trendDeltaPct` is the percent change of stamp activity (last 30
+ * days vs the 30 days before, rounded to one decimal) and is null when the
+ * previous period has no data (division by zero is not representable).
+ */
+export interface StaffStats {
+  /** cards with status='active' and deleted_at is null. */
+  activeCards: number;
+  /** rewards with status='redeemed' (all time). */
+  redeemedRewards: number;
+  /** sum(stamp_events.quantity) in the last 30 days (sales-indicator window). */
+  stampsLast30d: number;
+  /** sum(stamp_events.quantity) in the 30 days before that. */
+  stampsPrev30d: number;
+  /** Percent change stampsLast30d vs stampsPrev30d; null when prev30d is 0. */
+  trendDeltaPct: number | null;
+  /** Active cards created within the last 30 days. */
+  newCardsLast30d: number;
+  /** Average stamp_count across active cards, rounded to 1 decimal. */
+  avgStampCount: number;
+  /** Active cards at/above their rule's stamps_required with an open (issued) reward. */
+  readyRewards: number;
+  /** Active cards in the last quarter before the threshold (>= 0.75*required, below it). */
+  nearReward: number;
+}
 
 export interface DbClient { query<T = unknown>(sql: string, params?: unknown[]): Promise<{ rows: T[] }> }
 export interface TxClient extends DbClient { release(): void }
@@ -258,6 +286,43 @@ export class CardRepository {
     for(const r of rewards) lastReward.set(r.cardId,{id:r.id,status:r.status});
     const viewCards=cards.map(c=>{const rw=lastReward.get(c.id);return {...c,rewardId:rw?.id??null,rewardStatus:rw?.status??null};});
     return {tenant:{id:t.id,legalName:t.legalName,planCode:t.planCode,customerLimit:t.customerLimit,usedCards:Number(used.n??0)},branding:b,rule,joinPath:entry?.joinPath??null,cards:viewCards,events};
+  }); }
+
+  /**
+   * Staff-dashboard statistics — pure tenant-scoped aggregates in ONE tenant
+   * transaction (muster like staffDashboard/joinContext: begin →
+   * set_config('app.tenant_id') → reads → commit), so every row observed is
+   * covered by the tenant_isolation RLS policy of the calling tenant. No PII:
+   * only counts, sums, one average and one percentage. The 30-day windows use
+   * the transaction's stable now(); `avg(stamp_count)` over active cards is
+   * rounded to 1 decimal in JS; the trend delta is null (never a division by
+   * zero) when the previous period has no data. Empty/no-data tenants return
+   * zeros instead of errors.
+   */
+  async staffStats(tenantId:string):Promise<StaffStats> { return this.transaction(tenantId, async db => {
+    const active=(await db.query<{n:string}>('select count(*) as n from cards c where c.tenant_id=$1 and c.status=$2 and c.deleted_at is null',[tenantId,'active'])).rows[0];
+    const redeemed=(await db.query<{n:string}>('select count(*) as n from rewards where tenant_id=$1 and status=$2',[tenantId,'redeemed'])).rows[0];
+    const trend=(await db.query<{last30:string;prev30:string}>(`select coalesce(sum(quantity) filter (where created_at >= now() - interval '30 days'),0) as last30, coalesce(sum(quantity) filter (where created_at >= now() - interval '60 days' and created_at < now() - interval '30 days'),0) as prev30 from stamp_events e where e.tenant_id=$1`,[tenantId])).rows[0];
+    const fresh=(await db.query<{n:string}>(`select count(*) as n from cards c where c.tenant_id=$1 and c.status=$2 and c.deleted_at is null and c.created_at >= now() - interval '30 days'`,[tenantId,'active'])).rows[0];
+    const avg=(await db.query<{avg:string|null}>('select avg(c.stamp_count) as avg from cards c where c.tenant_id=$1 and c.status=$2 and c.deleted_at is null',[tenantId,'active'])).rows[0];
+    // Per-card rules: a card's progress band is defined by ITS stamp rule
+    // (rule_id), not the tenant's currently active rule — defunct/inactive
+    // rules keep their cards' thresholds valid.
+    const ready=(await db.query<{n:string}>('select count(*) as n from cards c join stamp_rules r on r.id = c.rule_id where c.tenant_id=$1 and c.status=$2 and c.deleted_at is null and c.stamp_count >= r.stamps_required and exists (select w.id from rewards w where w.tenant_id = c.tenant_id and w.card_id = c.id and w.status=$3)',[tenantId,'active','issued'])).rows[0];
+    const near=(await db.query<{n:string}>('select count(*) as n from cards c join stamp_rules r on r.id = c.rule_id where c.tenant_id=$1 and c.status=$2 and c.deleted_at is null and c.stamp_count >= 0.75 * r.stamps_required and c.stamp_count < r.stamps_required',[tenantId,'active'])).rows[0];
+    const last30=Number(trend?.last30??0);
+    const prev30=Number(trend?.prev30??0);
+    return {
+      activeCards:Number(active?.n??0),
+      redeemedRewards:Number(redeemed?.n??0),
+      stampsLast30d:last30,
+      stampsPrev30d:prev30,
+      trendDeltaPct:prev30>0?Math.round(((last30-prev30)/prev30)*1000)/10:null,
+      newCardsLast30d:Number(fresh?.n??0),
+      avgStampCount:avg?.avg==null?0:Math.round(Number(avg.avg)*10)/10,
+      readyRewards:Number(ready?.n??0),
+      nearReward:Number(near?.n??0),
+    };
   }); }
 }
 export interface AuditEvent { tenantId?:string;actorUserId?:string;action:string;entityType:string;entityId?:string;metadata?:Record<string,unknown> }

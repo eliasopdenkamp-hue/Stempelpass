@@ -1,7 +1,7 @@
 import { assertTenant, canStamp, hashToken } from './domain.js';
 import { cardResolveLimiter, clientIpKey, csrfValid, joinResolveKey, loginAccountKey, loginAccountLimiter, loginFailureReason, loginIpLimiter, stampLimiter, verifyPassword, verifyPasswordAgainstDummy, randomToken, hashSessionToken } from './security.js';
 import { createPostgresPool, runMigrations, type DbPool } from './db.js';
-import { CardRepository, type StaffDashboardData } from './repository.js';
+import { CardRepository, type StaffDashboardData, type StaffStats } from './repository.js';
 import { configurationStatus } from './config.js';
 import { EncryptedMfaSecretStore, verifyTotp } from './mfa.js';
 import { walletAdapter } from './wallet.js';
@@ -169,7 +169,7 @@ async function resolveCardId(tenantId:string,input:string):Promise<string>{
   if(!card)throw new Error('CARD_NOT_FOUND');
   return card.id;
 }
-function dashboardView(tenantId:string,role:string,dash:StaffDashboardData,csrf:string):DashboardView{
+function dashboardView(tenantId:string,role:string,dash:StaffDashboardData,stats:StaffStats,csrf:string):DashboardView{
   const branding=dash.branding;
   const rule=dash.rule;
   return {
@@ -191,6 +191,7 @@ function dashboardView(tenantId:string,role:string,dash:StaffDashboardData,csrf:
     csrf,
     cards:dash.cards,
     events:dash.events,
+    stats,
   };
 }
 /**
@@ -238,7 +239,8 @@ async function handleStaffDashboard(req:Request,tenantId:string,id:string):Promi
     const actor=await auth(req,tenantId,false);
     const dash=await repository.staffDashboard(tenantId);
     if(!dash.tenant)throw new Error('TENANT_NOT_FOUND');
-    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,actor.csrfTokenHash)));
+    const stats=await repository.staffStats(tenantId);
+    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,stats,actor.csrfTokenHash)));
   }catch(e){
     if(e instanceof Error&&e.message==='UNAUTHENTICATED')return staffRedirect('/login');
     return staffError(e,id);
@@ -258,8 +260,9 @@ async function handleStaffStamp(req:Request,tenantId:string,id:string):Promise<R
     const value=await repository.stamp(tenantId,cardId,quantity,actor.membershipId,crypto.randomUUID());
     const rotated=await rotate(actor);
     const dash=await repository.staffDashboard(tenantId);
+    const stats=await repository.staffStats(tenantId);
     const flash=`Stempel vergeben: Karte ${cardId.slice(0,8)} hat jetzt ${value.card.stampCount} Stempel.`+(value.reward?' Die Prämie ist jetzt einlösbar.':'');
-    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,rotated.header['x-csrf-token']),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
+    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,stats,rotated.header['x-csrf-token']),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
   }catch(e){return staffError(e,id);}
 }
 async function handleStaffRedeem(req:Request,tenantId:string,id:string):Promise<Response>{
@@ -273,8 +276,9 @@ async function handleStaffRedeem(req:Request,tenantId:string,id:string):Promise<
     const value=await repository.redeem(tenantId,rewardId);
     const rotated=await rotate(actor);
     const dash=await repository.staffDashboard(tenantId);
+    const stats=await repository.staffStats(tenantId);
     const flash=value.status==='redeemed'?'Prämie erfolgreich eingelöst.':'Prämie eingelöst.';
-    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,rotated.header['x-csrf-token']),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
+    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,stats,rotated.header['x-csrf-token']),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
   }catch(e){return staffError(e,id);}
 }
 async function handleStaffLogout(req:Request,tenantId:string,id:string):Promise<Response>{
