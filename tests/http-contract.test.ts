@@ -422,6 +422,11 @@ test('GET /join/:publicKey renders a branded HTML customer page, never raw JSON'
     expect(html).toContain('5 Stempel');
     expect(html).toContain('Prämie');
     expect(html).toContain('&middot; D'); // reward description
+    // The join page is cacheable public content (branded landing, no PII) —
+    // the HTML response carries a short public cache lifetime.
+    expect(res.headers.get('cache-control')).toBe('public, max-age=60');
+    // The entry path is rendered as a scannable QR image (SVG data URI).
+    expect(html).toContain('<img class="qr" src="data:image/svg+xml;utf8,');
     // Solution A instruction (no card token exists on the join link).
     expect(html).toContain('Diese Karte wird an der Kasse erstellt. Zeigen Sie diesen QR an der Kasse vor.');
     // DSGVO Art. 13 footer identical to the webcard.

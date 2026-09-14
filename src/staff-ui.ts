@@ -12,6 +12,7 @@
  */
 import type { StaffDashboardCard, StaffDashboardEvent, StaffStats } from './repository.js';
 import { DEFAULT_PRIMARY_CARD_COLOR, DEFAULT_SECONDARY_CARD_COLOR, safeCardColor } from './public-card.js';
+import { qrSvgDataUri } from './qr.js';
 
 /** HTML-escape a dynamic value (same character set as the public webcard). */
 export function esc(v: unknown): string {
@@ -44,6 +45,8 @@ code{font-size:.8rem;background:#f1f5f9;padding:.1rem .35rem;border-radius:.3rem
 .badge.issued{background:#dcfce7;color:#166534}.badge.redeemed{background:#e2e8f0;color:#475569}
 .flash{padding:.8rem 1rem;border-radius:.7rem;margin:0 0 1rem;font-weight:600}
 .flash.ok{background:#dcfce7;color:#166534}.flash.error{background:#fee2e2;color:#991b1b}
+.qr-card{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:.9rem;padding:1rem;margin:0 0 1.25rem}
+.qr-card img{border:1px solid #e2e8f0;border-radius:.75rem;background:#fff;padding:.4rem;box-sizing:content-box}
 .meta{color:#475569;font-size:.85rem}
 .error{color:#991b1b;font-weight:600}
 .hint{font-size:.85rem;color:#64748b;margin-top:.35rem}
@@ -176,6 +179,8 @@ export function staffErrorMessage(code: string): string {
     case 'CSRF_INVALID': return 'Sitzung abgelaufen. Bitte neu anmelden.';
     case 'FORBIDDEN': return 'Keine Berechtigung für diese Aktion.';
     case 'CARD_NOT_FOUND': return 'Karte nicht gefunden.';
+    case 'RULE_NOT_FOUND': return 'Keine aktive Stempelregel eingerichtet.';
+    case 'CUSTOMER_LIMIT_REACHED': return 'Kundenlimit erreicht.';
     case 'CARD_FIELDS_REQUIRED': return 'Bitte eine Karten-ID oder einen Karten-Token angeben.';
     case 'INVALID_STAMP_QUANTITY': return 'Ungültige Stempelanzahl (1–10).';
     case 'RATE_LIMITED': return 'Zu viele Anfragen. Bitte kurz warten.';
@@ -269,6 +274,13 @@ export interface DashboardView {
   events: StaffDashboardEvent[];
   /** Tenant-scoped statistics (aggregates only — no PII). */
   stats: StaffStats;
+  /**
+   * The most recently created card (anonymous, no-name flow) whose raw token
+   * could still be recovered from the encrypted idempotency store. Rendered as
+   * a QR panel (webcard URL) + link + token so staff can hand the card to the
+   * customer right at the register; null when there is nothing recoverable.
+   */
+  newCard: { id: string; url: string; token: string } | null;
 }
 
 const PLAN_LABEL: Record<string, string> = { up_to_500: 'Bis 500 Kunden', up_to_1000: 'Bis 1.000 Kunden' };
@@ -291,6 +303,16 @@ export function dashboardPage(v: DashboardView, flash?: { kind: 'ok' | 'error'; 
   const title = v.cardTitle || 'StempelPass';
   const tenantName = v.legalName || v.cardTitle || 'Unternehmen';
   const flashHtml = flash ? `<div class="flash ${esc(flash.kind)}" id="sp-flash">${esc(flash.text)}</div>` : '';
+  /**
+   * Prominent "Neue Karte" panel (only when a recoverable card token exists):
+   * scannable SVG data-URI of the webcard URL, the link + token as text, and
+   * the customer instruction. The token is a one-time value delivered to staff
+   * here (never logged); it grants read access to the customer's webcard only
+   * — never a stamping right (stamping needs an authenticated staff session).
+   */
+  const newCardHtml = v.newCard
+    ? `<div class="qr-card" id="sp-newcard"><div class="row" style="align-items:flex-start"><img src="${esc(qrSvgDataUri(v.newCard.url))}" alt="QR-Code der neuen Karte" width="176" height="176"><div style="flex:1;min-width:14rem"><h2 style="margin:.1rem 0 .4rem">Neue Karte angelegt</h2><p class="meta"><strong>Webkarten-Link:</strong> <code>${esc(v.newCard.url)}</code></p><p class="meta"><strong>Karten-Token:</strong> <code>${esc(v.newCard.token)}</code></p><p class="hint">Kunde: QR scannen → Webkarte öffnen → Zu Google Wallet hinzufügen.</p></div></div></div>`
+    : '';
   const rewardHtml = v.rewardTitle
     ? `<p><strong>Prämie:</strong> ${esc(v.rewardTitle)}${v.rewardDescription ? ` — ${esc(v.rewardDescription)}` : ''} (${esc(v.ruleName ?? 'Regel')}: ${esc(v.stampsRequired ?? '?')} Stempel)</p>`
     : '<p class="meta">Noch keine Stempelregel eingerichtet.</p>';
@@ -341,15 +363,19 @@ export function dashboardPage(v: DashboardView, flash?: { kind: 'ok' | 'error'; 
         <button type="submit" class="secondary" style="margin:0">Stempel vergeben</button>
       </form><p class="hint">Karten-ID aus der Liste kopieren oder den Token vom Kunden-Gerät/QR eingeben.</p>`
     : '<p class="meta">Diese Rolle kann keine Stempel vergeben oder Prämien einlösen.</p>';
+  const createCardButton = v.canStamp
+    ? `<button type="button" class="secondary" data-action="create-card" data-url="/staff/${esc(v.tenantId)}/cards" style="margin:1.75rem 0 .5rem">Neue Karte anlegen</button>`
+    : '';
   return page(`${title} – Personal-Bereich`,
     `<main class="card" id="sp-app" style="border-top-color:${esc(primary)}">
 ${flashHtml}<p id="sp-errbox" class="flash error" style="display:none" role="alert"></p>
+${newCardHtml}
 <div class="row"><h1 style="margin:0">${esc(tenantName)}</h1><span class="spacer"></span><button type="button" class="ghost" data-action="logout" data-url="/staff/${esc(v.tenantId)}/logout">Abmelden</button></div>${v.cardText ? `<p class="meta">${esc(v.cardText)}</p>` : ""}
 <p class="meta">Tarif: ${esc(PLAN_LABEL[v.planCode] ?? v.planCode)} · ${esc(v.usedCards)} von ${esc(v.customerLimit)} Kunden belegt · Rolle: ${esc(v.role)}</p>
 <h2>Stempelregel &amp; Prämie</h2>${rewardHtml}
 ${statsHtml}
 <h2>Links für die Demo</h2>${joinHtml}<p class="hint">Kunden-Webkarte: <code>/card/${esc(v.tenantId)}/{Karten-Token}</code> — der Karten-Token wird bei der Kartenerstellung einmalig ausgegeben und ist nur dem Kunden/Personal bekannt.</p>
-<h2>Karten</h2>
+<div class="row" style="flex-wrap:nowrap"><h2 style="flex:1">Karten</h2>${createCardButton}</div>
 <table><thead><tr><th>Karte / Kunde</th><th>Stempel</th><th>Fortschritt</th><th>Prämie</th><th>Aktion</th></tr></thead><tbody>${cardRows}</tbody></table>${stampForm}
 <h2>Letzte Stempel-Ereignisse</h2>
 <table><thead><tr><th>Karte</th><th>Kunde</th><th>Stempel</th><th>Zeitpunkt</th></tr></thead><tbody>${eventRows}</tbody></table>

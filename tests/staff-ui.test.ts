@@ -1,6 +1,7 @@
 import { test, expect } from 'bun:test';
 import { CardRepository, type DbPool, type TxClient } from '../src/repository';
 import { hashSessionToken, randomToken, stampLimiter } from '../src/security';
+import { createCipheriv, createHash, randomBytes } from 'node:crypto';
 
 /**
  * Staff web UI contract tests against the REAL fetchHandler — same DB-free
@@ -112,7 +113,7 @@ function authedHeaders(overrides: Record<string, string> = {}): Headers {
  *  re-rendered dashboard inside POST responses. The rule hander order keeps
  *  the repository.stamp() rule read (stamps_required from stamp_rules) apart
  *  from the dashboard rule read (created_at desc limit 1). */
-function dashboardHandlers(overrides: { tenant?: unknown[]; cards?: unknown[]; events?: unknown[]; rewards?: unknown[]; branding?: unknown[]; stats?: { active?: unknown[]; redeemed?: unknown[]; trend?: unknown[]; fresh?: unknown[]; avg?: unknown[]; ready?: unknown[]; near?: unknown[] } } = {}): FakeHandler[] {
+function dashboardHandlers(overrides: { tenant?: unknown[]; cards?: unknown[]; events?: unknown[]; rewards?: unknown[]; branding?: unknown[]; capacityCount?: unknown[]; stats?: { active?: unknown[]; redeemed?: unknown[]; trend?: unknown[]; fresh?: unknown[]; avg?: unknown[]; ready?: unknown[]; near?: unknown[] } } = {}): FakeHandler[] {
   return [
     { match: contains('from tenants where'), rows: overrides.tenant === undefined
       ? [{ id: TENANT, legalName: 'Beispiel GmbH', planCode: 'up_to_500', customerLimit: 500 }] : overrides.tenant },
@@ -120,7 +121,8 @@ function dashboardHandlers(overrides: { tenant?: unknown[]; cards?: unknown[]; e
       ? [{ cardTitle: 'Meine Karte', cardText: 'Sammel mit!', primaryColor: '#155e75', secondaryColor: '#f8fafc', version: 1 }] : overrides.branding },
     { match: contains('from stamp_rules'), rows: [{ id: RULE, tenantId: TENANT, name: 'Pilot-Regel', stampsRequired: 5, rewardTitle: 'Kaffee', rewardDescription: 'Ein Kaffee gratis', active: true, version: 1 }] },
     { match: contains('from tenant_entry_points'), rows: [{ joinPath: '/join/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }] },
-    { match: contains('count(distinct customer_id)'), rows: [{ n: '1' }] },
+    { match: contains('count(distinct customer_id)'), rows: overrides.capacityCount === undefined
+      ? [{ n: '1' }] : overrides.capacityCount },
     { match: contains('order by c.updated_at desc'), rows: overrides.cards === undefined
       ? [{ id: CARD, customerRef: 'Kunde-42', stampCount: 3, updatedAt: '2026-08-26T10:00:00.000Z' }] : overrides.cards },
     { match: contains('order by e.created_at desc'), rows: overrides.events === undefined
@@ -877,5 +879,222 @@ test('staff routes render internal failures as friendly HTML 500 with a request 
     expect(html).toContain('Fehlerkennung:');
     expect(html).not.toContain('postgres://');
     expect(html).not.toContain('secret');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (8) POST /staff/:tenantId/cards — "Neue Karte anlegen" (anonymous card, QR)
+// The staff action creates a card WITHOUT any customer name/account/e-mail
+// (business model: participation without Pflichtname): an anonymous customers
+// row (external_ref NULL) via createAnonymousCustomer, then the SAME
+// createCard method the tenant API uses (with a fresh idempotency key, so the
+// encrypted token lands in the migration-013 store and the newest-card QR can
+// be re-shown after a reload). The QR image + link + hint render in the
+// dashboard response; the card shows up in the table.
+// ---------------------------------------------------------------------------
+const ANON_CUSTOMER = '22222222-2222-4222-8222-222222222222';
+const NEW_CARD = '66666666-6666-4666-8666-666666666661';
+const TEST_SESSION_SECRET = 's'.repeat(64);
+/** encryptToken-compatible ciphertext for a raw token under TEST_SESSION_SECRET. */
+function encryptTokenForTest(token: string): string {
+  const key = createHash('sha256').update(TEST_SESSION_SECRET).digest();
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const body = Buffer.concat([cipher.update(token, 'utf8'), cipher.final()]);
+  return [iv, cipher.getAuthTag(), body].map(x => x.toString('base64url')).join('.');
+}
+/** Handlers for the create-card flow: session + dashboard reads + customer/card inserts. */
+function createCardFlowHandlers(overrides: { tenant?: unknown[]; rule?: unknown[]; cards?: unknown[] } = {}): FakeHandler[] {
+  return [
+    ...sessionHandlers(validSession),
+    ...dashboardHandlers(overrides),
+    { match: contains('insert into customers'), rows: [{ id: ANON_CUSTOMER }] },
+    { match: contains('from customers'), rows: [{ id: ANON_CUSTOMER }] },
+    { match: contains('insert into cards'), rows: [{ id: NEW_CARD, ruleId: RULE, stampCount: 0, revision: 1 }] },
+  ];
+}
+
+test('POST staff create-card via UI JSON payload creates an anonymous card and renders QR + link + customer hint', async () => {
+  process.env.SESSION_SECRET = TEST_SESSION_SECRET;
+  const pool = new FakePool(createCardFlowHandlers());
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/cards`, {
+      method: 'POST',
+      headers: authedHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({}),
+    }));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // Flash + QR panel: scannable SVG data-URI, the link, the token, the hint.
+    expect(html).toContain('Neue Karte angelegt');
+    expect(html).toContain('data:image/svg+xml;utf8,');
+    expect(html).toContain(`/card/${TENANT}/`);
+    expect(html).toContain('Kunde: QR scannen → Webkarte öffnen → Zu Google Wallet hinzufügen.');
+    // Session rotation: fresh cookie + fresh CSRF header + freshly embedded CSRF.
+    expect(res.headers.get('set-cookie')).toContain('__Host-sp_session=');
+    const rotatedCsrf = res.headers.get('x-csrf-token');
+    expect(rotatedCsrf).toMatch(/^[0-9a-f]{64}$/);
+    expect(rotatedCsrf).not.toBe(CSRF_VALUE);
+    expect(html).toContain(`name="sp-csrf" content="${rotatedCsrf}"`);
+    // The new card appears in the cards table (server re-renders the dashboard).
+    expect(html).toContain(NEW_CARD.slice(0, 8));
+    // Anonymous customer: external_ref stays NULL (hardcoded) — no name/account.
+    const customerInsert = pool.queries.find(q => q.sql.startsWith('insert into customers'));
+    expect(customerInsert?.sql).toContain('external_ref) values($1,null)');
+    expect(customerInsert?.params).toEqual([TENANT]);
+    // Only the SHA-256 hash reaches the cards row, never the raw token.
+    const cardInsert = pool.queries.find(q => q.sql.startsWith('insert into cards'));
+    expect(String(cardInsert!.params[3])).toMatch(/^[a-f0-9]{64}$/);
+    const token = html.match(/Karten-Token:<\/strong> <code>([^<]+)<\/code>/)?.[1];
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(String(cardInsert!.params[3])).not.toBe(token);
+    expect(JSON.stringify(pool.queries)).not.toContain(token);
+    // The same createCard method the tenant API uses (idempotency store row).
+    expect(pool.queries.some(q => q.sql.startsWith('insert into card_creation_idempotency'))).toBe(true);
+  }).finally(() => { delete process.env.SESSION_SECRET; });
+});
+
+test('POST staff create-card renders a QR for the newest card again after a reload (encrypted token store)', async () => {
+  process.env.SESSION_SECRET = TEST_SESSION_SECRET;
+  const NEW_TOKEN = 'Q'.repeat(43);
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    ...dashboardHandlers({ cards: [{ id: NEW_CARD, customerRef: null, stampCount: 0, updatedAt: '2026-09-14T10:00:00.000Z' }] }),
+    { match: contains('from card_creation_idempotency i join cards'), rows: [{ cardId: NEW_CARD, tokenCiphertext: encryptTokenForTest(NEW_TOKEN) }] },
+  ]);
+  await runWith(pool, async () => {
+    // GET dashboard -> newest-card QR panel is re-shown from the encrypted store.
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('data:image/svg+xml;utf8,');
+    expect(html).toContain(`http://test.local/card/${TENANT}/${NEW_TOKEN}`);
+    expect(html).toContain('Kunde: QR scannen → Webkarte öffnen → Zu Google Wallet hinzufügen.');
+    // The raw token never appears in any DB query param (only in the panel link).
+    expect(JSON.stringify(pool.queries)).not.toContain(NEW_TOKEN);
+  }).finally(() => { delete process.env.SESSION_SECRET; });
+});
+
+test('POST staff create-card without a CSRF token is rejected (403) and creates nothing', async () => {
+  const pool = new FakePool(createCardFlowHandlers());
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/cards`, {
+      method: 'POST',
+      headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}`, 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    }));
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain('Sitzung abgelaufen. Bitte neu anmelden.');
+    expect(pool.queries.some(q => q.sql.startsWith('insert into customers'))).toBe(false);
+    expect(pool.queries.some(q => q.sql.startsWith('insert into cards'))).toBe(false);
+  });
+});
+
+test('POST staff create-card by a viewer is rejected with FORBIDDEN', async () => {
+  const viewerRow = sessionRow({ role: 'viewer' });
+  const viewerSession: (sql: string, params: unknown[]) => unknown[] = (_s, p) => p[0] === SESSION_HASH ? [viewerRow] : [];
+  const pool = new FakePool([...sessionHandlers(viewerSession)]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/cards`, {
+      method: 'POST',
+      headers: authedHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({}),
+    }));
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain('Keine Berechtigung für diese Aktion.');
+    expect(pool.queries.some(q => q.sql.startsWith('insert into cards'))).toBe(false);
+  });
+});
+
+test('POST staff create-card with no active stamp rule answers a friendly error and creates nothing', async () => {
+  // The rule read must return NO row so the handler fails while loading the
+  // dashboard precondition (before any anonymous customer/card insert) — this
+  // handler precedes dashboardHandlers() so it wins the first-match lookup.
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('from stamp_rules'), rows: [] },
+    ...dashboardHandlers(),
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/cards`, {
+      method: 'POST',
+      headers: authedHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({}),
+    }));
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain('Keine aktive Stempelregel eingerichtet.');
+    expect(pool.queries.some(q => q.sql.startsWith('insert into customers'))).toBe(false);
+  });
+});
+
+test('POST staff create-card at the customer limit answers 409 CUSTOMER_LIMIT_REACHED', async () => {
+  process.env.SESSION_SECRET = TEST_SESSION_SECRET;
+  // The dashboard tenant row doubles as the create-flow tenant lock read: it
+  // must expose BOTH projections (customerLimit for the dashboard render,
+  // customer_limit for the raw capacity query). The same applies to the
+  // capacity count row: FakePool matches first-wins with reusable handlers,
+  // so the dashboard row (key `n`) also answers the create-flow capacity
+  // query, which reads `count`. The previously appended { count: '1' } handler
+  // never fired (shadowed by the dashboard row), left `count` undefined -> 0
+  // and the limit was never reached; exposing both keys on one row fixes the
+  // fixture precisely.
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    ...dashboardHandlers({
+      tenant: [{ id: TENANT, legalName: 'Beispiel GmbH', planCode: 'up_to_500', customerLimit: 1, customer_limit: 1 }],
+      cards: [],
+      capacityCount: [{ n: '1', count: '1' }],
+    }),
+    { match: contains('insert into customers'), rows: [{ id: ANON_CUSTOMER }] },
+    { match: contains('from customers'), rows: [{ id: ANON_CUSTOMER }] },
+    { match: contains('insert into cards'), rows: [{ id: NEW_CARD, ruleId: RULE, stampCount: 0, revision: 1 }] },
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/cards`, {
+      method: 'POST',
+      headers: authedHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({}),
+    }));
+    expect(res.status).toBe(409);
+    expect(await res.text()).toContain('Kundenlimit erreicht.');
+    expect(pool.queries.some(q => q.sql.startsWith('insert into cards'))).toBe(false);
+  }).finally(() => { delete process.env.SESSION_SECRET; });
+});
+
+// ---------------------------------------------------------------------------
+// (8b) No stamp access via card token/QR code
+// The customer QR/card token is a read-only identifier for the public webcard.
+// It grants NO stamping right: stamping requires a valid staff session + CSRF,
+// even when the card token is presented as the stamp target.
+// ---------------------------------------------------------------------------
+test('card token alone (as in the QR) grants no stamp access: staff stamp without a session is rejected', async () => {
+  stampLimiter.clear();
+  const pool = new FakePool([]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/stamp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ cardToken: CARD_TOKEN }),
+    }));
+    // No session -> unauthenticated staff error page (not a session-less stamp).
+    expect(res.status).toBe(401);
+    expect(await res.text()).toContain('Diese Seite erfordert eine Anmeldung.');
+    expect(pool.queries.some(q => q.sql.startsWith('insert into stamp_events'))).toBe(false);
+  });
+});
+
+test('public webcard for a card token is a read-only GET that never stamps', async () => {
+  const pool = new FakePool([
+    { match: contains('from cards where'), rows: [{ id: CARD, tenantId: TENANT, customerId: ANON_CUSTOMER, publicTokenHash: 'f'.repeat(64), status: 'active', stampCount: 3, revision: 2, ruleId: RULE }] },
+    { match: contains('from tenant_branding'), rows: [] },
+    { match: contains('select legal_name from tenants'), rows: [] },
+    { match: contains('from stamp_rules'), rows: [] },
+    { match: contains('from rewards'), rows: [] },
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/card/${TENANT}/${CARD_TOKEN}`));
+    expect(res.status).toBe(200);
+    // No mutating statement — the QR URL only ever reads public card data.
+    for (const q of pool.queries) expect(q.sql.trim().match(/^(insert|update|delete)\b/i)).toBeNull();
   });
 });
