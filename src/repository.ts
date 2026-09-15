@@ -9,8 +9,11 @@ export interface CardView { id: string; stampCount: number; revision: number; }
 export interface RewardView { id: string; status: 'issued' | 'redeemed'; }
 /** Strictly minimized card-creation result (client-facing projection). */
 export type CreatedCard = Pick<Card, 'id' | 'ruleId' | 'stampCount' | 'revision'>;
-/** Strictly minimized redeem result; never a full rewards row. */
-export interface RedeemResult { rewardId: string; status: 'issued' | 'redeemed'; }
+/** Strictly minimized redeem result; never a full rewards row. The reset card
+ * view ({id, stampCount: 0, revision}) is included ONLY for the caller's
+ * best-effort Google Wallet balance sync — it is projected away by
+ * toRedeemResponse() and never crosses the wire. */
+export interface RedeemResult { rewardId: string; status: 'issued' | 'redeemed'; card: CardView; }
 /**
  * Join-page view model for GET /join/:publicKey (unauthenticated customer
  * landing page, Solution A — the card itself is created by staff at the
@@ -241,7 +244,14 @@ export class CardRepository {
    * redeemed reward id (REWARD_ALREADY_REDEEMED) is unchanged and never
    * touches the card.
    */
-  async redeem(tenantId:string,rewardId:string):Promise<RedeemResult>{return this.transaction(tenantId,async db=>{const r=(await db.query<{id:string;status:'issued'|'redeemed';card_id:string}>("update rewards set status='redeemed',redeemed_at=now() where tenant_id=$1 and id=$2 and status='issued' returning id,status,card_id",[tenantId,rewardId])).rows[0];if(!r){const exists=await db.query<{id:string;status:string}>('select id,status from rewards where tenant_id=$1 and id=$2',[tenantId,rewardId]);if(exists.rows[0]?.status==='redeemed')throw new Error('REWARD_ALREADY_REDEEMED');throw new Error('REWARD_NOT_FOUND');}await db.query('update cards set stamp_count=0,revision=revision+1,updated_at=now() where tenant_id=$1 and id=$2',[tenantId,r.card_id]);return {rewardId:r.id,status:r.status};});}
+  async redeem(tenantId:string,rewardId:string):Promise<RedeemResult>{return this.transaction(tenantId,async db=>{const r=(await db.query<{id:string;status:'issued'|'redeemed';card_id:string}>("update rewards set status='redeemed',redeemed_at=now() where tenant_id=$1 and id=$2 and status='issued' returning id,status,card_id",[tenantId,rewardId])).rows[0];if(!r){const exists=await db.query<{id:string;status:string}>('select id,status from rewards where tenant_id=$1 and id=$2',[tenantId,rewardId]);if(exists.rows[0]?.status==='redeemed')throw new Error('REWARD_ALREADY_REDEEMED');throw new Error('REWARD_NOT_FOUND');}const reset=(await db.query<CardView>('update cards set stamp_count=0,revision=revision+1,updated_at=now() where tenant_id=$1 and id=$2 returning id, stamp_count as "stampCount", revision',[tenantId,r.card_id])).rows[0];return {rewardId:r.id,status:r.status,card:reset??{id:r.card_id,stampCount:0,revision:0}};});}
+  /**
+   * Minimal branding + stamp-rule context for the best-effort Google Wallet
+   * balance sync after stamp/redeem (the wallet PATCH needs the card title and
+   * the rule text). Never a customers/cards row beyond the rule id lookup, and
+   * never a full tenant row.
+   */
+  async cardWalletContext(tenantId:string,cardId:string):Promise<{branding:Branding|null;rule:{stampsRequired:number;rewardTitle:string}|null}>{return this.transaction(tenantId,async db=>{const c=(await db.query<{ruleId:string}>('select rule_id as "ruleId" from cards where tenant_id=$1 and id=$2 and deleted_at is null',[tenantId,cardId])).rows[0];if(!c)return {branding:null,rule:null};const brandingRow=(await db.query<{cardTitle:string;cardText:string;primaryColor:string;secondaryColor:string;version:number}>('select card_title as "cardTitle",card_text as "cardText",primary_color as "primaryColor",secondary_color as "secondaryColor",version from tenant_branding where tenant_id=$1',[tenantId])).rows[0]??null;const branding:Branding|null=brandingRow?{cardTitle:brandingRow.cardTitle,cardText:brandingRow.cardText,primaryColor:brandingRow.primaryColor,secondaryColor:brandingRow.secondaryColor,version:brandingRow.version}:null;const rule=(await db.query<{stampsRequired:number;rewardTitle:string}>('select stamps_required as "stampsRequired",reward_title as "rewardTitle" from stamp_rules where id=$1 and tenant_id=$2',[c.ruleId,tenantId])).rows[0]??null;return {branding,rule};});}
   /** Revoke all of a user's sessions (login bootstrap). Runs under app.user_id RLS context. */
   async revokeSessions(userId:string,exceptHash?:string){return this.userTransaction(userId,async db=>{await db.query('update sessions set revoked_at=now() where user_id=$1 and revoked_at is null and ($2 is null or token_hash<>$2)',[userId,exceptHash??null]);})}
   /** Revoke one session by token hash (logout/rotation). Runs under app.user_id RLS context. */

@@ -37,7 +37,7 @@ export function toCreateCardResponse(card: CreatedCard, cardToken: string): Crea
 
 /** POST .../rewards/:rewardId/redeem — never a full rewards row. */
 export interface RedeemResponse { rewardId: string; status: 'issued' | 'redeemed'; }
-export function toRedeemResponse(result: RedeemResult): RedeemResponse { return result; }
+export function toRedeemResponse(result: RedeemResult): RedeemResponse { return { rewardId: result.rewardId, status: result.status }; }
 
 /** POST /api/auth/login */
 export interface LoginResponse { csrfToken: string; mfaRequired: boolean; }

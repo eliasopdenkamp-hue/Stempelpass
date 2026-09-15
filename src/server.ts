@@ -118,6 +118,31 @@ function error(e:unknown,id:string){const {code,status,detail}=classifyError(e);
 function cookie(req:Request,name:string){return req.headers.get('cookie')?.split(';').map(x=>x.trim()).find(x=>x.startsWith(`${name}=`))?.slice(name.length+1)}
 async function auth(req:Request,tenantId:string,mutating=true){if(!pool||!repository)throw new Error('DATABASE_REQUIRED');const token=cookie(req,'__Host-sp_session');if(!token)throw new Error('UNAUTHENTICATED');const db=await pool.connect();try{await db.query('begin');await db.query("select set_config('app.tenant_id', $1, true)",[tenantId]);const resolved=await db.query<{user_id:string}>('select user_id from public.resolve_session_user($1)',[hashSessionToken(token)]);if(!resolved.rows[0]?.user_id)throw new Error('UNAUTHENTICATED');await db.query("select set_config('app.user_id', $1, true)",[resolved.rows[0].user_id]);const rows=await db.query<{id:string,user_id:string,csrf_token_hash:string,tenant_id:string,role:string;membership_id:string;mfa_required:boolean;mfa_verified:boolean}>('select s.id,s.user_id,s.csrf_token_hash,s.mfa_verified,m.id as membership_id,m.tenant_id,m.role,(u.mfa_required or m.mfa_required) as mfa_required from sessions s join users u on u.id=s.user_id join tenant_memberships m on m.user_id=s.user_id and m.status=$2 where s.token_hash=$1 and s.revoked_at is null and s.expires_at>now() and m.tenant_id=$3 and u.status=$4',[hashSessionToken(token),'active',tenantId,'active']);const s=rows.rows[0];if(!s)throw new Error('UNAUTHENTICATED');if(s.mfa_required&&!s.mfa_verified)throw new Error('MFA_REQUIRED');if(mutating&&!csrfValid(req,s.csrf_token_hash))throw new Error('CSRF_INVALID');assertTenant(tenantId,s.tenant_id);const actor={userId:s.user_id,role:s.role as any,sessionId:s.id,membershipId:s.membership_id,token,mfaVerified:s.mfa_verified,csrfTokenHash:s.csrf_token_hash};await db.query('commit');return actor;}catch(e){try{await db.query('rollback');}catch{}throw e;}finally{db.release();}}
 async function rotate(a:{userId:string;token:string;mfaVerified:boolean}){if(!pool||!repository)throw new Error('DATABASE_REQUIRED');const db=await pool.connect();try{await db.query('begin');await db.query("select set_config('app.user_id', $1, true)",[a.userId]);await db.query('update sessions set revoked_at=now() where token_hash=$1',[hashSessionToken(a.token)]);const raw=randomToken(),csrf=randomToken();await db.query("insert into sessions(user_id,token_hash,csrf_token_hash,mfa_verified,expires_at) values($1,$2,$3,$4,now()+interval '12 hours')",[a.userId,hashSessionToken(raw),hashSessionToken(csrf),a.mfaVerified]);await db.query('commit');return {csrf,header:{'Set-Cookie':sessionCookie(raw, 43200),'x-csrf-token':hashSessionToken(csrf)}}}catch(e){try{await db.query('rollback');}catch{}throw e;}finally{db.release();}}
+/**
+ * Best-effort Google Wallet balance sync after a committed stamp/redeem.
+ *
+ * There is deliberately NO wallet-artifact column on cards: the only truth
+ * about "was this card saved to Google Wallet" lives at Google (the
+ * loyaltyObject id is deterministic: `{issuerId}.{cardId}`). A PATCH against
+ * a never-saved object returns 404, which refresh() treats as a graceful
+ * no-op, so calling refresh for every stamp/redeem is safe and idempotent.
+ * A failing sync must NEVER fail the already-committed stamp/redeem request:
+ * all errors are logged and suppressed. Logs carry only the error code
+ * (mirroring revoke()), never card ids or other identifiers.
+ */
+async function syncWalletBalance(tenantId:string,card:{id:string;stampCount:number},oidcToken:string|null):Promise<void>{
+  if(!repository)return;
+  try{
+    const ctx=await repository.cardWalletContext(tenantId,card.id);
+    const adapter=walletFactory('google',{oidcToken:oidcToken??undefined});
+    const result=await adapter.refresh(toWalletCardView(card),['loyaltyPoints','textModulesData'],{
+      branding:safeBranding(ctx.branding)??{cardTitle:'StempelPass',cardText:'',primaryColor:DEFAULT_PRIMARY_CARD_COLOR,secondaryColor:DEFAULT_SECONDARY_CARD_COLOR,version:1},
+      stampRequired:ctx.rule?.stampsRequired??undefined,
+      rewardTitle:ctx.rule?.rewardTitle??undefined,
+    });
+    if(result.status==='not_configured')return;
+  }catch(error){console.error(`wallet_refresh_failed code=${error instanceof Error?error.message:'GOOGLE_WALLET_REFRESH_UNAVAILABLE'}`)}
+}
 /** Strict tenant/card UUID format guard (early 404, avoids bad DB casts). */
 const UUID_RE=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const htmlResponse=(html:string,status=200,headers:HeadersInit={})=>new Response(html,{status,headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store',...headers}});
@@ -373,8 +398,8 @@ if(parts[3]==='capacity'&&req.method==='GET')return json(await repository!.capac
 if(parts[3]==='cards'&&parts.length===4&&req.method==='POST'){const body=await req.json() as {customerId?:string,ruleId?:string};if(!body.customerId||!body.ruleId)throw new Error('CARD_FIELDS_REQUIRED');const rawToken=randomToken();const idempotencyKey=req.headers.get('idempotency-key')?.trim()||undefined;const created=await repository!.createCard(tenantId,body.customerId,body.ruleId,hashToken(rawToken),idempotencyKey,rawToken);const {token, ...card}=created;return json(toCreateCardResponse(card,token ?? rawToken),201,id);}
 if(parts[3]==='cards'&&parts.length===5&&req.method==='DELETE'){if(actor.role!=='owner'&&actor.role!=='admin')throw new Error('FORBIDDEN');const value=await repository!.deleteCard(tenantId,parts[4]);return json(toDeleteResponse(value),200,id);}
 if(parts[3]==='customers'&&parts.length===5&&req.method==='DELETE'){if(actor.role!=='owner'&&actor.role!=='admin')throw new Error('FORBIDDEN');const value=await repository!.deleteCustomer(tenantId,parts[4]);return json(toDeleteResponse(value),200,id);}
-if(parts[3]==='cards'&&parts[5]==='stamps'&&req.method==='POST'){if(!canStamp(actor.role))throw new Error('FORBIDDEN');if(!stampLimiter.allow(`${tenantId}:${actor.userId}`))throw new Error('RATE_LIMITED');const body=await req.json() as {quantity?:number};const idempotencyKey=req.headers.get('idempotency-key')||null;const value=await repository!.stamp(tenantId,parts[4],body.quantity??1,actor.membershipId,idempotencyKey);const rotated=await rotate(actor);return json(toStampResponse(value),200,id,rotated.header);}
-if(parts[3]==='rewards'&&parts[5]==='redeem'&&req.method==='POST'){if(!canStamp(actor.role))throw new Error('FORBIDDEN');const value=await repository!.redeem(tenantId,parts[4]);const rotated=await rotate(actor);return json(toRedeemResponse(value),200,id,rotated.header);}
+if(parts[3]==='cards'&&parts[5]==='stamps'&&req.method==='POST'){if(!canStamp(actor.role))throw new Error('FORBIDDEN');if(!stampLimiter.allow(`${tenantId}:${actor.userId}`))throw new Error('RATE_LIMITED');const body=await req.json() as {quantity?:number};const idempotencyKey=req.headers.get('idempotency-key')||null;const value=await repository!.stamp(tenantId,parts[4],body.quantity??1,actor.membershipId,idempotencyKey);const rotated=await rotate(actor);await syncWalletBalance(tenantId,value.card,req.headers.get('x-vercel-oidc-token'));return json(toStampResponse(value),200,id,rotated.header);}
+if(parts[3]==='rewards'&&parts[5]==='redeem'&&req.method==='POST'){if(!canStamp(actor.role))throw new Error('FORBIDDEN');const value=await repository!.redeem(tenantId,parts[4]);await syncWalletBalance(tenantId,value.card,req.headers.get('x-vercel-oidc-token'));const rotated=await rotate(actor);return json(toRedeemResponse(value),200,id,rotated.header);}
 return json({error:'NOT_FOUND'},404,id);}catch(e){return error(e,id)}}
 
 /** Apply response CORS after route handling so normal and error responses share the same policy. */

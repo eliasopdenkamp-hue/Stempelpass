@@ -288,12 +288,12 @@ test('redeem returns only rewardId and status, never the full reward row', async
     [], // begin
     [], // set_config
     [{ id: 'reward-1', status: 'redeemed', card_id: CARD }], // update rewards returning
-    [], // update cards reset
+    [{ id: CARD, stampCount: 0, revision: 3 }], // update cards reset (returning the reset card)
     [], // commit
   ]);
   const repo = new CardRepository(pool);
   const result = await repo.redeem(TENANT, 'reward-1');
-  expect(result).toEqual({ rewardId: 'reward-1', status: 'redeemed' });
+  expect(result).toEqual({ rewardId: 'reward-1', status: 'redeemed', card: { id: CARD, stampCount: 0, revision: 3 } });
   expectNoInternalFields(result);
   const update = pool.queries.find(q => q.sql.startsWith('update rewards'));
   expect(update?.sql).toContain('returning id,status,card_id');
@@ -311,12 +311,12 @@ test('redeem resets the card stamp counter to 0 in the same tenant transaction',
     [], // begin
     [], // set_config app.tenant_id
     [{ id: 'reward-1', status: 'redeemed', card_id: CARD }], // update rewards returning
-    [], // update cards reset
+    [{ id: CARD, stampCount: 0, revision: 3 }], // update cards reset (returning the reset card)
     [], // commit
   ]);
   const repo = new CardRepository(pool);
   const result = await repo.redeem(TENANT, 'reward-1');
-  expect(result).toEqual({ rewardId: 'reward-1', status: 'redeemed' });
+  expect(result).toEqual({ rewardId: 'reward-1', status: 'redeemed', card: { id: CARD, stampCount: 0, revision: 3 } });
   const reset = pool.queries.find(q => q.sql.startsWith('update cards'));
   expect(reset?.sql).toContain('stamp_count=0');
   expect(reset?.sql).toContain('revision=revision+1');
@@ -368,7 +368,7 @@ test('after a redeem reset exactly stampsRequired FRESH stamps mint the next rew
     [], // begin
     [], // set_config
     [{ id: 'reward-1', status: 'redeemed', card_id: CARD }], // update rewards returning
-    [], // update cards reset
+    [{ id: CARD, stampCount: 0, revision: 3 }], // update cards reset (returning the reset card)
     [], // commit
     // stamp 1 (0 -> 1, below 5)
     [], [], // begin, set_config
