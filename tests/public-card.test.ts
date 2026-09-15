@@ -1,5 +1,6 @@
 import { test, expect } from 'bun:test';
 import { safeCardColor, safeBranding, toPublicCardResponse, toWalletCardView, joinPageHtml, DEFAULT_PRIMARY_CARD_COLOR, DEFAULT_SECONDARY_CARD_COLOR } from '../src/public-card';
+import { qrSvgDataUri } from '../src/qr';
 import type { Card } from '../src/domain';
 import type { JoinPageData } from '../src/repository';
 
@@ -61,8 +62,20 @@ test('joinPageHtml renders branding, rule and the register instruction with the 
   expect(html).toContain('<section class="privacy">');
   expect(html).toContain('Verantwortlich für die Verarbeitung: Beispiel GmbH');
   expect(html).toContain('Kontakt für Anfragen: datenschutz@beispiel.de');
+  // The entry path is a real QR image, not just a text link.
+  expect(html).toContain('<img class="qr" src="data:image/svg+xml;utf8,');
+  expect(html).toContain('QR-Code: Café-Stempelkarte öffnen');
+  // QR encodes the join path (deterministic data URI of the exact path).
+  expect(html).toContain(qrSvgDataUri('/join/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'));
   // No card token exists on the join page -> no save-to-wallet button.
   expect(html).not.toContain('Zu Google Wallet hinzufügen');
+});
+
+test('joinPageHtml QR encodes an explicit absolute target when the origin is known', () => {
+  const target = 'https://karte.beispiel.de/join/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const html = joinPageHtml(joinData(), target);
+  expect(html).toContain('<img class="qr"');
+  expect(html).toContain(qrSvgDataUri(target));
 });
 
 test('joinPageHtml escapes every dynamic value and sanitizes colors', () => {

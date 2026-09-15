@@ -169,7 +169,7 @@ async function resolveCardId(tenantId:string,input:string):Promise<string>{
   if(!card)throw new Error('CARD_NOT_FOUND');
   return card.id;
 }
-function dashboardView(tenantId:string,role:string,dash:StaffDashboardData,stats:StaffStats,csrf:string):DashboardView{
+function dashboardView(tenantId:string,role:string,dash:StaffDashboardData,stats:StaffStats,csrf:string,newCard:{id:string;url:string;token:string}|null=null):DashboardView{
   const branding=dash.branding;
   const rule=dash.rule;
   return {
@@ -192,7 +192,22 @@ function dashboardView(tenantId:string,role:string,dash:StaffDashboardData,stats
     cards:dash.cards,
     events:dash.events,
     stats,
+    newCard,
   };
+}
+/**
+ * Newest-card QR panel for the staff dashboard: only stamp-capable roles see
+ * it, only when the encrypted token is still recoverable, and only for THEIR
+ * tenant (newestCardToken runs under tenant RLS). The URL uses the request
+ * origin so the QR opens the webcard on the customer's phone; the origin is
+ * never logged and the token is delivered to staff only (never in logs).
+ */
+async function dashboardNewCard(req:Request,tenantId:string,role:string):Promise<{id:string;url:string;token:string}|null>{
+  if(!canStamp(role as any))return null;
+  const newest=await repository!.newestCardToken(tenantId);
+  if(!newest)return null;
+  const origin=new URL(req.url).origin;
+  return {id:newest.cardId,url:`${origin}/card/${tenantId}/${newest.token}`,token:newest.token};
 }
 /**
  * Tenantless /staff entry: validate the session (user-scoped RLS, same
@@ -240,7 +255,8 @@ async function handleStaffDashboard(req:Request,tenantId:string,id:string):Promi
     const dash=await repository.staffDashboard(tenantId);
     if(!dash.tenant)throw new Error('TENANT_NOT_FOUND');
     const stats=await repository.staffStats(tenantId);
-    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,stats,actor.csrfTokenHash)));
+    const newCard=await dashboardNewCard(req,tenantId,actor.role);
+    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,stats,actor.csrfTokenHash,newCard)));
   }catch(e){
     if(e instanceof Error&&e.message==='UNAUTHENTICATED')return staffRedirect('/login');
     return staffError(e,id);
@@ -261,8 +277,9 @@ async function handleStaffStamp(req:Request,tenantId:string,id:string):Promise<R
     const rotated=await rotate(actor);
     const dash=await repository.staffDashboard(tenantId);
     const stats=await repository.staffStats(tenantId);
+    const newCard=await dashboardNewCard(req,tenantId,actor.role);
     const flash=`Stempel vergeben: Karte ${cardId.slice(0,8)} hat jetzt ${value.card.stampCount} Stempel.`+(value.reward?' Die Prämie ist jetzt einlösbar.':'');
-    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,stats,rotated.header['x-csrf-token']),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
+    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,stats,rotated.header['x-csrf-token'],newCard),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
   }catch(e){return staffError(e,id);}
 }
 async function handleStaffRedeem(req:Request,tenantId:string,id:string):Promise<Response>{
@@ -277,8 +294,40 @@ async function handleStaffRedeem(req:Request,tenantId:string,id:string):Promise<
     const rotated=await rotate(actor);
     const dash=await repository.staffDashboard(tenantId);
     const stats=await repository.staffStats(tenantId);
+    const newCard=await dashboardNewCard(req,tenantId,actor.role);
     const flash=value.status==='redeemed'?'Prämie erfolgreich eingelöst.':'Prämie eingelöst.';
-    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,stats,rotated.header['x-csrf-token']),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
+    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,stats,rotated.header['x-csrf-token'],newCard),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
+  }catch(e){return staffError(e,id);}
+}
+/**
+ * Staff "Neue Karte anlegen": create an ANONYMOUS card (no customer name,
+ * account or e-mail — business model) through the exact same createCard
+ * repository path the tenant API uses, so the card gets its one-time token
+ * with the identical hash/capacity/idempotency contract. The staff session
+ * must be CSRF-valid (mutating), the role must be stamp-capable, and the
+ * tenant must have an active stamp rule (the card is bound to the rule the
+ * dashboard is showing). The response re-renders the dashboard with the QR
+ * panel for the new card.
+ */
+async function handleStaffCreateCard(req:Request,tenantId:string,id:string):Promise<Response>{
+  try{
+    if(!UUID_RE.test(tenantId))return htmlResponse(staffErrorPage(404,'TENANT_NOT_FOUND',id),404);
+    if(!pool||!repository)throw new Error('DATABASE_REQUIRED');
+    const actor=await auth(req,tenantId,true);
+    if(!canStamp(actor.role))throw new Error('FORBIDDEN');
+    const dash=await repository.staffDashboard(tenantId);
+    if(!dash.tenant)throw new Error('TENANT_NOT_FOUND');
+    if(!dash.rule)throw new Error('RULE_NOT_FOUND');
+    const customerId=await repository.createAnonymousCustomer(tenantId);
+    const rawToken=randomToken();
+    const created=await repository.createCard(tenantId,customerId,dash.rule.id,hashToken(rawToken),crypto.randomUUID(),rawToken);
+    const rotated=await rotate(actor);
+    const dash2=await repository.staffDashboard(tenantId);
+    const stats=await repository.staffStats(tenantId);
+    const origin=new URL(req.url).origin;
+    const newCard={id:created.id,url:`${origin}/card/${tenantId}/${created.token ?? rawToken}`,token:created.token ?? rawToken};
+    const flash='Neue Karte angelegt — QR-Code und Link unten direkt weitergeben.';
+    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash2,stats,rotated.header['x-csrf-token'],newCard),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
   }catch(e){return staffError(e,id);}
 }
 async function handleStaffLogout(req:Request,tenantId:string,id:string):Promise<Response>{
@@ -299,7 +348,7 @@ if(parts[0]==='api'&&!configured)throw new Error('CONFIGURATION_REQUIRED');
         if(parts[6]==='wallet'&&parts[7]==='google'){const artifact=walletAdapter('google',{oidcToken:req.headers.get('x-vercel-oidc-token')??undefined});const branding: Branding=safeBranding(result.branding) ?? {cardTitle:'StempelPass',cardText:'',primaryColor:DEFAULT_PRIMARY_CARD_COLOR,secondaryColor:DEFAULT_SECONDARY_CARD_COLOR,version:1};const rule: StampRule|null=result.rule;const value=await artifact.issue(toWalletCardView(result.card),branding,{stampRequired:rule?.stampsRequired,rewardTitle:rule?.rewardTitle});return json(value,200,id);}
         return json(toPublicCardResponse(result,parts[3]),200,id);}
     if(parts[0]==='card'&&parts.length===3&&req.method==='GET'){if(!repository||!cardResolveLimiter.allow(clientIpKey(req)))throw new Error(!repository?'DATABASE_REQUIRED':'RATE_LIMITED');const result=await repository.publicCard(parts[1],hashToken(parts[2]));if(!result)throw new Error('CARD_NOT_FOUND');const b: Branding=safeBranding(result.branding) ?? {cardTitle:'StempelPass',cardText:'',primaryColor:DEFAULT_PRIMARY_CARD_COLOR,secondaryColor:DEFAULT_SECONDARY_CARD_COLOR,version:1};const r: StampRule=result.rule ?? {id:'',tenantId:parts[1],name:'',stampsRequired:1,rewardTitle:'Prämie',rewardDescription:'',active:true,version:1};const esc=(v:unknown)=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]!));const progress=Math.min(100,Math.round((result.card.stampCount/Math.max(1,Number(r.stampsRequired||1)))*100));return new Response(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(b.cardTitle||'StempelPass')}</title><style>body{font:16px system-ui;margin:0;padding:2rem;background:${esc(b.secondaryColor||'#f8fafc')};color:#172033}.card{max-width:28rem;margin:auto;padding:2rem;border-radius:1.5rem;background:white;border-top:1rem solid ${esc(b.primaryColor||'#155e75')};box-shadow:0 8px 30px #0002}progress{width:100%;accent-color:${esc(b.primaryColor||'#155e75')}}.privacy{margin-top:1.5rem;padding-top:1rem;border-top:1px solid #e2e8f0;font-size:.85rem;color:#475569}.privacy h3{margin:0 0 .4rem;font-size:inherit;color:#334155}.privacy p{margin:.4rem 0}</style><main class="card"><h1>${esc(b.cardTitle)}</h1><p>${esc(b.cardText)}</p><p><strong>${result.card.stampCount}</strong> / ${esc(r.stampsRequired)} Stempel</p><progress max="100" value="${progress}"></progress><h2>${esc(r.rewardTitle)}</h2><p>${esc(r.rewardDescription)}</p><a style="display:block;width:100%;box-sizing:border-box;text-align:center;background:${esc(b.primaryColor)};color:#fff;text-decoration:none;padding:.9rem 1rem;border-radius:.75rem;font-weight:600;margin-top:1.5rem" href="/api/public/tenants/${esc(parts[1])}/cards/${esc(parts[2])}/wallet/google/redirect">Zu Google Wallet hinzufügen</a><p style="margin:.5rem 0 0;font-size:.8rem;color:#475569;text-align:center">Auf dem Handy öffnen, um die Karte ins Wallet zu legen.</p><section class="privacy"><h3>Datenschutz</h3><p>${esc('Verantwortlich für die Verarbeitung: '+(result.controllerName||'<Tenant>'))}</p><p>${esc('Diese Stempelkarte speichert nur den Stempelstand und den Fortschritt zur Prämie. StempelPass Deutschland verarbeitet die Daten als Auftragsverarbeiter (Art. 28 DSGVO).')}</p><p>${esc('Die Karte wird nach 12 Monaten ohne Stempelaktivität deaktiviert. Kundendaten werden 30 Tage nach der Soft-Löschung endgültig gelöscht. Falls Sie Kommunikationsnachrichten erhalten oder eine Einwilligung erteilen, wird die Kommunikationshistorie 24 Monate gespeichert; der Nachweis Ihrer Einwilligung wird für einen Zeitraum von 3 Jahren nach Ihrem Widerruf gespeichert. Audit-Aufzeichnungen werden zur Beweissicherung dauerhaft aufbewahrt.')}</p>${result.privacyContact?'<p>'+esc('Sie haben das Recht auf Auskunft, Berichtigung, Löschung und Widerspruch. Kontakt für Anfragen: '+result.privacyContact)+'</p>':''}</section></main>`,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'}});}
-    if(parts[0]==='join'&&parts.length===2&&req.method==='GET'){if(!/^[a-f0-9]{32}$/i.test(parts[1]))throw new Error('ENTRY_POINT_NOT_FOUND');if(!repository||!cardResolveLimiter.allow(joinResolveKey(req,parts[1])))throw new Error(!repository?'DATABASE_REQUIRED':'RATE_LIMITED');const ctx=await repository.joinContext(parts[1]);if(!ctx)throw new Error('ENTRY_POINT_NOT_FOUND');return htmlResponse(joinPageHtml(ctx),200);}
+    if(parts[0]==='join'&&parts.length===2&&req.method==='GET'){if(!/^[a-f0-9]{32}$/i.test(parts[1]))throw new Error('ENTRY_POINT_NOT_FOUND');if(!repository||!cardResolveLimiter.allow(joinResolveKey(req,parts[1])))throw new Error(!repository?'DATABASE_REQUIRED':'RATE_LIMITED');const ctx=await repository.joinContext(parts[1]);if(!ctx)throw new Error('ENTRY_POINT_NOT_FOUND');const origin=new URL(req.url).origin;return htmlResponse(joinPageHtml(ctx,`${origin}${ctx.joinPath}`),200,{'Cache-Control':'public, max-age=60'});}
     // -----------------------------------------------------------------
     // Staff web UI (server-rendered HTML, same auth/CSRF/rotation as the API)
     // -----------------------------------------------------------------
@@ -310,6 +359,7 @@ if(parts[0]==='api'&&!configured)throw new Error('CONFIGURATION_REQUIRED');
     }
     if(parts[0]==='staff'&&parts.length===3&&req.method==='POST'){
       if(parts[2]==='stamp')return handleStaffStamp(req,parts[1],id);
+      if(parts[2]==='cards')return handleStaffCreateCard(req,parts[1],id);
       if(parts[2]==='redeem')return handleStaffRedeem(req,parts[1],id);
       if(parts[2]==='logout')return handleStaffLogout(req,parts[1],id);
     }
