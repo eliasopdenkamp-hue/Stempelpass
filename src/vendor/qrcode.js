@@ -2295,3 +2295,23 @@ var qrcode = function() {
 }(function () {
     return qrcode;
 }));
+
+//---------------------------------------------------------------------
+// ESM default export (added for the StempelPass Node/ESM runtime)
+//
+// This file is a classic CJS/UMD bundle, but the package is
+// `"type": "module"` and the Vercel Node runtime (nodejs24.x) loads
+// every .js file as ESM. Under ESM the UMD tail above is a no-op: the
+// `typeof exports === 'object'` guard is false because `exports` does
+// not exist in ESM scope, so `module.exports` is never executed. The
+// result is a module with NO exports at all, and `import qrcodeFactory
+// from './vendor/qrcode.js'` fails at link time ("does not provide an
+// export named 'default'") — which crashed the whole Vercel function
+// (every route 500, FUNCTION_INVOCATION_FAILED).
+//
+// `var qrcode` is a module-scope binding, so this one line gives ESM
+// runtimes (Node AND Bun, which also respects `"type": "module"`) a
+// real default export. It is intentionally never mixed with
+// `module.exports` — the guarded UMD tail stays but cannot run under
+// ESM, and CommonJS loaders are not used in this package.
+export default qrcode;

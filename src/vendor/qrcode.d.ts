@@ -15,9 +15,12 @@
 //
 // Vendored from qrcode-generator@1.4.4 (package/qrcode.d.ts, MIT). The
 // original declares an ambient module 'qrcode-generator'; this copy is adapted
-// for our local import path (./vendor/qrcode.js) by exposing the factory as the
-// DEFAULT export — that is how Bun's CJS interop delivers module.exports for
-// the UMD build, and it typechecks without esModuleInterop.
+// for our local import path (./vendor/qrcode.js) by exposing the factory as
+// the DEFAULT export. The vendored .js carries a real ESM `export default`
+// (added 2026-09-15: the UMD build alone has NO default export under Node ESM
+// because the package is "type": "module" — `export default qrcode;` at the
+// module level makes Node and Bun agree), so the declaration matches the
+// runtime and typechecks without esModuleInterop.
 //
 //---------------------------------------------------------------------
 type TypeNumber =
