@@ -33,6 +33,7 @@ const EXPECTED = [
   '014_app_role_grants.sql',
   '015_customer_legal_retention_hold.sql',
   '016_staff_tenant_resolver.sql',
+  '017_customers_insert_grant.sql',
 ];
 
 test('migration files: exact expected set, runner-compatible names, stable order', async () => {
@@ -544,4 +545,34 @@ test('015 adds an explicit legal-retention hold for hard-delete candidates', asy
   const m015 = await readFile(join(MIGRATIONS_DIR, '015_customer_legal_retention_hold.sql'), 'utf8');
   expect(m015).toMatch(/alter table customers add column legal_retention_hold boolean not null default false/i);
   expect(m015).toMatch(/customers_hard_delete_candidates/i);
+});
+
+test('017 grants INSERT on customers to the runtime role (2026-09-15 regression pin)', async () => {
+  const m017 = await readFile(join(MIGRATIONS_DIR, '017_customers_insert_grant.sql'), 'utf8');
+  const stmts = m017.replace(/^--.*$/gm, '');
+  // The exact grant 014 omitted: INSERT for the dedicated runtime role.
+  expect(stmts).toMatch(/execute 'grant insert on public\.customers to stempelpass_runtime'/i);
+  // Same conditional pattern as 008/009/010/014/016 — the role is provisioned
+  // out-of-band, an unconditional GRANT to an absent role would abort the run.
+  expect(stmts).toMatch(/if exists \(select 1 from pg_roles where rolname = 'stempelpass_runtime'\)/i);
+  // Comments must reference the 014 omission and the 2026-09-15 incident so
+  // future maintainers understand why this grant exists.
+  expect(m017).toMatch(/014_app_role_grants\.sql/);
+  expect(m017).toMatch(/2026-09-15/);
+  // Additive grant only: no role changes, no revokes, no DDL on other objects.
+  expect(stmts).not.toMatch(/\b(revoke|alter role|drop role|create role)\b/i);
+  expect(stmts).not.toMatch(/alter table/i);
+  // Matches the runtime role name used in production and the verified
+  // restore/grant runbooks — never the legacy `app_role` placeholder.
+  expect(stmts).not.toMatch(/app_role/);
+});
+
+test('017 closes the exact 014 matrix gap: customers INSERT is granted', async () => {
+  const m014 = await readFile(join(MIGRATIONS_DIR, '014_app_role_grants.sql'), 'utf8');
+  const m017 = await readFile(join(MIGRATIONS_DIR, '017_customers_insert_grant.sql'), 'utf8');
+  // 014 granted DML only on card_creation_idempotency (INSERT, SELECT, UPDATE);
+  // customers was never covered by any per-table grant before 017.
+  expect(m014).toMatch(/grant select, insert, update on table public\.card_creation_idempotency/);
+  expect(m014).not.toMatch(/public\.customers/);
+  expect(m017).toMatch(/execute 'grant insert on public\.customers to stempelpass_runtime'/i);
 });
