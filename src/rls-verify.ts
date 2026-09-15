@@ -75,16 +75,42 @@ export const ALL_APP_TABLES: readonly string[] = [
 ];
 
 /**
+ * Tables the application WRITES through the runtime role (derived from the
+ * INSERT statements in the repository/server code paths). The grant check
+ * requires INSERT on every one of them — a missing INSERT here (e.g. the
+ * 2026-09-15 `customers` omission) must fail `rls-verify`, not ship silently.
+ */
+export const APP_WRITE_TABLES: readonly string[] = [
+  'customers',
+  'cards',
+  'card_creation_idempotency',
+  'sessions',
+  'stamp_events',
+  'rewards',
+  'communication_preferences',
+  'communication_consent_events',
+  'communication_message_logs',
+  'tenant_branding',
+  'tenant_entry_points',
+  'tenant_memberships',
+  'audit_log',
+];
+
+/**
  * Minimal DML the application role actually needs (derived from the current
- * repository/server SQL). Grants beyond this are not required for least
- * privilege; missing entries here fail the check.
+ * repository/server SQL; see migrations/001..017). Grants beyond this are not
+ * required for least privilege; missing entries here fail the check.
  */
 export const REQUIRED_GRANTS: Readonly<Record<string, readonly ('SELECT' | 'INSERT' | 'UPDATE' | 'DELETE')[]>> = {
   tenants: ['SELECT', 'UPDATE'],
   users: ['SELECT'],
   sessions: ['SELECT', 'INSERT', 'UPDATE'],
   tenant_memberships: ['SELECT', 'INSERT', 'UPDATE'],
-  customers: ['SELECT', 'UPDATE'],
+  // 2026-09-15 incident: INSERT on customers was missing here (and in the
+  // production grant matrix from which this table is derived), so the check
+  // passed while POST /staff/{tenantId}/cards 500'd. Every APP_WRITE_TABLES
+  // entry below must include INSERT.
+  customers: ['SELECT', 'INSERT', 'UPDATE'],
   tenant_branding: ['SELECT', 'INSERT', 'UPDATE'],
   stamp_rules: ['SELECT', 'INSERT'],
   cards: ['SELECT', 'INSERT', 'UPDATE'],

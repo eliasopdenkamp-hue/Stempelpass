@@ -19,6 +19,8 @@ import { describe, expect, test } from 'bun:test';
 import {
   ALL_APP_TABLES,
   TENANT_SENSITIVE_TABLES,
+  APP_WRITE_TABLES,
+  REQUIRED_GRANTS,
   REQUIRED_FUNCTION_GRANTS,
   buildAsRoleQueries,
   buildNamedRoleQueries,
@@ -191,6 +193,32 @@ describe('classifyRlsReport', () => {
     expect(r.ok).toBe(false);
     expect(r.checks.grantsComplete).toBe(false);
     expect(r.checks.missingGrants).toEqual(['cards:UPDATE']);
+  });
+
+  test('2026-09-15 incident shape: customers without INSERT fails with customers:INSERT', () => {
+    // This is exactly the production state before the hotfix: `customers` had
+    // SELECT+UPDATE but no INSERT, and the (old) expectation matrix mirrored
+    // that, so the check passed while the staff create-card write path 500'd.
+    // The corrected matrix must fail here.
+    const grantRows = ALL_APP_TABLES.map(t => ({ table_name: t, sel: true, ins: true, upd: true, del: true })).map(row =>
+      row.table_name === 'customers' ? { ...row, ins: false } : row,
+    );
+    const r = report(healthyInput({ grantRows }));
+    expect(r.ok).toBe(false);
+    expect(r.checks.grantsComplete).toBe(false);
+    expect(r.checks.missingGrants).toEqual(['customers:INSERT']);
+  });
+
+  test('every app-written table requires INSERT in the expectation matrix', () => {
+    // The 2026-09-15 root cause was a wrong *expectation* (REQUIRED_GRANTS
+    // omitted customers INSERT): the DB was checked, but against a matrix that
+    // encoded the bug. Pin the matrix itself: each table the repository writes
+    // must demand INSERT, or a future migration omission ships silently again.
+    expect(APP_WRITE_TABLES.length).toBeGreaterThan(0);
+    for (const table of APP_WRITE_TABLES) {
+      expect(REQUIRED_GRANTS[table], `REQUIRED_GRANTS[${table}] missing`).toBeDefined();
+      expect(REQUIRED_GRANTS[table].includes('INSERT'), `REQUIRED_GRANTS[${table}] must include INSERT`).toBe(true);
+    }
   });
 
   test('missing resolver EXECUTE grant fails and is named without hiding table grants', () => {

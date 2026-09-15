@@ -258,6 +258,7 @@ export const EXPECTED_MIGRATIONS: readonly string[] = [
   '014_app_role_grants.sql',
   '015_customer_legal_retention_hold.sql',
   '016_staff_tenant_resolver.sql',
+  '017_customers_insert_grant.sql',
 ];
 
 export interface MigrationCheck {
