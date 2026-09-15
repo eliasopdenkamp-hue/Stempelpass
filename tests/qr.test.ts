@@ -84,3 +84,19 @@ test('qrSvgDataUri honors error-correction and quiet-zone options deterministica
   const dim = (uri: string) => Number(decodeDataUri(uri).svg.match(/width="(\d+)"/)?.[1]);
   expect(dim(noQuiet)).toBeLessThan(dim(base));
 });
+// Regression pin for the 2026-09-15 production outage: the vendored UMD
+// bundle (src/vendor/qrcode.js) is loaded as ESM by the Node runtime
+// ("type": "module") and the Vercel build; without a real default export the
+// module graph failed at link time ("does not provide an export named
+// 'default'") and EVERY route returned 500 FUNCTION_INVOCATION_FAILED.
+// Bun's CJS interop masked the bug, so this also asserts the vendor factory
+// resolves as a function regardless of runtime.
+import qrcodeFactory from '../src/vendor/qrcode.js';
+test('vendored QR factory resolves as a function (ESM default export)', () => {
+  expect(typeof qrcodeFactory).toBe('function');
+  // The factory builds a working encoder instance (type 0 = auto version).
+  const qr = qrcodeFactory(0, 'M');
+  qr.addData('regression-pin');
+  qr.make();
+  expect(qr.getModuleCount()).toBeGreaterThanOrEqual(21);
+});
