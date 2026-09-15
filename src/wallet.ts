@@ -16,7 +16,9 @@ export interface LoyaltyObject {
   loyaltyPoints: { balance: { int: number } };
   textModulesData?: Array<{ header: string; body: string }>;
 }
-export interface WalletAdapter { issue(card: WalletCardView, branding: Branding, context?: { stampRequired?: number; rewardTitle?: string }): Promise<WalletArtifact>; refresh(card: WalletCardView, changedFields: string[]): Promise<WalletArtifact>; revoke(card: WalletCardView): Promise<void>; }
+export interface WalletAdapter { issue(card: WalletCardView, branding: Branding, context?: { stampRequired?: number; rewardTitle?: string }): Promise<WalletArtifact>; refresh(card: WalletCardView, changedFields: string[], context?: { branding?: Branding; stampRequired?: number; rewardTitle?: string }): Promise<WalletArtifact>; revoke(card: WalletCardView): Promise<void>; }
+/** Refresh context mirrors the issue() context plus the branding needed for the text module. */
+export interface WalletRefreshContext { branding?: Branding; stampRequired?: number; rewardTitle?: string; }
 
 /** Signs the UTF-8 bytes of `header.payload` and returns the base64url signature. */
 export interface JwtSigner { sign(signingInput: string): Promise<string>; }
@@ -51,7 +53,7 @@ class UnconfiguredWalletAdapter implements WalletAdapter {
     const base = `${this.provider} wallet is not configured; no pass was created.`;
     return { provider: this.provider, status: 'not_configured', message: this.detail ? `${base} Missing: ${this.detail}` : base };
   }
-  async refresh(_card: WalletCardView, _changedFields: string[]): Promise<WalletArtifact> { return { provider: this.provider, status: 'not_configured', message: `${this.provider} wallet is not configured; refresh skipped.` }; }
+  async refresh(_card: WalletCardView, _changedFields: string[], _context?: WalletRefreshContext): Promise<WalletArtifact> { return { provider: this.provider, status: 'not_configured', message: `${this.provider} wallet is not configured; refresh skipped.` }; }
   async revoke(_card: WalletCardView) { /* no external call without credentials */ }
 }
 
@@ -117,7 +119,36 @@ export class GoogleWalletAdapter implements WalletAdapter {
       : 'Save to Google Wallet';
     return { provider: 'google', status: 'issued', message, artifact: `${header}.${payload}.${signature}` };
   }
-  async refresh(_card: WalletCardView, _changedFields: string[]) { return { provider: 'google' as const, status: 'issued' as const, message: 'Google Wallet object refresh is handled by the issuer API.' }; }
+  /**
+   * PUSH a balance/text-module update to an already-saved Google Wallet object.
+   *
+   * Same auth/URL plumbing as revoke(): Bearer token from the issuer
+   * credentials, PATCH `loyaltyObject/{issuerId}.{cardId}`. The PATCH body is
+   * deliberately built from the card + branding + rule context (mirroring the
+   * objectModel shape used by issue()) — the `changedFields` argument is
+   * accepted for protocol compatibility but never used to construct the body.
+   *
+   * 404 means the object does not exist (the customer never saved the pass) —
+   * treated as a graceful no-op, exactly like revoke() treats 404. Any other
+   * non-OK status throws GOOGLE_WALLET_REFRESH_FAILED_<status> (consistent
+   * with issue()/class provisioning error contract); callers that must not
+   * fail the committed stamp/redeem wrap this in try/catch.
+   */
+  async refresh(card: WalletCardView, changedFields: string[], context?: WalletRefreshContext): Promise<WalletArtifact> {
+    if (!this.credentials) return { provider: 'google', status: 'not_configured', message: 'Google Wallet wallet is not configured; refresh skipped.' };
+    const branding: Branding = context?.branding ?? { cardTitle: 'StempelPass', cardText: '', primaryColor: '', secondaryColor: '', version: 1 };
+    const model = this.objectModel(card, branding, { stampRequired: context?.stampRequired, rewardTitle: context?.rewardTitle });
+    const { token } = await this.credentials.getAccessToken(WALLET_OBJECT_SCOPE);
+    const response = await this.fetchFn(
+      `https://walletobjects.googleapis.com/walletobjects/v1/loyaltyObject/${encodeURIComponent(`${this.issuerId}.${card.id}`)}`,
+      { method: 'PATCH', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ loyaltyPoints: model.loyaltyPoints, textModulesData: model.textModulesData }) },
+    );
+    if (!response.ok && response.status !== 404) throw new Error(`GOOGLE_WALLET_REFRESH_FAILED_${response.status}`);
+    const message = response.status === 404
+      ? 'Google Wallet object not saved yet; refresh skipped.'
+      : `Google Wallet object updated (${changedFields.length === 0 ? card.id : changedFields.join(', ')}).`;
+    return { provider: 'google', status: 'issued', message };
+  }
   async revoke(card: WalletCardView): Promise<void> {
     if (!this.credentials) {
       console.error('wallet_revoke_failed code=GOOGLE_WALLET_CREDENTIALS_UNAVAILABLE');

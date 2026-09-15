@@ -91,9 +91,20 @@ function mockGoogleFetch(calls: Array<{ url: string; init: RequestInit }>): type
       const { createHash } = await import('node:crypto');
       return new Response(JSON.stringify({ keyId: 'test-key', signedBlob: createHash('sha256').update(payload).digest('base64') }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
+    if (url.includes('/loyaltyObject/')) {
+      // PATCH surface: echo a minimal loyaltyObject like the Wallet API does.
+      return new Response(JSON.stringify({ id: '123.card-1', state: 'ACTIVE' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
     throw new Error(`unexpected URL in mock: ${url}`);
   };
   return fakeFetch as unknown as typeof fetch;
+}
+
+/** Classic fallback adapter with a mocked HTTP surface (oauth + loyaltyObject). */
+function classicAdapter(calls: Array<{ url: string; init: RequestInit }>, key: string) {
+  process.env.GOOGLE_ISSUER_ID = '123';
+  process.env.GOOGLE_SERVICE_ACCOUNT_JSON = JSON.stringify({ client_email: 'sa@example.invalid', private_key: key });
+  return walletAdapter('google', { fetchFn: mockGoogleFetch(calls) });
 }
 
 test('keyless external-account mode issues a signed JWT without any private key (mocked Google calls)', async () => withCleanEnv(async () => {
@@ -189,3 +200,75 @@ test('Google Wallet class provisioning is idempotent (GET then CREATE on 404)', 
   ]);
   expect(JSON.parse(String(calls[1].init.body)).reviewStatus).toBe('UNDER_REVIEW');
 });
+
+
+// ---------------------------------------------------------------------------
+// refresh(): REAL Wallet-API PATCH of the loyaltyObject balance + text module.
+// ---------------------------------------------------------------------------
+const WALLET_PATCH_URL = 'https://walletobjects.googleapis.com/walletobjects/v1/loyaltyObject/123.card-1';
+
+test('refresh PATCHes the loyaltyObject with the new balance and text module (mocked Google calls)', async () => withCleanEnv(async () => {
+  const key = await Bun.$`openssl genrsa 2048 2>/dev/null`.text();
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const adapter = classicAdapter(calls, key);
+  const result = await adapter.refresh(card, ['loyaltyPoints', 'textModulesData'], { branding, stampRequired: 10, rewardTitle: 'Gratis' });
+  expect(result.status).toBe('issued');
+  expect(result.artifact).toBeUndefined();
+  const patch = calls.find(c => c.url === WALLET_PATCH_URL);
+  expect(patch).toBeDefined();
+  expect(patch!.init.method).toBe('PATCH');
+  const auth = (patch!.init.headers as Record<string, string>).Authorization;
+  expect(auth).toBe('Bearer oauth-token');
+  const body = JSON.parse(String(patch!.init.body)) as Record<string, any>;
+  expect(body.loyaltyPoints).toEqual({ balance: { int: card.stampCount } });
+  expect(body.textModulesData).toEqual([{ header: branding.cardTitle, body: '3/10 Stempel · Gratis' }]);
+  // The PATCH is the ONLY loyaltyObject call: no GET, no class provisioning.
+  expect(calls.filter(c => c.url.includes('/loyaltyObject/'))).toHaveLength(1);
+}));
+
+test('refresh without credentials is honest (not_configured, no fetch)', async () => withCleanEnv(async () => {
+  const result = await walletAdapter('google').refresh(card, ['loyaltyPoints'], { branding });
+  expect(result).toEqual({ provider: 'google', status: 'not_configured', message: 'google wallet is not configured; refresh skipped.' });
+  expect(result.artifact).toBeUndefined();
+}));
+
+test('refresh treats a 404 loyaltyObject as a graceful no-op (card never saved to Wallet)', async () => withCleanEnv(async () => {
+  const key = await Bun.$`openssl genrsa 2048 2>/dev/null`.text();
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); calls.push({ url, init: init ?? {} });
+    if (url === 'https://oauth2.googleapis.com/token') return new Response(JSON.stringify({ access_token: 'oauth-token', expires_in: 3600, token_type: 'Bearer' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    if (url === WALLET_PATCH_URL) return new Response('not found', { status: 404 });
+    throw new Error(`unexpected URL in mock: ${url}`);
+  }) as unknown as typeof fetch;
+  process.env.GOOGLE_ISSUER_ID = '123';
+  process.env.GOOGLE_SERVICE_ACCOUNT_JSON = JSON.stringify({ client_email: 'sa@example.invalid', private_key: key });
+  const adapter = walletAdapter('google', { fetchFn });
+  const result = await adapter.refresh(card, ['loyaltyPoints'], { branding, stampRequired: 10, rewardTitle: 'Gratis' });
+  expect(result.status).toBe('issued'); // graceful no-op — never throws
+  expect(calls.some(c => c.url === WALLET_PATCH_URL)).toBe(true);
+}));
+
+test('refresh propagates a non-404 API failure like issue() does (GOOGLE_WALLET_REFRESH_FAILED_<status>)', async () => withCleanEnv(async () => {
+  const key = await Bun.$`openssl genrsa 2048 2>/dev/null`.text();
+  const fetchFn = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === 'https://oauth2.googleapis.com/token') return new Response(JSON.stringify({ access_token: 'oauth-token', expires_in: 3600, token_type: 'Bearer' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    if (url === WALLET_PATCH_URL) return new Response('denied', { status: 500 });
+    throw new Error(`unexpected URL in mock: ${url}`);
+  }) as unknown as typeof fetch;
+  process.env.GOOGLE_ISSUER_ID = '123';
+  process.env.GOOGLE_SERVICE_ACCOUNT_JSON = JSON.stringify({ client_email: 'sa@example.invalid', private_key: key });
+  const adapter = walletAdapter('google', { fetchFn });
+  await expect(adapter.refresh(card, ['loyaltyPoints'], { branding })).rejects.toThrow('GOOGLE_WALLET_REFRESH_FAILED_500');
+}));
+
+test('refresh PATCHes with fallback branding/rule when no context is supplied', async () => withCleanEnv(async () => {
+  const key = await Bun.$`openssl genrsa 2048 2>/dev/null`.text();
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const adapter = classicAdapter(calls, key);
+  const result = await adapter.refresh(card, []);
+  expect(result.status).toBe('issued');
+  const body = JSON.parse(String(calls.find(c => c.url === WALLET_PATCH_URL)!.init.body)) as Record<string, any>;
+  expect(body.textModulesData).toEqual([{ header: 'StempelPass', body: '3/? Stempel · Prämie' }]);
+}));

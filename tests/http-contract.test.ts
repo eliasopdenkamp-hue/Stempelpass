@@ -1403,3 +1403,86 @@ test('DELETE tenant by an admin is rejected with FORBIDDEN (owner only)', async 
     expect(pool.queries.some(q => q.sql.startsWith('update tenants'))).toBe(false);
   });
 });
+
+
+// ---------------------------------------------------------------------------
+// (7b) Wallet balance sync after stamp/redeem (best-effort, never fails the
+// committed write; the PATCH body is built by GoogleWalletAdapter.refresh from
+// the card + rule/branding context).
+// ---------------------------------------------------------------------------
+test('stamp route best-effort-syncs the Google Wallet balance with the fresh stamp count', async () => {
+  const refreshed: Array<{ card: { id: string; stampCount: number }; context: Record<string, unknown> }> = [];
+  const adapter = {
+    async issue() { return { provider: 'google' as const, status: 'issued' as const, message: 'ok', artifact: 'a.b.c' }; },
+    async refresh(card: { id: string; stampCount: number }, _fields: string[], context?: unknown) {
+      refreshed.push({ card, context: (context ?? {}) as Record<string, unknown> });
+      return { provider: 'google' as const, status: 'issued' as const, message: 'ok' };
+    },
+    async revoke() {},
+  };
+  const factory = (() => adapter) as unknown as typeof walletAdapter;
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('from stamp_events'), rows: [] }, // no replay
+    { match: contains('from cards where'), rows: [{ id: 'card-1', stampCount: 3, revision: 2, ruleId: RULE }] },
+    { match: contains('insert into stamp_events'), rows: [] },
+    { match: contains('update cards set stamp_count'), rows: [{ id: 'card-1', stampCount: 4, revision: 3 }] },
+    { match: contains('reward_title as "rewardTitle"'), rows: [{ stampsRequired: 5, rewardTitle: 'Prämie' }] }, // cardWalletContext rule (specific match, first)
+    { match: contains('from stamp_rules'), rows: [{ id: RULE, stamps_required: 1 }] }, // stamp() rule probe
+    { match: contains('insert into rewards'), rows: [{ id: 'reward-1', status: 'issued' }] },
+    { match: contains('from tenant_branding'), rows: [{ cardTitle: 'StempelPass Demo', cardText: 'Deine Karte', primaryColor: '#155e75', secondaryColor: '#f8fafc', version: 1 }] },
+  ]);
+  const restore = withTestDependencies({ configured: true, pool, repository: new CardRepository(pool), walletFactory: factory });
+  try {
+    const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}/cards/card-1/stamps`, {
+      method: 'POST',
+      headers: authedHeaders({ 'idempotency-key': 'client-key-1' }),
+      body: JSON.stringify({ quantity: 1 }),
+    }));
+    expect(res.status).toBe(200);
+    // The committed stamp itself is untouched: the response is the normal shape.
+    const body = (await res.json()) as { data: unknown };
+    expect(body.data).toEqual(EXPECTED_STAMP_DATA);
+    // Wallet sync: exactly one refresh with the NEW stamp count and the rule/branding context.
+    expect(refreshed).toHaveLength(1);
+    expect(refreshed[0].card).toEqual({ id: 'card-1', stampCount: 4 });
+    expect(refreshed[0].context.stampRequired).toBe(5);
+    expect(refreshed[0].context.rewardTitle).toBe('Prämie');
+    expect((refreshed[0].context.branding as { cardTitle: string }).cardTitle).toBe('StempelPass Demo');
+  } finally { restore(); }
+});
+
+test('redeem route best-effort-syncs the wallet to the reset balance (0 stamps) and never fails the redeem', async () => {
+  const refreshed: Array<{ card: { id: string; stampCount: number } }> = [];
+  const adapter = {
+    async issue() { return { provider: 'google' as const, status: 'issued' as const, message: 'ok', artifact: 'a.b.c' }; },
+    async refresh(card: { id: string; stampCount: number }, _fields: string[], _context?: unknown) {
+      refreshed.push({ card });
+      return { provider: 'google' as const, status: 'issued' as const, message: 'ok' };
+    },
+    async revoke() {},
+  };
+  const factory = (() => adapter) as unknown as typeof walletAdapter;
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('update rewards set status'), rows: [{ id: 'reward-1', status: 'redeemed', card_id: 'card-1' }] },
+    { match: contains('update cards set stamp_count=0'), rows: [{ id: 'card-1', stampCount: 0, revision: 3 }] },
+    { match: contains('from cards where'), rows: [{ id: 'card-1', stampCount: 0, revision: 3, ruleId: RULE }] },
+    { match: contains('from tenant_branding'), rows: [] },
+    { match: contains('from stamp_rules'), rows: [] },
+  ]);
+  const restore = withTestDependencies({ configured: true, pool, repository: new CardRepository(pool), walletFactory: factory });
+  try {
+    const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}/rewards/reward-1/redeem`, {
+      method: 'POST',
+      headers: authedHeaders(),
+    }));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { request_id: string; data: unknown };
+    // The API contract is unchanged: only rewardId + status cross the wire.
+    expect(body.data).toEqual({ rewardId: 'reward-1', status: 'redeemed' });
+    // Wallet sync: exactly one refresh with the RESET balance (0).
+    expect(refreshed).toHaveLength(1);
+    expect(refreshed[0].card).toEqual({ id: 'card-1', stampCount: 0 });
+  } finally { restore(); }
+});
