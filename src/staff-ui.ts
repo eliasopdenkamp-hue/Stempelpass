@@ -209,7 +209,9 @@ export function loginPage(): string {
 <label for="f-mfa">MFA-Code <span class="hint">(nur falls aktiviert)</span></label><input id="f-mfa" name="mfaCode" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="6-stelliger Code">
 <p id="login-msg" class="error" style="min-height:1.2em"></p>
 <button type="submit">Anmelden</button>
-</form></main>
+</form>
+<p class="meta" style="margin-top:1rem"><a href="/reset">Passwort vergessen?</a></p>
+</main>
 <script>
 (function () {
   var form = document.getElementById('login-form');
@@ -239,6 +241,95 @@ export function loginPage(): string {
   });
 })();
 </script>`);
+}
+
+/**
+ * GET /reset — public "Passwort vergessen" request page. Submits JSON to
+ * POST /api/auth/reset/request and shows ONE neutral text regardless of
+ * whether the account exists (anti-enumeration; identical to the API body).
+ */
+export function resetRequestPage(): string {
+  return page('Passwort zurücksetzen – StempelPass', `<main class="card"><h1>Passwort zurücksetzen</h1>
+<p class="meta">Geben Sie die E-Mail-Adresse Ihres Kontos ein. Wenn es dieses Konto gibt, erhalten Sie in Kürze eine E-Mail mit einem Link zum Zurücksetzen (60 Minuten gültig).</p>
+<form id="reset-request-form">
+<label for="f-email">E-Mail</label><input id="f-email" name="email" type="email" required autocomplete="email" autofocus>
+<p id="reset-msg" class="error" style="min-height:1.2em"></p>
+<button type="submit">Link senden</button>
+</form>
+<p class="meta"><a href="/login">Zurück zur Anmeldung</a></p></main>
+<script>
+(function () {
+  var form = document.getElementById('reset-request-form');
+  var msg = document.getElementById('reset-msg');
+  var NEUTRAL = 'Wenn es dieses Konto gibt, haben wir Ihnen eine E-Mail mit einem Link zum Zurücksetzen gesendet.';
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var btn = form.querySelector('button');
+    btn.disabled = true; msg.textContent = '';
+    fetch('/api/auth/reset/request', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: form.email.value }) })
+      .then(function (res) {
+        if (res.status === 429) { msg.textContent = 'Zu viele Versuche. Bitte kurz warten.'; return; }
+        // Same neutral text for every other outcome (known/unknown account,
+        // SMTP not configured, send failure) — never reveals account existence.
+        return res.json().catch(function () { return {}; }).then(function () { msg.textContent = NEUTRAL; });
+      })
+      .catch(function () { msg.textContent = 'Dienst ist kurz nicht erreichbar. Bitte erneut versuchen.'; })
+      .then(function () { btn.disabled = false; });
+  });
+})();
+</script>`);
+}
+
+/**
+ * GET /reset/:token — public new-password form. The raw token travels from the
+ * URL into a hidden form field (HTML-escaped); the confirm POST sends it as a
+ * Bearer secret — like the login POST, the confirm is pre-auth and uses
+ * rate limits instead of CSRF (see PASSWORD_RESET_PREP §6).
+ */
+export function resetPasswordPage(rawToken: string): string {
+  return page('Neues Passwort – StempelPass', `<main class="card"><h1>Neues Passwort</h1>
+<p class="meta">Legen Sie ein neues Passwort für Ihr Konto fest (mindestens 12 Zeichen). Alle bestehenden Anmeldungen werden beendet.</p>
+<form id="reset-confirm-form">
+<input type="hidden" name="token" value="${esc(rawToken)}">
+<label for="f-password">Neues Passwort</label><input id="f-password" name="password" type="password" required minlength="12" autocomplete="new-password">
+<label for="f-password2">Passwort wiederholen</label><input id="f-password2" name="password2" type="password" required minlength="12" autocomplete="new-password">
+<p id="reset-msg" class="error" style="min-height:1.2em"></p>
+<button type="submit">Passwort ändern</button>
+</form>
+<p class="meta"><a href="/login">Zurück zur Anmeldung</a></p></main>
+<script>
+(function () {
+  var form = document.getElementById('reset-confirm-form');
+  var msg = document.getElementById('reset-msg');
+  var texts = {
+    RESET_TOKEN_INVALID: 'Der Link ist ungültig oder wurde bereits verwendet.',
+    PASSWORD_TOO_SHORT: 'Das Passwort muss mindestens 12 Zeichen lang sein.',
+    CREDENTIALS_REQUIRED: 'Bitte ein neues Passwort eingeben.',
+    RATE_LIMITED: 'Zu viele Versuche. Bitte kurz warten.'
+  };
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    if (form.password.value !== form.password2.value) { msg.textContent = 'Die Passwörter stimmen nicht überein.'; return; }
+    var btn = form.querySelector('button');
+    btn.disabled = true; msg.textContent = '';
+    fetch('/api/auth/reset/confirm', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: form.token.value, password: form.password.value }) })
+      .then(function (res) {
+        if (res.ok) { window.location.href = '/login'; return; }
+        return res.json().catch(function () { return {}; }).then(function (body) {
+          var code = body && body.data && body.data.error;
+          msg.textContent = texts[code] || 'Passwort konnte nicht geändert werden. Bitte erneut versuchen.';
+        });
+      })
+      .catch(function () { msg.textContent = 'Dienst ist kurz nicht erreichbar. Bitte erneut versuchen.'; })
+      .then(function () { btn.disabled = false; });
+  });
+})();
+</script>`);
+}
+
+/** GET /reset/:token with an unknown/expired/consumed token — neutral page, no form. */
+export function resetTokenInvalidPage(): string {
+  return page('Link ungültig – StempelPass', `<main class="card"><h1>Link ungültig oder abgelaufen</h1><p>Dieser Link ist nicht mehr gültig oder wurde bereits verwendet. Bitte fordern Sie einen neuen Link an.</p><p><a href="/reset">Neuen Link anfordern</a></p><p><a href="/login">Zur Anmeldung</a></p></main>`);
 }
 
 /** GET /staff with >1 active tenant — chooser page. */

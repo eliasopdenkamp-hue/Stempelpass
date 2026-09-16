@@ -260,6 +260,7 @@ export const EXPECTED_MIGRATIONS: readonly string[] = [
   '016_staff_tenant_resolver.sql',
   '017_customers_insert_grant.sql',
   '018_tenant_branding_logo_url.sql',
+  '019_password_reset_tokens.sql',
 ];
 
 export interface MigrationCheck {

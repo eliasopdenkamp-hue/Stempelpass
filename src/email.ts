@@ -1,5 +1,6 @@
 import nodemailer, { type Transporter } from 'nodemailer';
 import { createHmac } from 'node:crypto';
+import { esc } from './staff-ui.js';
 
 export type EmailConfiguration = {
   host: string;
@@ -70,4 +71,30 @@ export function recipientHash(email: string, env: NodeJS.ProcessEnv = process.en
   const secret = communicationHashSecret(env);
   if (!secret) return null;
   return createHmac('sha256', secret).update(email.trim().toLowerCase()).digest('hex');
+}
+
+/**
+ * Self-service password-reset mail (plain text). The reset link embeds the RAW
+ * one-time token (43-char base64url); it reaches only the account owner's
+ * mailbox and is treated as a Bearer secret by GET /reset/:token and
+ * POST /api/auth/reset/confirm.
+ */
+export function passwordResetEmailText(resetLink: string): string {
+  return 'Passwort zurücksetzen\n\n'
+    + 'Sie haben ein Zurücksetzen Ihres Passworts angefordert. Der Link ist 60 Minuten gültig:\n'
+    + resetLink
+    + '\n\nFalls Sie das nicht angefordert haben, ignorieren Sie diese E-Mail. Ihr Passwort bleibt unverändert.\n';
+}
+
+/** Self-service password-reset mail (HTML). Every dynamic value is HTML-escaped. */
+export function passwordResetEmailHtml(resetLink: string): string {
+  const safe = esc(resetLink);
+  return '<!doctype html><html lang="de"><body style="font:16px system-ui,sans-serif;color:#172033;background:#f8fafc;padding:2rem">'
+    + '<div style="max-width:32rem;margin:auto;background:#fff;padding:2rem;border-radius:1rem;border-top:.5rem solid #155e75">'
+    + '<h1 style="font-size:1.25rem;margin:0 0 .5rem">Passwort zurücksetzen</h1>'
+    + '<p>Sie haben ein Zurücksetzen Ihres Passworts angefordert. Der Link ist <strong>60 Minuten</strong> gültig.</p>'
+    + '<p><a href="' + safe + '" style="display:inline-block;background:#155e75;color:#fff;text-decoration:none;padding:.7rem 1.1rem;border-radius:.65rem;font-weight:600">Passwort zurücksetzen</a></p>'
+    + '<p>Falls Sie das nicht angefordert haben, ignorieren Sie diese E-Mail. Ihr Passwort bleibt unverändert.</p>'
+    + '<p style="font-size:.8rem;color:#475569">StempelPass Deutschland</p>'
+    + '</div></body></html>';
 }

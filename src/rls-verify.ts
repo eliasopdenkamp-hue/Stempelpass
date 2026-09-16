@@ -64,6 +64,7 @@ export const TENANT_SENSITIVE_TABLES: readonly string[] = [
   'tenant_entry_points',
   'audit_log',
   'sessions',
+  'password_reset_tokens',
 ];
 
 /** Every application table (owner-risk and grant checks cover all of them). */
@@ -94,6 +95,7 @@ export const APP_WRITE_TABLES: readonly string[] = [
   'tenant_entry_points',
   'tenant_memberships',
   'audit_log',
+  'password_reset_tokens',
 ];
 
 /**
@@ -103,8 +105,11 @@ export const APP_WRITE_TABLES: readonly string[] = [
  */
 export const REQUIRED_GRANTS: Readonly<Record<string, readonly ('SELECT' | 'INSERT' | 'UPDATE' | 'DELETE')[]>> = {
   tenants: ['SELECT', 'UPDATE'],
-  users: ['SELECT'],
+  // 2026-09-16 (customers-017 incident class): reset confirm writes
+  // users.password_hash — UPDATE is required (granted by migration 019).
+  users: ['SELECT', 'UPDATE'],
   sessions: ['SELECT', 'INSERT', 'UPDATE'],
+  password_reset_tokens: ['SELECT', 'INSERT', 'UPDATE'],
   tenant_memberships: ['SELECT', 'INSERT', 'UPDATE'],
   // 2026-09-15 incident: INSERT on customers was missing here (and in the
   // production grant matrix from which this table is derived), so the check
@@ -131,6 +136,7 @@ export const REQUIRED_FUNCTION_GRANTS: readonly { name: string; identityArgument
   { name: 'resolve_session_user', identityArguments: 'text' },
   { name: 'membership_mfa_required', identityArguments: 'uuid' },
   { name: 'resolve_user_tenants', identityArguments: 'uuid' },
+  { name: 'resolve_password_reset_user', identityArguments: 'text' },
 ];
 
 // ---------------------------------------------------------------------------

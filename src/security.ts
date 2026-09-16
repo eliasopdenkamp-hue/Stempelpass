@@ -181,3 +181,25 @@ export const loginIpLimiter = new RateLimiter(20, 15 * 60_000, 50_000);
 export const loginAccountLimiter = new RateLimiter(5, 15 * 60_000, 50_000);
 export const cardResolveLimiter = new RateLimiter(60, 60_000, 50_000);
 export const stampLimiter = new RateLimiter(30, 60_000, 50_000);
+
+/**
+ * Password-reset limits (mirror the login limiter split): a per-IP budget and
+ * a per-normalized-account budget (loginAccountKey — the raw email never
+ * becomes a limiter key) bind mailbox flooding and account probing; the
+ * confirm path additionally binds per IP+token (resetResolveKey). Per-instance
+ * only (see RATE_LIMITING.md), like every limiter on the request path.
+ */
+export const resetRequestIpLimiter = new RateLimiter(10, 15 * 60_000, 50_000);
+export const resetRequestAccountLimiter = new RateLimiter(3, 15 * 60_000, 50_000);
+export const resetConfirmIpLimiter = new RateLimiter(10, 15 * 60_000, 50_000);
+export const resetConfirmTokenLimiter = new RateLimiter(5, 15 * 60_000, 50_000);
+export const resetResolveLimiter = new RateLimiter(10, 15 * 60_000, 50_000);
+
+/**
+ * Per-token reset resolution/confirmation key: hashed client IP plus SHA-256
+ * of the raw token (mirrors joinResolveKey). Binds the budget to one client +
+ * one reset link and keeps raw tokens out of limiter keys and memory.
+ */
+export function resetResolveKey(req: Request, token: string): string {
+  return `${clientIpKey(req)}:reset:${createHash('sha256').update(String(token ?? ''), 'utf8').digest('hex')}`;
+}

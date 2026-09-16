@@ -1,5 +1,5 @@
 import { assertTenant, canStamp, hashToken } from './domain.js';
-import { cardResolveLimiter, clientIpKey, csrfValid, joinResolveKey, loginAccountKey, loginAccountLimiter, loginFailureReason, loginIpLimiter, stampLimiter, verifyPassword, verifyPasswordAgainstDummy, randomToken, hashSessionToken } from './security.js';
+import { cardResolveLimiter, clientIpKey, csrfValid, hashPassword, joinResolveKey, loginAccountKey, loginAccountLimiter, loginFailureReason, loginIpLimiter, resetConfirmIpLimiter, resetConfirmTokenLimiter, resetRequestAccountLimiter, resetRequestIpLimiter, resetResolveKey, resetResolveLimiter, stampLimiter, verifyPassword, verifyPasswordAgainstDummy, randomToken, hashSessionToken } from './security.js';
 import { createPostgresPool, runMigrations, type DbPool } from './db.js';
 import { CardRepository, type StaffDashboardData, type StaffStats } from './repository.js';
 import { configurationStatus } from './config.js';
@@ -8,9 +8,10 @@ import { walletAdapter, ensureGoogleWalletClass } from './wallet.js';
 import { classifyError } from './http-error.js';
 import { DEFAULT_PRIMARY_CARD_COLOR, DEFAULT_SECONDARY_CARD_COLOR, joinPageHtml, safeBranding, toPublicCardResponse, toWalletCardView } from './public-card.js';
 import { publicHealthResponse } from './health.js';
-import { loginPage, tenantChooserPage, noTenantPage, dashboardPage, staffErrorPage, type DashboardView } from './staff-ui.js';
+import { loginPage, resetPasswordPage, resetRequestPage, resetTokenInvalidPage, tenantChooserPage, noTenantPage, dashboardPage, staffErrorPage, type DashboardView } from './staff-ui.js';
+import { SmtpEmailAdapter, passwordResetEmailHtml, passwordResetEmailText } from './email.js';
 import { requireVerifiedMfaBootstrap } from './mfa-bootstrap.js';
-import { toCreateCardResponse, toDeleteResponse, toLoginResponse, toPilotResponse, toRedeemResponse, toStaffResponse, toStampResponse } from './contracts.js';
+import { toCreateCardResponse, toDeleteResponse, toLoginResponse, toPilotResponse, toRedeemResponse, toResetConfirmResponse, toResetRequestResponse, toStaffResponse, toStampResponse } from './contracts.js';
 import type { Branding, StampRule } from './domain.js';
 const config=configurationStatus(); let configured=config.ready;
 /**
@@ -39,6 +40,8 @@ const sessionCookie = (value: string, maxAge: number) =>
 let pool:DbPool|undefined; let repository:CardRepository|undefined;
 /** Wallet-factory seam for tests; defaults to the real Google Wallet adapter factory. */
 let walletFactory: typeof walletAdapter = walletAdapter;
+/** E-mail-adapter seam for tests (password-reset mail); defaults to the real SMTP adapter. */
+let emailFactory: (() => SmtpEmailAdapter) | undefined;
 const mfaStore = process.env.MFA_ENCRYPTION_KEY ? new EncryptedMfaSecretStore() : undefined;
 let initializationError: unknown;
 let dbReady = false;
@@ -428,8 +431,162 @@ async function handleStaffLogout(req:Request,tenantId:string,id:string):Promise<
     return staffRedirect('/login',{'Set-Cookie':sessionCookie('',0)});
   }catch(e){return staffError(e,id);}
 }
+/**
+ * Password reset ("Passwort vergessen", owner wish).
+ *
+ * Flow: POST /api/auth/reset/request (email in, neutral answer always) →
+ * e-mail with a raw one-time token → GET /reset/:token (new-password form) →
+ * POST /api/auth/reset/confirm (token + new password). The raw token is a
+ * randomToken() (32 random bytes base64url, 43 chars) and is NEVER stored or
+ * logged — only its SHA-256 hex digest (hashSessionToken, exactly like session
+ * tokens) lands in password_reset_tokens.token_hash. The SQL resolver
+ * public.resolve_password_reset_user (migration 019) is the RLS-safe identity
+ * bootstrap for the auth-less pages, mirroring resolve_session_user (009).
+ */
+const RESET_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+const RESET_TOKEN_TTL_SQL = "now() + interval '60 minutes'";
+/** Audit action for a confirmed reset; metadata.operationId is the idempotency anchor. */
+const RESET_CONFIRM_AUDIT_ACTION = 'user.password_reset_confirmed';
+
+/**
+ * POST /api/auth/reset/request — always answers the SAME neutral body
+ * ({status:'requested'}) for known accounts, unknown accounts, missing SMTP
+ * (not_configured) and send failures: no enumeration, no mailbox probing.
+ * Rate limits follow the login limiter split (per hashed IP + per hashed
+ * normalized account key — the raw email never becomes a limiter key or a log
+ * line). The token row is created only for an EXISTING active account, inside
+ * a transaction that sets app.user_id from the server-side lookup (never from
+ * client input) so the user-scoped RLS policy (migration 019) passes exactly
+ * for the owning user. E-mail delivery is best-effort and happens outside the
+ * transaction; it must never fail or change the request/response.
+ */
+async function handleResetRequest(req: Request, id: string): Promise<Response> {
+  if (!pool) throw new Error('DATABASE_REQUIRED');
+  if (!resetRequestIpLimiter.allow(clientIpKey(req))) throw new Error('RATE_LIMITED');
+  const body = await req.json() as { email?: string };
+  const email = String(body.email ?? '').trim();
+  if (!email) throw new Error('CREDENTIALS_REQUIRED');
+  const accountKey = loginAccountKey(email);
+  if (!resetRequestAccountLimiter.allow(accountKey)) throw new Error('RATE_LIMITED');
+  const emailValid = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+  const db = await pool.connect();
+  let rawToken = '';
+  try {
+    await db.query('begin');
+    let user: { id: string } | undefined;
+    if (emailValid) user = (await db.query<{ id: string }>('select id from users where lower(email)=lower($1) and status=$2', [email, 'active'])).rows[0];
+    if (user) {
+      rawToken = randomToken();
+      await db.query("select set_config('app.user_id', $1, true)", [user.id]);
+      await db.query('insert into password_reset_tokens(user_id,token_hash,expires_at) values($1,$2,' + RESET_TOKEN_TTL_SQL + ')', [user.id, hashSessionToken(rawToken)]);
+    }
+    await db.query('commit');
+  } catch (e) {
+    try { await db.query('rollback'); } catch { /* preserve the original error */ }
+    throw e;
+  } finally {
+    db.release();
+  }
+  if (rawToken) {
+    const origin = new URL(req.url).origin;
+    const link = origin + '/reset/' + rawToken;
+    const adapter = emailFactory ? emailFactory() : new SmtpEmailAdapter();
+    const result = await adapter.send({ to: email, subject: 'Passwort zurücksetzen – StempelPass', text: passwordResetEmailText(link), html: passwordResetEmailHtml(link) });
+    // Neutral either way; logs carry only the hashed account key (never the
+    // raw address) and the classified status (never provider details).
+    if (result.status !== 'sent') console.warn('password_reset_email_not_sent request_id=' + id + ' status=' + result.status + ' account=' + accountKey);
+  }
+  return json(toResetRequestResponse(), 200, id as Parameters<typeof json>[2]);
+}
+
+/**
+ * GET /reset/:token — the new-password form (public HTML; token in the URL is
+ * the Bearer secret of the page, exactly like /card/:tenantId/:cardToken).
+ * Rate-limited per IP+token (resetResolveKey). Unknown/expired/consumed tokens
+ * and malformed tokens all answer the same neutral 404 page, never a form.
+ */
+async function handleResetPage(req: Request): Promise<Response> {
+  const token = new URL(req.url).pathname.split('/').filter(Boolean)[1] ?? '';
+  if (!RESET_TOKEN_RE.test(token)) return htmlResponse(resetTokenInvalidPage(), 404);
+  if (!pool || !repository) throw new Error('DATABASE_REQUIRED');
+  if (!resetResolveLimiter.allow(resetResolveKey(req, token))) throw new Error('RATE_LIMITED');
+  const db = await pool.connect();
+  try {
+    const row = (await db.query<{ user_id: string }>('select user_id from public.resolve_password_reset_user($1)', [hashSessionToken(token)])).rows;
+    if (!row[0]) return htmlResponse(resetTokenInvalidPage(), 404);
+    return htmlResponse(resetPasswordPage(token), 200);
+  } finally {
+    db.release();
+  }
+}
+
+/**
+ * POST /api/auth/reset/confirm — token + new password. Pre-auth like the login
+ * POST: no CSRF, rate limits + the token itself as secret. On success the
+ * password_hash is replaced (migration 019 grants UPDATE on users to the
+ * runtime role — WARNING 1 in PASSWORD_RESET_PREP), ALL sessions of the user
+ * are revoked (rotate-owner-password.ts:126 pattern — the next login re-runs
+ * MFA), the token is single-use (consumed_at) and an audit row (tenantId null,
+ * global-isolation policy 009 — no app.tenant_id is ever set here) records the
+ * rotation with a fresh operationId as idempotency anchor.
+ */
+async function handleResetConfirm(req: Request, id: string): Promise<Response> {
+  if (!pool) throw new Error('DATABASE_REQUIRED');
+  if (!resetConfirmIpLimiter.allow(clientIpKey(req))) throw new Error('RATE_LIMITED');
+  const body = await req.json() as { token?: string; password?: string };
+  const token = String(body.token ?? '').trim();
+  const password = String(body.password ?? '');
+  if (!token || !password) throw new Error('CREDENTIALS_REQUIRED');
+  if (!RESET_TOKEN_RE.test(token)) throw new Error('RESET_TOKEN_INVALID');
+  if (!resetConfirmTokenLimiter.allow(resetResolveKey(req, token))) throw new Error('RATE_LIMITED');
+  if (password.length < 12) throw new Error('PASSWORD_TOO_SHORT');
+  const passwordHash = await hashPassword(password);
+  const operationId = crypto.randomUUID();
+  const db = await pool.connect();
+  try {
+    await db.query('begin');
+    // operationId-Idempotenz (rotate-owner-password pattern): the audit trail
+    // is the source of truth; the guarded INSERT below refuses a duplicate
+    // audit row for a replayed operation. The single-use token (consumed_at)
+    // is the primary replay guard of this self-service flow.
+    const prior = (await db.query<{ entity_id: string | null }>('select entity_id from audit_log where action = $1 and metadata->>\'operationId\' = $2 limit 2', [RESET_CONFIRM_AUDIT_ACTION, operationId])).rows;
+    const resolved = (await db.query<{ user_id: string }>('select user_id from public.resolve_password_reset_user($1)', [hashSessionToken(token)])).rows;
+    if (!resolved[0]?.user_id) throw new Error('RESET_TOKEN_INVALID');
+    const userId = resolved[0].user_id;
+    if (prior.length) {
+      if (prior.some(r => r.entity_id !== userId)) throw new Error('RESET_TOKEN_INVALID');
+      await db.query('commit');
+      return json(toResetConfirmResponse(), 200, id as Parameters<typeof json>[2]);
+    }
+    // User context for the RLS-scoped writes below (session revoke + token
+    // consume); app.tenant_id stays unset so the audit row lands in the
+    // global-isolation branch (009 policy).
+    await db.query("select set_config('app.user_id', $1, true)", [userId]);
+    const updated = (await db.query<{ id: string }>('update users set password_hash=$1, updated_at=now() where id=$2 and status=\'active\' returning id', [passwordHash, userId])).rows;
+    if (!updated[0]) throw new Error('RESET_TOKEN_INVALID');
+    // Revoke ALL sessions — the reset itself bypasses MFA, so every existing
+    // session dies and the next login must re-verify MFA (login flow requires
+    // mfa_verified for memberships that need it).
+    await db.query('update sessions set revoked_at=now() where user_id=$1 and revoked_at is null', [userId]);
+    await db.query('update password_reset_tokens set consumed_at=now() where token_hash=$1 and consumed_at is null', [hashSessionToken(token)]);
+    const audit = (await db.query<{ id: string }>('insert into audit_log(tenant_id,actor_user_id,action,entity_type,entity_id,metadata) select null, $1, $2, \'user\', $1, $3::jsonb where not exists (select 1 from audit_log where action = $2 and metadata->>\'operationId\' = $4) returning id', [userId, RESET_CONFIRM_AUDIT_ACTION, JSON.stringify({ operationId }), operationId])).rows;
+    // Fail closed: a password change without an audit row must never commit
+    // (RESET_AUDIT_FAILED is not a public code → INTERNAL_ERROR, tx rolled back).
+    if (!audit[0]) throw new Error('RESET_AUDIT_FAILED');
+    await db.query('commit');
+    return json(toResetConfirmResponse(), 200, id as Parameters<typeof json>[2]);
+  } catch (e) {
+    try { await db.query('rollback'); } catch { /* preserve the original error */ }
+    throw e;
+  } finally {
+    db.release();
+  }
+}
+
 async function handleRequest(req: Request): Promise<Response> {const id=crypto.randomUUID();const headers=corsHeaders(req);if(req.method==='OPTIONS')return new Response(null,{status:204,headers});try{const u=new URL(req.url),parts=u.pathname.split('/').filter(Boolean);if(req.method==='GET'&&u.pathname==='/health')return publicHealthResponse(configured&&!initializationError&&dbReady&&pilotReady,headers);await waitForReadiness();
 if(parts[0]==='api'&&parts[1]==='auth'&&parts[2]==='login'&&req.method==='POST'){if(!pool)throw new Error('DATABASE_REQUIRED');const ipKey=clientIpKey(req);if(!loginIpLimiter.allow(ipKey))throw new Error('RATE_LIMITED');const body=await req.json() as {email?:string,password?:string,mfaCode?:string};if(!body.email||!body.password)throw new Error('CREDENTIALS_REQUIRED');const accountKey=loginAccountKey(body.email);if(!loginAccountLimiter.allow(accountKey))throw new Error('RATE_LIMITED');const db=await pool.connect();try{await db.query('begin');const user=(await db.query<{id:string,password_hash:string,mfa_required:boolean,mfa_enabled:boolean,mfa_secret_ciphertext:string|null}>('select id,password_hash,mfa_required,mfa_enabled,mfa_secret_ciphertext from users where lower(email)=lower($1) and status=$2',[body.email,'active'])).rows[0];const passwordOk=user?.password_hash?await verifyPassword(body.password,user.password_hash):await verifyPasswordAgainstDummy(body.password);if(!user||!passwordOk)throw new Error('INVALID_CREDENTIALS');const mfaRow=(await db.query<{required:boolean|null}>('select public.membership_mfa_required($1) as required',[user.id])).rows[0];const required=requireVerifiedMfaBootstrap(mfaRow);if(required){if(!mfaStore||!user.mfa_secret_ciphertext)throw new Error('MFA_NOT_CONFIGURED');let secret:string;try{secret=await mfaStore.decrypt(user.mfa_secret_ciphertext);}catch{throw new Error('MFA_SECRET_DECRYPT_FAILED');}if(!body.mfaCode||!verifyTotp(secret,body.mfaCode))throw new Error('MFA_INVALID');}await db.query("select set_config('app.user_id', $1, true)",[user.id]);await db.query('update sessions set revoked_at=now() where user_id=$1 and revoked_at is null',[user.id]);const raw=randomToken(),csrf=randomToken();await db.query("insert into sessions(user_id,token_hash,csrf_token_hash,mfa_verified,expires_at) values($1,$2,$3,$4,now()+interval '12 hours')",[user.id,hashSessionToken(raw),hashSessionToken(csrf),required]);await db.query('commit');return json(toLoginResponse(hashSessionToken(csrf),required),200,id,{'Set-Cookie':sessionCookie(raw, 43200)});}catch(e){try{await db.query('rollback');}catch{}const reason=loginFailureReason(e);if(reason){console.warn(`login_failed request_id=${id} reason=${reason} account=${accountKey} ip=${ipKey}`);throw new Error('INVALID_CREDENTIALS');}throw e;}finally{db.release();}}
+if(parts[0]==='api'&&parts[1]==='auth'&&parts[2]==='reset'&&parts[3]==='request'&&req.method==='POST')return await handleResetRequest(req,id);
+if(parts[0]==='api'&&parts[1]==='auth'&&parts[2]==='reset'&&parts[3]==='confirm'&&req.method==='POST')return await handleResetConfirm(req,id);
 if(parts[0]==='api'&&!configured)throw new Error('CONFIGURATION_REQUIRED');
 // Public resolution requires the tenant in the URL; a token alone can never select across tenants.
     if(parts[0]==='api'&&parts[1]==='public'&&parts[2]==='tenants'&&parts[4]==='cards'&&req.method==='GET'){if(!repository||!cardResolveLimiter.allow(clientIpKey(req)))throw new Error(!repository?'DATABASE_REQUIRED':'RATE_LIMITED');const result=await repository.publicCard(parts[3],hashToken(parts[5]));if(!result)throw new Error('CARD_NOT_FOUND');
@@ -438,6 +595,8 @@ if(parts[0]==='api'&&!configured)throw new Error('CONFIGURATION_REQUIRED');
         return json(toPublicCardResponse(result,parts[3]),200,id);}
     if(parts[0]==='card'&&parts.length===3&&req.method==='GET'){if(!repository||!cardResolveLimiter.allow(clientIpKey(req)))throw new Error(!repository?'DATABASE_REQUIRED':'RATE_LIMITED');const result=await repository.publicCard(parts[1],hashToken(parts[2]));if(!result)throw new Error('CARD_NOT_FOUND');const b: Branding=safeBranding(result.branding) ?? {cardTitle:'StempelPass',cardText:'',primaryColor:DEFAULT_PRIMARY_CARD_COLOR,secondaryColor:DEFAULT_SECONDARY_CARD_COLOR,version:1};const r: StampRule=result.rule ?? {id:'',tenantId:parts[1],name:'',stampsRequired:1,rewardTitle:'Prämie',rewardDescription:'',active:true,version:1};const esc=(v:unknown)=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]!));const progress=Math.min(100,Math.round((result.card.stampCount/Math.max(1,Number(r.stampsRequired||1)))*100));return new Response(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(b.cardTitle||'StempelPass')}</title><style>body{font:16px system-ui;margin:0;padding:2rem;background:${esc(b.secondaryColor||'#f8fafc')};color:#172033}.card{max-width:28rem;margin:auto;padding:2rem;border-radius:1.5rem;background:white;border-top:1rem solid ${esc(b.primaryColor||'#155e75')};box-shadow:0 8px 30px #0002}progress{width:100%;accent-color:${esc(b.primaryColor||'#155e75')}}.privacy{margin-top:1.5rem;padding-top:1rem;border-top:1px solid #e2e8f0;font-size:.85rem;color:#475569}.privacy h3{margin:0 0 .4rem;font-size:inherit;color:#334155}.privacy p{margin:.4rem 0}</style><main class="card"><h1>${esc(b.cardTitle)}</h1><p>${esc(b.cardText)}</p><p><strong>${result.card.stampCount}</strong> / ${esc(r.stampsRequired)} Stempel</p><progress max="100" value="${progress}"></progress><h2>${esc(r.rewardTitle)}</h2><p>${esc(r.rewardDescription)}</p><a style="display:block;width:100%;box-sizing:border-box;text-align:center;background:${esc(b.primaryColor)};color:#fff;text-decoration:none;padding:.9rem 1rem;border-radius:.75rem;font-weight:600;margin-top:1.5rem" href="/api/public/tenants/${esc(parts[1])}/cards/${esc(parts[2])}/wallet/google/redirect">Zu Google Wallet hinzufügen</a><p style="margin:.5rem 0 0;font-size:.8rem;color:#475569;text-align:center">Auf dem Handy öffnen, um die Karte ins Wallet zu legen.</p><section class="privacy"><h3>Datenschutz</h3><p>${esc('Verantwortlich für die Verarbeitung: '+(result.controllerName||'<Tenant>'))}</p><p>${esc('Diese Stempelkarte speichert nur den Stempelstand und den Fortschritt zur Prämie. StempelPass Deutschland verarbeitet die Daten als Auftragsverarbeiter (Art. 28 DSGVO).')}</p><p>${esc('Die Karte wird nach 12 Monaten ohne Stempelaktivität deaktiviert. Kundendaten werden 30 Tage nach der Soft-Löschung endgültig gelöscht. Falls Sie Kommunikationsnachrichten erhalten oder eine Einwilligung erteilen, wird die Kommunikationshistorie 24 Monate gespeichert; der Nachweis Ihrer Einwilligung wird für einen Zeitraum von 3 Jahren nach Ihrem Widerruf gespeichert. Audit-Aufzeichnungen werden zur Beweissicherung dauerhaft aufbewahrt.')}</p>${result.privacyContact?'<p>'+esc('Sie haben das Recht auf Auskunft, Berichtigung, Löschung und Widerspruch. Kontakt für Anfragen: '+result.privacyContact)+'</p>':''}</section></main>`,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'}});}
     if(parts[0]==='join'&&parts.length===2&&req.method==='GET'){if(!/^[a-f0-9]{32}$/i.test(parts[1]))throw new Error('ENTRY_POINT_NOT_FOUND');if(!repository||!cardResolveLimiter.allow(joinResolveKey(req,parts[1])))throw new Error(!repository?'DATABASE_REQUIRED':'RATE_LIMITED');const ctx=await repository.joinContext(parts[1]);if(!ctx)throw new Error('ENTRY_POINT_NOT_FOUND');const origin=new URL(req.url).origin;return htmlResponse(joinPageHtml(ctx,`${origin}${ctx.joinPath}`),200,{'Cache-Control':'public, max-age=60'});}
+    if(parts[0]==='reset'&&parts.length===1&&req.method==='GET')return htmlResponse(resetRequestPage());
+    if(parts[0]==='reset'&&parts.length===2&&req.method==='GET')return await handleResetPage(req);
     // -----------------------------------------------------------------
     // Staff web UI (server-rendered HTML, same auth/CSRF/rotation as the API)
     // -----------------------------------------------------------------
@@ -488,12 +647,14 @@ export function withTestDependencies(next: {
   pool?: DbPool | undefined;
   repository?: CardRepository | undefined;
   walletFactory?: typeof walletAdapter;
+  emailFactory?: (() => SmtpEmailAdapter) | undefined;
 }): () => void {
-  const previous = { configured, pool, repository, dbReady, initializationError, pilotReady, walletFactory };
+  const previous = { configured, pool, repository, dbReady, initializationError, pilotReady, walletFactory, emailFactory };
   if (next.configured !== undefined) configured = next.configured;
   pool = next.pool;
   repository = next.repository;
   if (next.walletFactory !== undefined) walletFactory = next.walletFactory;
+  if (next.emailFactory !== undefined) emailFactory = next.emailFactory;
   // The seam injects an already-ready runtime (a scripted fake pool): bypass
   // the module-scope readiness gate so requests hit the fake pool directly.
   if (next.pool !== undefined) { dbReady = true; pilotReady = true; }
