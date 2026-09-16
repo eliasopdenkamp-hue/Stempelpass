@@ -577,3 +577,54 @@ test('017 closes the exact 014 matrix gap: customers INSERT is granted', async (
   expect(m014).not.toMatch(/public\.customers/);
   expect(m017).toMatch(/execute 'grant insert on public\.customers to stempelpass_runtime'/i);
 });
+
+test('019 creates password_reset_tokens as user-scoped RLS storage with hash-only tokens', async () => {
+  const m019 = await readFile(join(MIGRATIONS_DIR, '019_password_reset_tokens.sql'), 'utf8');
+  expect(m019).toMatch(/create table password_reset_tokens/);
+  expect(m019).toMatch(/user_id uuid not null references users\(id\)/i);
+  expect(m019).toMatch(/token_hash text not null unique/i);
+  expect(m019).toMatch(/expires_at timestamptz not null/i);
+  expect(m019).toMatch(/consumed_at timestamptz/i);
+  expect(m019.replace(/^--.*$/gm, '')).not.toMatch(/raw[_ ]?token/i);
+  expect(m019).toMatch(/alter table password_reset_tokens enable row level security/i);
+  expect(m019).not.toMatch(/force row level security/i);
+  const policy = m019.match(/create policy password_reset_tokens_user_isolation on password_reset_tokens\s*using \(([\s\S]*?)\)\s*with check \(([\s\S]*?)\);/s);
+  expect(policy).not.toBeNull();
+  const expectedUserScope = "user_id = nullif(current_setting('app.user_id', true), '')::uuid";
+  expect(policy![1].trim()).toBe(expectedUserScope);
+  expect(policy![2].trim()).toBe(expectedUserScope);
+});
+
+test('019 resolver: minimal SECURITY DEFINER token-to-user bootstrap with format guard and validity window', async () => {
+  const m019 = await readFile(join(MIGRATIONS_DIR, '019_password_reset_tokens.sql'), 'utf8');
+  expect(m019).toMatch(/create or replace function public\.resolve_password_reset_user\(p_token_hash text\)/);
+  expect(m019).toMatch(/returns table \(user_id uuid\)/);
+  expect(m019).toMatch(/\bsecurity definer\b/i);
+  expect(m019).toMatch(/set search_path = pg_catalog/i);
+  expect(m019).toMatch(/from public\.password_reset_tokens/);
+  expect(m019).toMatch(/p_token_hash ~ '\^\[a-f0-9\]\{64\}\$'/);
+  expect(m019).toMatch(/consumed_at is null/i);
+  expect(m019).toMatch(/expires_at > now\(\)/i);
+  const body = m019.match(/as \$\$\n?([\s\S]*?)\n?\$\$/)?.[1] ?? '';
+  expect(body).not.toMatch(/\bexecute\b/i);
+  expect(body).not.toMatch(/format\(/i);
+  expect(body).not.toMatch(/select \*/i);
+  expect(body).not.toMatch(/email|password|mfa_|csrf|token_hash/i);
+  expect(m019).toMatch(/revoke all on function public\.resolve_password_reset_user\(text\) from public/);
+  expect(m019).toMatch(/grant execute on function public\.resolve_password_reset_user\(text\) to stempelpass_runtime/);
+  expect(m019).toMatch(/grant execute on function public\.resolve_password_reset_user\(text\) to app_role/);
+  expect(m019).toMatch(/if exists \(select 1 from pg_roles where rolname = 'stempelpass_runtime'\)/i);
+  expect(m019).toMatch(/if exists \(select 1 from pg_roles where rolname = 'app_role'\)/i);
+});
+
+test('019 grants UPDATE on users to the runtime role (customers-017 incident class)', async () => {
+  const m019 = await readFile(join(MIGRATIONS_DIR, '019_password_reset_tokens.sql'), 'utf8');
+  const stmts = m019.replace(/^--.*$/gm, '');
+  expect(stmts).toMatch(/execute 'grant update on public\.users to stempelpass_runtime'/i);
+  expect(stmts).toMatch(/execute 'grant update on public\.users to app_role'/i);
+  expect(stmts).toMatch(/execute 'grant select, insert, update on table public\.password_reset_tokens to stempelpass_runtime'/i);
+  expect(stmts).toMatch(/execute 'grant select, insert, update on table public\.password_reset_tokens to app_role'/i);
+  expect(stmts).not.toMatch(/\b(alter role|drop role|create role)\b/i);
+  expect(stmts).not.toMatch(/revoke [^;]*(stempelpass_runtime|app_role)/i);
+  expect(stmts).not.toMatch(/force row level security/i);
+});

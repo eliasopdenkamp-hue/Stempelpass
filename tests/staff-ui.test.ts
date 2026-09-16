@@ -181,6 +181,8 @@ test('GET /login renders the staff login form without any server state', async (
     expect(html).toContain('name="mfaCode"');
     expect(html).toContain('/api/auth/login');
     expect(html).toContain('location.href = \'/staff\'');
+    // Owner wish: the login page links to the self-service password reset.
+    expect(html).toContain('<p class="meta" style="margin-top:1rem"><a href="/reset">Passwort vergessen?</a></p>');
     // No session/CSRF/secrets are ever embedded in the login page.
     expect(html).not.toContain('csrf');
     expect(html).not.toContain(SESSION_TOKEN);

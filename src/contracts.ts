@@ -42,6 +42,15 @@ export function toRedeemResponse(result: RedeemResult): RedeemResponse { return 
 /** POST /api/auth/login */
 export interface LoginResponse { csrfToken: string; mfaRequired: boolean; }
 export function toLoginResponse(csrfToken: string, mfaRequired: boolean): LoginResponse { return { csrfToken, mfaRequired }; }
+/**
+ * POST /api/auth/reset/request — fixed neutral body, byte-identical for known
+ * and unknown accounts (anti-enumeration; SMTP not_configured changes nothing).
+ */
+export interface ResetRequestResponse { status: 'requested'; }
+export function toResetRequestResponse(): ResetRequestResponse { return { status: 'requested' }; }
+/** POST /api/auth/reset/confirm — fixed acknowledgement after a successful rotation. */
+export interface ResetConfirmResponse { status: 'password_reset_confirmed'; }
+export function toResetConfirmResponse(): ResetConfirmResponse { return { status: 'password_reset_confirmed' }; }
 
 /** PUT .../pilot — unchanged shape, centralized contract. */
 export interface PilotResponse { tenantId: string; planCode: 'up_to_500' | 'up_to_1000'; customerLimit: number; ruleId: string; joinPath: string; }
