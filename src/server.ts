@@ -302,6 +302,13 @@ async function handleStaffStamp(req:Request,tenantId:string,id:string):Promise<R
     const cardId=await resolveCardId(tenantId,input);
     const value=await repository.stamp(tenantId,cardId,quantity,actor.membershipId,crypto.randomUUID());
     const rotated=await rotate(actor);
+    // Best-effort Google Wallet balance sync (same contract as the tenant API
+    // routes): DB write first, then refresh the loyaltyObject {issuerId}.{cardId}
+    // with the committed stamp result. The refreshed card id comes from the
+    // stamp's UPDATE ... RETURNING — the exact card that was stamped. A Wallet
+    // failure never fails the already-committed stamp (errors are suppressed
+    // inside syncWalletBalance).
+    await syncWalletBalance(tenantId,value.card,req.headers.get('x-vercel-oidc-token'));
     const dash=await repository.staffDashboard(tenantId);
     const stats=await repository.staffStats(tenantId);
     const newCard=await dashboardNewCard(req,tenantId,actor.role);
@@ -319,6 +326,10 @@ async function handleStaffRedeem(req:Request,tenantId:string,id:string):Promise<
     const rewardId=String(body.rewardId??'').trim();if(!rewardId)throw new Error('REWARD_NOT_FOUND');
     const value=await repository.redeem(tenantId,rewardId);
     const rotated=await rotate(actor);
+    // Best-effort Google Wallet balance sync: refresh the loyaltyObject
+    // {issuerId}.{cardId} to the RESET balance (0 stamps — new collection
+    // round). Same contract as the API redeem route; failures stay suppressed.
+    await syncWalletBalance(tenantId,value.card,req.headers.get('x-vercel-oidc-token'));
     const dash=await repository.staffDashboard(tenantId);
     const stats=await repository.staffStats(tenantId);
     const newCard=await dashboardNewCard(req,tenantId,actor.role);
@@ -349,6 +360,13 @@ async function handleStaffCreateCard(req:Request,tenantId:string,id:string):Prom
     const rawToken=randomToken();
     const created=await repository.createCard(tenantId,customerId,dash.rule.id,hashToken(rawToken),crypto.randomUUID(),rawToken);
     const rotated=await rotate(actor);
+    // Best-effort Google Wallet balance sync for the fresh card: the
+    // loyaltyObject {issuerId}.{cardId} is provisioned by issue() when the
+    // customer saves the card — at that point the balance comes from the DB
+    // (0 for a brand-new card). The refresh here keeps the staff create path
+    // uniform with stamp/redeem; against a never-saved object it is a graceful
+    // 404 no-op inside refresh().
+    await syncWalletBalance(tenantId,{id:created.id,stampCount:created.stampCount??0},req.headers.get('x-vercel-oidc-token'));
     const dash2=await repository.staffDashboard(tenantId);
     const stats=await repository.staffStats(tenantId);
     const origin=new URL(req.url).origin;
