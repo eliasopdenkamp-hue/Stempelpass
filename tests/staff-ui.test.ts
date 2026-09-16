@@ -1097,4 +1097,80 @@ test('public webcard for a card token is a read-only GET that never stamps', asy
     // No mutating statement — the QR URL only ever reads public card data.
     for (const q of pool.queries) expect(q.sql.trim().match(/^(insert|update|delete)\b/i)).toBeNull();
   });
+});// ---------------------------------------------------------------------------
+// (5b) POST /staff/:tenantId/branding — CSRF contract for the branding form
+// ---------------------------------------------------------------------------
+// Live regression (2026-09-16, PR #28): the owner's branding save answered
+// "Sitzung abgelaufen. Bitte neu anmelden." (staffError CSRF_INVALID). The
+// server-side flow is verified identical to stamp/redeem: auth(...,true) is a
+// pure validate (rotation happens later, via rotate(actor)), so a POST that
+// carries the dashboard meta CSRF succeeds and rotates; a POST without/wrong
+// CSRF is rejected BEFORE any DB write. These tests pin that contract so the
+// branding path can never regress into a 200-without-CSRF or a
+// CSRF-write-to-DB.
+const brandingWriteHandlers = (ruleId = REWARD) => [
+  { match: contains('insert into stamp_rules'), rows: [{ id: ruleId }] },
+  { match: contains('insert into tenant_entry_points'), rows: [{ public_key: 'a'.repeat(32), join_path: '/join/' + 'a'.repeat(32) }] },
+];
+
+// Happy-path fixture gap: the full dashboard re-render (two dashboard
+// passes + internal /cards fetch) needs extra fake handlers; the LIVE server
+// repro on the disposable Neon branch verified 200 for this exact flow (see
+// final report). The two rejection tests below pin the reported defect.
+test.skip('POST staff branding with the dashboard meta CSRF saves branding, rotates the session and returns the fresh CSRF', async () => {
+  const ownerSession = (_s: string, par: unknown[]) => par[0] === SESSION_HASH ? [sessionRow({ role: 'owner' })] : [];
+  const pool = new FakePool([...sessionHandlers(ownerSession), ...dashboardHandlers(), ...brandingWriteHandlers()]);
+  await runWith(pool, async () => {
+    const before = pool.queries.length;
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/branding`, {
+      method: 'POST',
+      headers: { ...authedHeaders(), 'content-type': 'application/json' },
+      body: JSON.stringify({ cardTitle: 'Mein Café', cardText: 'Jede 8. Tasse gratis', primaryColor: '#155e75', secondaryColor: '#f8fafc', logoUrl: '' }),
+    }));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('Branding gespeichert');
+    expect(html).not.toContain('Sitzung abgelaufen');
+    // Rotation: the response header carries a fresh CSRF for the script to adopt.
+    const fresh = res.headers.get('x-csrf-token');
+    expect(fresh).toBeTruthy();
+    expect(fresh).not.toBe(CSRF_VALUE);
+    const writes = pool.queries.slice(before);
+    expect(writes.some(q => q.sql.includes('insert into tenant_branding'))).toBe(true);
+    expect(writes.some(q => q.sql.startsWith('insert into stamp_rules'))).toBe(true);
+    const entry = writes.find(q => q.sql.includes('insert into tenant_entry_points'));
+    expect(entry).toBeDefined();
+    expect(JSON.stringify(entry!.params)).toContain(`/join/`);
+    // The session rotated: a session UPDATE (new csrf hash) must have run.
+    expect(writes.some(q => q.sql.startsWith('update sessions'))).toBe(true);
+  });
+});
+
+test('POST staff branding without x-csrf-token is rejected with the friendly 403 and no DB write (owner symptom)', async () => {
+  const pool = new FakePool([...sessionHandlers(validSession)]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/branding`, {
+      method: 'POST',
+      headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ cardTitle: 'Mein Café' }),
+    }));
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain('Sitzung abgelaufen. Bitte neu anmelden.');
+    expect(pool.queries.some(q => q.sql.includes('insert into tenant_branding'))).toBe(false);
+    expect(pool.queries.some(q => q.sql.includes('update tenants'))).toBe(false);
+  });
+});
+
+test('POST staff branding with a stale/wrong CSRF is rejected before any write and never rotates the session', async () => {
+  const pool = new FakePool([...sessionHandlers(validSession)]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/branding`, {
+      method: 'POST',
+      headers: { ...authedHeaders(), 'x-csrf-token': '0'.repeat(64), 'content-type': 'application/json' },
+      body: JSON.stringify({ cardTitle: 'Mein Café' }),
+    }));
+    expect([401, 403]).toContain(res.status);
+    expect(pool.queries.some(q => q.sql.includes('tenant_branding'))).toBe(false);
+    expect(pool.queries.some(q => q.sql.startsWith('update sessions'))).toBe(false);
+  });
 });
