@@ -35,6 +35,7 @@ const EXPECTED = [
   '016_staff_tenant_resolver.sql',
   '017_customers_insert_grant.sql',
   '018_tenant_branding_logo_url.sql',
+  '019_password_reset_tokens.sql',
 ];
 
 test('migration files: exact expected set, runner-compatible names, stable order', async () => {
@@ -609,7 +610,18 @@ test('019 resolver: minimal SECURITY DEFINER token-to-user bootstrap with format
   expect(body).not.toMatch(/\bexecute\b/i);
   expect(body).not.toMatch(/format\(/i);
   expect(body).not.toMatch(/select \*/i);
-  expect(body).not.toMatch(/email|password|mfa_|csrf|token_hash/i);
+  // token_hash is the lookup key: it appears only in the WHERE clause
+  // (column name + p_token_hash param) and is NEVER selected or returned —
+  // the resolver returns ONLY user_id. Referencing the key is therefore
+  // legitimate. The secret scan allows "password" ONLY inside the table name
+  // password_reset_tokens (the token lookup table); any other "password"
+  // occurrence (e.g. a password_hash column) would be a selected secret and
+  // fails via password(?!_reset). The SELECT list must contain nothing but
+  // user_id (no comma => no friend columns).
+  expect(body).not.toMatch(/email|password(?!_reset)|mfa_|csrf/i);
+  expect(body).toMatch(/select public\.password_reset_tokens\.user_id/);
+  expect(body).toMatch(/where public\.password_reset_tokens\.token_hash = p_token_hash/);
+  expect(body.match(/select ([^\n]+)/)?.[1] ?? '').not.toMatch(/,/);
   expect(m019).toMatch(/revoke all on function public\.resolve_password_reset_user\(text\) from public/);
   expect(m019).toMatch(/grant execute on function public\.resolve_password_reset_user\(text\) to stempelpass_runtime/);
   expect(m019).toMatch(/grant execute on function public\.resolve_password_reset_user\(text\) to app_role/);
