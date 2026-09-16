@@ -34,6 +34,7 @@ const EXPECTED = [
   '015_customer_legal_retention_hold.sql',
   '016_staff_tenant_resolver.sql',
   '017_customers_insert_grant.sql',
+  '018_tenant_branding_logo_url.sql',
 ];
 
 test('migration files: exact expected set, runner-compatible names, stable order', async () => {

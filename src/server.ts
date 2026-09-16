@@ -4,7 +4,7 @@ import { createPostgresPool, runMigrations, type DbPool } from './db.js';
 import { CardRepository, type StaffDashboardData, type StaffStats } from './repository.js';
 import { configurationStatus } from './config.js';
 import { EncryptedMfaSecretStore, verifyTotp } from './mfa.js';
-import { walletAdapter } from './wallet.js';
+import { walletAdapter, ensureGoogleWalletClass } from './wallet.js';
 import { classifyError } from './http-error.js';
 import { DEFAULT_PRIMARY_CARD_COLOR, DEFAULT_SECONDARY_CARD_COLOR, joinPageHtml, safeBranding, toPublicCardResponse, toWalletCardView } from './public-card.js';
 import { publicHealthResponse } from './health.js';
@@ -208,6 +208,8 @@ function dashboardView(tenantId:string,role:string,dash:StaffDashboardData,stats
     cardTitle:branding?.cardTitle??'StempelPass',
     cardText:branding?.cardText??'',
     primaryColor:branding?.primaryColor??DEFAULT_PRIMARY_CARD_COLOR,
+    secondaryColor:branding?.secondaryColor??DEFAULT_SECONDARY_CARD_COLOR,
+    logoUrl:branding?.logoUrl??'',
     ruleName:rule?.name??null,
     stampsRequired:rule?.stampsRequired??null,
     rewardTitle:rule?.rewardTitle??null,
@@ -355,6 +357,50 @@ async function handleStaffCreateCard(req:Request,tenantId:string,id:string):Prom
     return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash2,stats,rotated.header['x-csrf-token'],newCard),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
   }catch(e){return staffError(e,id);}
 }
+async function handleStaffBranding(req:Request,tenantId:string,id:string):Promise<Response>{
+  try{
+    if(!UUID_RE.test(tenantId))return htmlResponse(staffErrorPage(404,'TENANT_NOT_FOUND',id),404);
+    if(!pool||!repository)throw new Error('DATABASE_REQUIRED');
+    const actor=await auth(req,tenantId,true);
+    if(actor.role!=='owner'&&actor.role!=='admin')throw new Error('FORBIDDEN');
+    const dash=await repository.staffDashboard(tenantId);
+    if(!dash.tenant)throw new Error('TENANT_NOT_FOUND');
+    const body=await parseBody(req);
+    // Branding-only edit through the existing configurePilot path: preserve the
+    // current plan + stamp rule, replace the branding fields from the form.
+    const currentBranding=dash.branding??{cardTitle:'',cardText:'',primaryColor:'',secondaryColor:'',version:0};
+    const currentRule=dash.rule??{stampsRequired:10,rewardTitle:'Gratisartikel',rewardDescription:''};
+    const newBranding: Branding={
+      cardTitle:String(body.cardTitle??currentBranding.cardTitle??'StempelPass').trim(),
+      cardText:String(body.cardText??currentBranding.cardText??'').trim(),
+      primaryColor:String(body.primaryColor??currentBranding.primaryColor??DEFAULT_PRIMARY_CARD_COLOR),
+      secondaryColor:String(body.secondaryColor??currentBranding.secondaryColor??DEFAULT_SECONDARY_CARD_COLOR),
+      logoUrl:String(body.logoUrl??'').trim()||undefined,
+      version:(currentBranding.version??0)+1,
+    };
+    await repository.configurePilot(tenantId,actor.userId,{
+      planCode:dash.tenant.planCode as 'up_to_500'|'up_to_1000',
+      cardTitle:newBranding.cardTitle,
+      cardText:newBranding.cardText,
+      primaryColor:newBranding.primaryColor,
+      secondaryColor:newBranding.secondaryColor,
+      logoUrl:newBranding.logoUrl,
+      stampsRequired:Number(currentRule.stampsRequired??10),
+      rewardTitle:String(currentRule.rewardTitle??'Gratisartikel').trim(),
+      rewardDescription:String(currentRule.rewardDescription??'').trim(),
+    });
+    // Best-effort class sync: push the SAVED colors/name/logo onto the approved
+    // Wallet class NOW (never fail the request — the class is patched anyway on
+    // the next save-to-wallet issue()). Logged with the error code only.
+    try{await ensureGoogleWalletClass(newBranding,{oidcToken:req.headers.get('x-vercel-oidc-token')??undefined});}catch(error){console.error(`wallet_class_sync_failed code=${error instanceof Error?error.message:'GOOGLE_WALLET_CLASS_SYNC_UNAVAILABLE'}`)}
+    const rotated=await rotate(actor);
+    const dash2=await repository.staffDashboard(tenantId);
+    const stats=await repository.staffStats(tenantId);
+    const newCard=await dashboardNewCard(req,tenantId,actor.role);
+    const flash='Branding gespeichert — die Google-Wallet-Klasse wird bei der nächsten Kartenausstellung bzw. sofort aktualisiert.';
+    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash2,stats,rotated.header['x-csrf-token'],newCard),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
+  }catch(e){return staffError(e,id);}
+}
 async function handleStaffLogout(req:Request,tenantId:string,id:string):Promise<Response>{
   try{
     if(!UUID_RE.test(tenantId))return htmlResponse(staffErrorPage(404,'TENANT_NOT_FOUND',id),404);
@@ -386,11 +432,12 @@ if(parts[0]==='api'&&!configured)throw new Error('CONFIGURATION_REQUIRED');
       if(parts[2]==='stamp')return handleStaffStamp(req,parts[1],id);
       if(parts[2]==='cards')return handleStaffCreateCard(req,parts[1],id);
       if(parts[2]==='redeem')return handleStaffRedeem(req,parts[1],id);
+      if(parts[2]==='branding')return handleStaffBranding(req,parts[1],id);
       if(parts[2]==='logout')return handleStaffLogout(req,parts[1],id);
     }
     if(parts[0]!=='api'||parts[1]!=='tenants')return json({error:'NOT_FOUND'},404,id);const tenantId=parts[2];const actor=await auth(req,tenantId,req.method!=='GET');
     if(parts.length===3&&req.method==='DELETE'){if(actor.role!=='owner')throw new Error('FORBIDDEN');const value=await repository!.deleteTenant(tenantId);return json(toDeleteResponse(value),200,id);}
-    if(parts[3]==='pilot'&&req.method==='PUT'){if(actor.role!=='owner'&&actor.role!=='admin')throw new Error('FORBIDDEN');const body=await req.json() as any;const value=await repository!.configurePilot(tenantId,actor.userId,{planCode:body.planCode,cardTitle:body.cardTitle||'',cardText:body.cardText||'',primaryColor:body.primaryColor||'',secondaryColor:body.secondaryColor||'',iconAssetId:body.iconAssetId,logoAssetId:body.logoAssetId,stampsRequired:body.stampsRequired,rewardTitle:body.rewardTitle||'',rewardDescription:body.rewardDescription||''});return json(toPilotResponse(value),200,id);}
+    if(parts[3]==='pilot'&&req.method==='PUT'){if(actor.role!=='owner'&&actor.role!=='admin')throw new Error('FORBIDDEN');const body=await req.json() as any;const value=await repository!.configurePilot(tenantId,actor.userId,{planCode:body.planCode,cardTitle:body.cardTitle||'',cardText:body.cardText||'',primaryColor:body.primaryColor||'',secondaryColor:body.secondaryColor||'',iconAssetId:body.iconAssetId,logoAssetId:body.logoAssetId,logoUrl:body.logoUrl,stampsRequired:body.stampsRequired,rewardTitle:body.rewardTitle||'',rewardDescription:body.rewardDescription||''});return json(toPilotResponse(value),200,id);}
     if(parts[3]==='entry-point'&&req.method==='GET')return json(await repository!.entryPoint(tenantId),200,id);
     if(parts[3]==='staff'&&req.method==='PUT'){if(actor.role!=='owner'&&actor.role!=='admin')throw new Error('FORBIDDEN');const body=await req.json() as {userId?:string;role?:'admin'|'staff'|'viewer';active?:boolean};const value=await repository!.setStaff(tenantId,actor.userId,body.userId||'',body.role||'staff',body.active!==false);return json(toStaffResponse(value),200,id);}
 if(parts[3]==='logout'&&req.method==='POST'){await repository!.revokeSession(actor.userId,hashSessionToken(actor.token));return json({loggedOut:true},200,id,{'Set-Cookie':sessionCookie('', 0)});}

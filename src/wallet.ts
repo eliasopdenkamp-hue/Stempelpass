@@ -8,6 +8,10 @@ export interface LoyaltyClass {
   programName: string;
   reviewStatus?: 'UNDER_REVIEW' | 'APPROVED';
   programLogo?: { sourceUri: { uri: string } };
+  /** Class-level card background color (Google Wallet LoyaltyClass.hexBackgroundColor). */
+  hexBackgroundColor?: string;
+  /** Class-level card text color (Google Wallet LoyaltyClass.hexFontColor). */
+  hexFontColor?: string;
 }
 export interface LoyaltyObject {
   id: string;
@@ -61,7 +65,60 @@ export interface GoogleWalletClassProvisioner {
   ensureClassExists(classModel: LoyaltyClass): Promise<void>;
 }
 
-/** Idempotently provisions the issuer-wide LoyaltyClass before issuing a pass. */
+/** Strict six-digit CSS hex, as the Wallet API expects for card colors. */
+function brandHexColor(value: string | undefined): string | undefined {
+  return value && /^#[0-9a-fA-F]{6}$/.test(value) ? value : undefined;
+}
+/** Google Wallet needs a PUBLICLY HOSTED image URL for programLogo. */
+function brandHttpsUrl(value: string | undefined): string | undefined {
+  return value && /^https:\/\/\S+$/i.test(value) && value.length <= 2048 ? value : undefined;
+}
+/** Fallback logo URL (platform default; used when the tenant set no logo yet). */
+export const DEFAULT_CLASS_LOGO_URI = 'https://www.gstatic.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png';
+/** Fallback branding mirrors the pre-branding adapter behaviour (StempelPass defaults). */
+export const FALLBACK_BRANDING: Branding = { cardTitle: 'StempelPass', cardText: '', primaryColor: '', secondaryColor: '', version: 1 };
+
+/**
+ * Deterministic tenant-aware LoyaltyClass model built from tenant branding.
+ *
+ * Class id: `{issuerId}.{classSuffix}` — the PILOT tenant keeps the default
+ * suffix `stempelpass_loyalty`, which is exactly the class id that is already
+ * APPROVED in the production issuer account (`3388000000023180140.stempelpass_loyalty`),
+ * so the owner's already-saved Wallet pass keeps working. A different suffix
+ * (future multi-tenant) means a NEW class at Google that goes through review
+ * again — deliberately NOT used for the pilot.
+ *
+ * Branding mapping (fields the Wallet API actually accepts at class level):
+ * programName   ← branding.cardTitle (company card title)
+ * hexBackgroundColor ← branding.primaryColor (validated #rrggbb)
+ * programLogo   ← branding.logoUrl (must be a hosted https URL), else the
+ *                 platform fallback logo (never omits programLogo).
+ * issuerName stays the platform name 'Stempelpass' — Branding deliberately has
+ * no legal-name field; a per-tenant issuer name is a documented follow-up.
+ */
+export function tenantClassModel(issuerId: string, branding: Branding, classSuffix = 'stempelpass_loyalty'): LoyaltyClass {
+  const title = (branding.cardTitle ?? '').trim() || 'StempelPass';
+  const logoUri = brandHttpsUrl(branding.logoUrl);
+  const model: LoyaltyClass = {
+    id: `${issuerId}.${classSuffix}`,
+    issuerName: 'Stempelpass',
+    programName: title,
+    reviewStatus: 'UNDER_REVIEW',
+    programLogo: { sourceUri: { uri: logoUri ?? DEFAULT_CLASS_LOGO_URI } },
+  };
+  const background = brandHexColor(branding.primaryColor);
+  if (background) model.hexBackgroundColor = background;
+  return model;
+}
+
+/** Idempotently provisions the issuer-wide LoyaltyClass before issuing a pass.
+ *  GET → 404: POST create. GET 200: compare ONLY the branding-relevant fields;
+ *  when any differs, PATCH the existing class with exactly those fields
+ *  (partial update, no reviewStatus/id) — idempotent "patch once": after the
+ *  first PATCH the GET returns the new values and no further PATCH is issued.
+ *  Patching the APPROVED pilot class can push it back into Google review
+ *  (documented in the PR); the owner's saved pass object is NOT affected —
+ *  objects reference the class by id, which never changes. */
 export class GoogleWalletApiClassProvisioner implements GoogleWalletClassProvisioner {
   constructor(private readonly credentials: GcpCredentialProvider, private readonly fetchFn: typeof fetch = fetch) {}
 
@@ -70,7 +127,19 @@ export class GoogleWalletApiClassProvisioner implements GoogleWalletClassProvisi
     const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
     const url = `https://walletobjects.googleapis.com/walletobjects/v1/loyaltyClass/${encodeURIComponent(classModel.id)}`;
     const existing = await this.fetchFn(url, { headers });
-    if (existing.ok) return;
+    if (existing.ok) {
+      let current: Partial<LoyaltyClass> = {};
+      try { current = (await existing.json()) as Partial<LoyaltyClass>; } catch { /* non-JSON body: leave the class untouched */ return; }
+      const patch: Partial<LoyaltyClass> = {};
+      if ((current.issuerName ?? '') !== classModel.issuerName) patch.issuerName = classModel.issuerName;
+      if ((current.programName ?? '') !== classModel.programName) patch.programName = classModel.programName;
+      if (classModel.programLogo && (current.programLogo?.sourceUri?.uri ?? '') !== classModel.programLogo.sourceUri.uri) patch.programLogo = classModel.programLogo;
+      if (classModel.hexBackgroundColor && (current.hexBackgroundColor ?? '') !== classModel.hexBackgroundColor) patch.hexBackgroundColor = classModel.hexBackgroundColor;
+      if (Object.keys(patch).length === 0) return;
+      const patched = await this.fetchFn(url, { method: 'PATCH', headers, body: JSON.stringify(patch) });
+      if (!patched.ok) throw new Error(`GOOGLE_WALLET_CLASS_PATCH_FAILED_${patched.status}`);
+      return;
+    }
     if (existing.status !== 404) throw new Error(`GOOGLE_WALLET_CLASS_GET_FAILED_${existing.status}`);
 
     const create = await this.fetchFn('https://walletobjects.googleapis.com/walletobjects/v1/loyaltyClass', {
@@ -88,6 +157,9 @@ export class GoogleWalletAdapter implements WalletAdapter {
    * @param signer     JWT signer (local private-key or keyless IAM signBlob).
    * @param clientEmail Service-account email used as the JWT `iss` claim.
    * @param credentialMode 'service-account-json' (fallback) or 'external-account' (keyless/WIF).
+   * @param classSuffix Class-id suffix after `{issuerId}.` — defaults to the
+   *   pilot suffix `stempelpass_loyalty` (the APPROVED production class); a
+   *   different suffix provisions a NEW class that needs Google review.
    */
   constructor(
     private readonly issuerId: string,
@@ -97,22 +169,28 @@ export class GoogleWalletAdapter implements WalletAdapter {
     private readonly classProvisioner?: GoogleWalletClassProvisioner,
     private readonly credentials?: GcpCredentialProvider,
     private readonly fetchFn: typeof fetch = fetch,
+    private readonly classSuffix: string = 'stempelpass_loyalty',
   ) {
-    this.classModel = {
-      id: `${issuerId}.stempelpass_loyalty`,
-      issuerName: 'Stempelpass',
-      programName: 'StempelPass',
-      reviewStatus: 'UNDER_REVIEW',
-      programLogo: { sourceUri: { uri: 'https://www.gstatic.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png' } },
-    };
+    this.classModel = tenantClassModel(issuerId, FALLBACK_BRANDING, this.classSuffix);
   }
-  private objectModel(card: WalletCardView, branding: Branding, context?: { stampRequired?: number; rewardTitle?: string }): LoyaltyObject {
-    return { id: `${this.issuerId}.${card.id}`, classId: this.classModel.id, state: 'ACTIVE', loyaltyPoints: { balance: { int: card.stampCount } }, textModulesData: [{ header: branding.cardTitle, body: `${card.stampCount}/${context?.stampRequired ?? '?'} Stempel · ${context?.rewardTitle ?? 'Prämie'}` }] };
+  /** Branding-derived LoyaltyClass (tenant-aware: card title, colors, logo). */
+  classModelFor(branding: Branding): LoyaltyClass {
+    return tenantClassModel(this.issuerId, branding, this.classSuffix);
+  }
+  private objectModel(classId: string, card: WalletCardView, branding: Branding, context?: { stampRequired?: number; rewardTitle?: string }): LoyaltyObject {
+    const title = branding.cardTitle?.trim() || 'StempelPass';
+    const modules: Array<{ header: string; body: string }> = [
+      { header: title, body: `${card.stampCount}/${context?.stampRequired ?? '?'} Stempel · ${context?.rewardTitle ?? 'Prämie'}` },
+    ];
+    const cardText = branding.cardText?.trim();
+    if (cardText) modules.push({ header: title, body: cardText });
+    return { id: `${this.issuerId}.${card.id}`, classId, state: 'ACTIVE', loyaltyPoints: { balance: { int: card.stampCount } }, textModulesData: modules };
   }
   async issue(card: WalletCardView, branding: Branding, context?: { stampRequired?: number; rewardTitle?: string }): Promise<WalletArtifact> {
-    if (this.classProvisioner) await this.classProvisioner.ensureClassExists(this.classModel);
+    const classModel = this.classModelFor(branding);
+    if (this.classProvisioner) await this.classProvisioner.ensureClassExists(classModel);
     const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'savetowallet' }));
-    const payload = base64url(JSON.stringify({ iss: this.clientEmail, aud: 'google', typ: 'savetowallet', iat: Math.floor(Date.now() / 1000), payload: { loyaltyObjects: [this.objectModel(card, branding, context)] } }));
+    const payload = base64url(JSON.stringify({ iss: this.clientEmail, aud: 'google', typ: 'savetowallet', iat: Math.floor(Date.now() / 1000), payload: { loyaltyObjects: [this.objectModel(classModel.id, card, branding, context)] } }));
     const signature = await this.signer.sign(`${header}.${payload}`);
     const message = this.credentialMode === 'external-account'
       ? 'Save to Google Wallet (keyless: signed via IAM Credentials; requires owner verification against real Wallet)'
@@ -137,7 +215,7 @@ export class GoogleWalletAdapter implements WalletAdapter {
   async refresh(card: WalletCardView, changedFields: string[], context?: WalletRefreshContext): Promise<WalletArtifact> {
     if (!this.credentials) return { provider: 'google', status: 'not_configured', message: 'Google Wallet wallet is not configured; refresh skipped.' };
     const branding: Branding = context?.branding ?? { cardTitle: 'StempelPass', cardText: '', primaryColor: '', secondaryColor: '', version: 1 };
-    const model = this.objectModel(card, branding, { stampRequired: context?.stampRequired, rewardTitle: context?.rewardTitle });
+    const model = this.objectModel(this.classModelFor(branding).id, card, branding, { stampRequired: context?.stampRequired, rewardTitle: context?.rewardTitle });
     const { token } = await this.credentials.getAccessToken(WALLET_OBJECT_SCOPE);
     const response = await this.fetchFn(
       `https://walletobjects.googleapis.com/walletobjects/v1/loyaltyObject/${encodeURIComponent(`${this.issuerId}.${card.id}`)}`,
@@ -195,6 +273,23 @@ export function walletAdapter(provider: Provider, options: WalletAdapterOptions 
     return new UnconfiguredWalletAdapter(provider, resolution.missing.join(', ') || 'GOOGLE_ISSUER_ID');
   }
   return new UnconfiguredWalletAdapter(provider);
+}
+
+/**
+ * Best-effort Google Wallet CLASS sync for the current tenant branding
+ * (colors / program name / logo). Used after the Staff-UI branding form saves,
+ * so the APPROVED pilot class reflects the new branding immediately instead of
+ * waiting for the next save-to-wallet (issue()). GET-compare-PATCH semantics
+ * make it idempotent; without GOOGLE_ISSUER_ID / credentials it is a silent
+ * no-op (the class is patched anyway on the next issue()).
+ */
+export async function ensureGoogleWalletClass(branding: Branding, options: WalletAdapterOptions = {}): Promise<void> {
+  const issuerId = process.env.GOOGLE_ISSUER_ID;
+  if (!issuerId) return;
+  const resolution = resolveGcpCredentials(process.env, { oidcToken: options.oidcToken, fetchFn: options.fetchFn });
+  if (!resolution.provider || !resolution.provider.clientEmail) return;
+  const provisioner = new GoogleWalletApiClassProvisioner(resolution.provider, options.fetchFn);
+  await provisioner.ensureClassExists(tenantClassModel(issuerId, branding));
 }
 
 /** Health/status helper: which Google credential mode is configured (if any). */

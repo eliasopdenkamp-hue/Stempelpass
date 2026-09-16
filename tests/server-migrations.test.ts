@@ -299,8 +299,8 @@ test('dbMigrate: applies all pending migrations via the pool and exits 0', async
   const { pool, applied } = fakeApplyingPool();
   const code = await dbMigrate({ DATABASE_URL: 'postgres://user:pass@example.invalid/db' }, () => pool);
   expect(code).toBe(0);
-  // The real migrations directory holds exactly 001–017; all applied once.
-  expect(applied.length).toBe(17);
+  // The real migrations directory holds exactly 001–018; all applied once.
+  expect(applied.length).toBe(18);
 });
 
 test('runMigrationsOnPool: rejects when the pool fails (caller maps to exit 1)', async () => {

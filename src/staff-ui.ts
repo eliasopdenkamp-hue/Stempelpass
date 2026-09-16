@@ -264,6 +264,9 @@ export interface DashboardView {
   cardTitle: string;
   cardText: string;
   primaryColor: string;
+  secondaryColor: string;
+  /** Hosted logo (https URL) shown on the Google Wallet class (tenant_branding.logo_url). */
+  logoUrl: string;
   ruleName: string | null;
   stampsRequired: number | null;
   rewardTitle: string | null;
@@ -303,6 +306,28 @@ export function dashboardPage(v: DashboardView, flash?: { kind: 'ok' | 'error'; 
   const title = v.cardTitle || 'StempelPass';
   const tenantName = v.legalName || v.cardTitle || 'Unternehmen';
   const flashHtml = flash ? `<div class="flash ${esc(flash.kind)}" id="sp-flash">${esc(flash.text)}</div>` : '';
+  /**
+   * Tenant branding editor (owner/admin only): cardTitle, card text, colors and
+   * the hosted logo URL that becomes the Google Wallet class programLogo. The
+   * form posts JSON via the generic data-staff-form handler to
+   * /staff/:tenantId/branding, which persists through the existing
+   * configurePilot path. Legacy iconAssetId/logoAssetId (uuid asset refs) are intentionally
+   * NOT in the form: the Wallet API needs a hosted https URL (logo_url), while
+   * the uuid asset-store columns have no store yet — follow-up.
+   */
+  const brandingCanEdit = v.role === 'owner' || v.role === 'admin' ? `
+<div style="margin-top:1.25rem;padding:.1rem .9rem;border:1px solid #e2e8f0;border-radius:.75rem;background:#f8fafc">
+<h2>Karten-Branding</h2>
+<p class="hint">Titel, Farben und Logo erscheinen auf der Webkarte und im Google-Wallet-Klasse. Das Logo braucht eine öffentlich erreichbare https-URL; Änderungen an der Google-Wallet-Klasse können eine erneute Freigabe-Prüfung auslösen.</p>
+<form data-staff-form action="/staff/${esc(v.tenantId)}/branding" method="post">
+<label for="b-title">Kartentitel</label><input id="b-title" name="cardTitle" value="${esc(v.cardTitle)}" required maxlength="120">
+<label for="b-text">Kartentext</label><textarea id="b-text" name="cardText" rows="2" maxlength="280" style="width:100%;box-sizing:border-box;padding:.7rem .8rem;border:1px solid #cbd5e1;border-radius:.6rem;font:inherit">${esc(v.cardText)}</textarea>
+<label for="b-primary">Primärfarbe</label><input id="b-primary" name="primaryColor" type="text" value="${esc(primary)}" pattern="#[0-9a-fA-F]{6}" title="#rrggbb" placeholder="#155e75">
+<label for="b-secondary">Sekundärfarbe (Hintergrund Webkarte)</label><input id="b-secondary" name="secondaryColor" type="text" value="${esc(safeColor(v.secondaryColor ?? '', DEFAULT_SECONDARY_CARD_COLOR))}" pattern="#[0-9a-fA-F]{6}" title="#rrggbb" placeholder="#f8fafc">
+<label for="b-logo">Logo-URL (https, für Google Wallet)</label><input id="b-logo" name="logoUrl" type="url" value="${esc(v.logoUrl)}" placeholder="https://…" maxlength="2048">
+<button type="submit" class="secondary">Branding speichern</button>
+</form>
+</div>` : '';
   /**
    * Prominent "Neue Karte" panel (only when a recoverable card token exists):
    * scannable SVG data-URI of the webcard URL, the link + token as text, and
@@ -372,6 +397,7 @@ ${flashHtml}<p id="sp-errbox" class="flash error" style="display:none" role="ale
 ${newCardHtml}
 <div class="row"><h1 style="margin:0">${esc(tenantName)}</h1><span class="spacer"></span><button type="button" class="ghost" data-action="logout" data-url="/staff/${esc(v.tenantId)}/logout">Abmelden</button></div>${v.cardText ? `<p class="meta">${esc(v.cardText)}</p>` : ""}
 <p class="meta">Tarif: ${esc(PLAN_LABEL[v.planCode] ?? v.planCode)} · ${esc(v.usedCards)} von ${esc(v.customerLimit)} Kunden belegt · Rolle: ${esc(v.role)}</p>
+${brandingCanEdit}
 <h2>Stempelregel &amp; Prämie</h2>${rewardHtml}
 ${statsHtml}
 <h2>Links für die Demo</h2>${joinHtml}<p class="hint">Kunden-Webkarte: <code>/card/${esc(v.tenantId)}/{Karten-Token}</code> — der Karten-Token wird bei der Kartenerstellung einmalig ausgegeben und ist nur dem Kunden/Personal bekannt.</p>
