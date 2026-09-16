@@ -1,6 +1,7 @@
 import { test, expect } from 'bun:test';
 import { CardRepository, type DbPool, type TxClient } from '../src/repository';
 import { hashSessionToken, randomToken, stampLimiter } from '../src/security';
+import { walletAdapter } from '../src/wallet';
 import { createCipheriv, createHash, randomBytes } from 'node:crypto';
 
 /**
@@ -1172,5 +1173,159 @@ test('POST staff branding with a stale/wrong CSRF is rejected before any write a
     expect([401, 403]).toContain(res.status);
     expect(pool.queries.some(q => q.sql.includes('tenant_branding'))).toBe(false);
     expect(pool.queries.some(q => q.sql.startsWith('update sessions'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (9) Google Wallet balance sync in the staff write handlers (owner fix:
+// "DB=6 Stempel, Wallet zeigt 4" — staff-stamped stamps never refreshed the
+// loyaltyObject because handleStaffStamp/Redeem/CreateCard did not call
+// syncWalletBalance, unlike the tenant API routes from PR #27). Same
+// best-effort contract: DB write first, then refresh the deterministic
+// loyaltyObject {issuerId}.{cardId} with the committed balance; a Wallet
+// failure never fails the already-committed write. Fake WalletAdapter is
+// injected through the withTestDependencies walletFactory seam (same pattern
+// as the API-route refresh tests in tests/http-contract.test.ts §7b).
+// ---------------------------------------------------------------------------
+function walletSyncAdapter(refreshed: Array<{ card: { id: string; stampCount: number }; context: Record<string, unknown> }>, options: { failRefresh?: boolean } = {}) {
+  return {
+    async issue() { return { provider: 'google' as const, status: 'issued' as const, message: 'ok', artifact: 'a.b.c' }; },
+    async refresh(card: { id: string; stampCount: number }, _fields: string[], context?: unknown) {
+      if (options.failRefresh) throw new Error('GOOGLE_WALLET_REFRESH_FAILED_500');
+      refreshed.push({ card, context: (context ?? {}) as Record<string, unknown> });
+      return { provider: 'google' as const, status: 'issued' as const, message: 'ok' };
+    },
+    async revoke() {},
+  };
+}
+function runWithWallet(pool: DbPool, factory: typeof walletAdapter, fn: () => Promise<unknown>): Promise<unknown> {
+  const restore = withTestDependencies({ configured: true, pool, repository: new CardRepository(pool), walletFactory: factory });
+  return fn().finally(restore);
+}
+
+test('POST staff stamp best-effort-syncs the Google Wallet balance with the STAMPED card id and the new count', async () => {
+  stampLimiter.clear();
+  const refreshed: Array<{ card: { id: string; stampCount: number }; context: Record<string, unknown> }> = [];
+  const adapter = walletSyncAdapter(refreshed);
+  const factory = (() => adapter) as unknown as typeof walletAdapter;
+  const pool = new FakePool(stampFlowHandlers());
+  await runWithWallet(pool, factory, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/stamp`, {
+      method: 'POST',
+      headers: authedHeaders(),
+      body: new URLSearchParams({ cardId: CARD, quantity: '1' }),
+    }));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('hat jetzt 4 Stempel');
+    // Exactly one refresh — the deterministic {issuerId}.{cardId} object id is
+    // derived from the card id the stamp write RETURNED (same card that was
+    // stamped via resolveCardId → repository.stamp), with the NEW balance.
+    expect(refreshed).toHaveLength(1);
+    expect(refreshed[0].card).toEqual({ id: CARD, stampCount: 4 });
+    // Refresh context comes from cardWalletContext: rule + branding.
+    expect(refreshed[0].context.stampRequired).toBe(5);
+    expect(refreshed[0].context.rewardTitle).toBe('Kaffee');
+    expect((refreshed[0].context.branding as { cardTitle: string }).cardTitle).toBe('Meine Karte');
+  });
+});
+
+test('POST staff stamp resolves a card TOKEN and syncs the wallet for the resolved card (same id as the DB write)', async () => {
+  stampLimiter.clear();
+  const refreshed: Array<{ card: { id: string; stampCount: number } }> = [];
+  const adapter = walletSyncAdapter(refreshed as never);
+  const factory = (() => adapter) as unknown as typeof walletAdapter;
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('public_token_hash'), rows: [{ id: CARD, tenantId: TENANT, customerId: '22222222-2222-4222-8222-222222222222', publicTokenHash: 'f'.repeat(64), status: 'active', stampCount: 3, revision: 2, ruleId: RULE, createdAt: null, updatedAt: null }] },
+    { match: contains('from stamp_events where'), rows: [] },
+    { match: contains('from cards where'), rows: [{ id: CARD, stampCount: 3, revision: 2, ruleId: RULE }] },
+    { match: contains('insert into stamp_events'), rows: [] },
+    { match: contains('update cards set stamp_count'), rows: [{ id: CARD, stampCount: 4, revision: 3 }] },
+    { match: contains('stamps_required from stamp_rules'), rows: [{ id: RULE, stamps_required: 5 }] },
+    { match: contains('(select 1 from rewards'), rows: [] },
+    ...dashboardHandlers(),
+  ]);
+  await runWithWallet(pool, factory, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/stamp`, {
+      method: 'POST',
+      headers: authedHeaders(),
+      body: new URLSearchParams({ cardId: CARD_TOKEN, quantity: '1' }),
+    }));
+    expect(res.status).toBe(200);
+    // The refresh targets the RESOLVED card id — not the token, never a
+    // different card (PR #27 deploy report showed a mismatched card: DB 0 vs
+    // Wallet 2 — this pins that the staff refresh hits the stamped card).
+    expect(refreshed).toHaveLength(1);
+    expect(refreshed[0].card).toEqual({ id: CARD, stampCount: 4 });
+  });
+});
+
+test('POST staff redeem best-effort-syncs the wallet to the RESET balance (0 stamps)', async () => {
+  const refreshed: Array<{ card: { id: string; stampCount: number } }> = [];
+  const adapter = walletSyncAdapter(refreshed as never);
+  const factory = (() => adapter) as unknown as typeof walletAdapter;
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed', card_id: CARD }] },
+    { match: contains('update cards set stamp_count=0'), rows: [] },
+    // Post-redeem dashboard: the card counter is back to 0 (new collection round).
+    ...dashboardHandlers({
+      rewards: [{ id: REWARD, cardId: CARD, status: 'redeemed' }],
+      cards: [{ id: CARD, customerRef: 'Kunde-42', stampCount: 0, updatedAt: '2026-08-26T10:00:00.000Z' }],
+    }),
+  ]);
+  await runWithWallet(pool, factory, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/redeem`, {
+      method: 'POST',
+      headers: authedHeaders(),
+      body: new URLSearchParams({ rewardId: REWARD }),
+    }));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('Prämie erfolgreich eingelöst.');
+    // Exactly one refresh with the reset balance and the reward's card id.
+    expect(refreshed).toHaveLength(1);
+    expect(refreshed[0].card).toEqual({ id: CARD, stampCount: 0 });
+  });
+});
+
+test('POST staff create-card best-effort-syncs the new card ({issuerId}.{newCardId}, balance 0)', async () => {
+  process.env.SESSION_SECRET = TEST_SESSION_SECRET;
+  const refreshed: Array<{ card: { id: string; stampCount: number } }> = [];
+  const adapter = walletSyncAdapter(refreshed as never);
+  const factory = (() => adapter) as unknown as typeof walletAdapter;
+  const pool = new FakePool(createCardFlowHandlers());
+  await runWithWallet(pool, factory, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/cards`, {
+      method: 'POST',
+      headers: authedHeaders({ 'content-type': 'application/json' }),
+      body: JSON.stringify({}),
+    }));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('Neue Karte angelegt');
+    // The fresh card is synced with the preconfigured balance 0 — the same id
+    // the QR/Webkarte/Wallet save-link flow will use for the loyaltyObject.
+    // Against a never-saved object the real adapter's refresh() is a graceful
+    // 404 no-op; the call itself must still happen for every staff write path.
+    expect(refreshed).toHaveLength(1);
+    expect(refreshed[0].card).toEqual({ id: NEW_CARD, stampCount: 0 });
+  }).finally(() => { delete process.env.SESSION_SECRET; });
+});
+
+test('staff wallet refresh failure never fails the committed stamp (best-effort suppressed)', async () => {
+  stampLimiter.clear();
+  const adapter = walletSyncAdapter([], { failRefresh: true });
+  const factory = (() => adapter) as unknown as typeof walletAdapter;
+  const pool = new FakePool(stampFlowHandlers());
+  await runWithWallet(pool, factory, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/stamp`, {
+      method: 'POST',
+      headers: authedHeaders(),
+      body: new URLSearchParams({ cardId: CARD, quantity: '1' }),
+    }));
+    // The committed stamp answers 200 even though the Wallet PATCH threw
+    // GOOGLE_WALLET_REFRESH_FAILED_500 (logged, suppressed by syncWalletBalance).
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('hat jetzt 4 Stempel');
+    expect(res.headers.get('x-csrf-token')).toMatch(/^[0-9a-f]{64}$/);
   });
 });
