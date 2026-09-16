@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { GoogleWalletAdapter, GoogleWalletApiClassProvisioner, PrivateKeyJwtSigner, IamSignBlobJwtSigner, walletAdapter, googleWalletConfiguration } from './wallet';
+import { GoogleWalletAdapter, GoogleWalletApiClassProvisioner, PrivateKeyJwtSigner, IamSignBlobJwtSigner, walletAdapter, googleWalletConfiguration, ensureGoogleWalletClass, tenantClassModel, DEFAULT_CLASS_LOGO_URI } from './wallet';
 import { ExternalAccountCredentials, ServiceAccountJsonCredentials } from './gcp-credentials';
 const card = { id:'card-1', tenantId:'tenant-1', customerId:'customer-1', publicTokenHash:'hash', status:'active' as const, stampCount:3, revision:2, ruleId:'rule-1' };
 const branding = { cardTitle:'Café', cardText:'Treuekarte', primaryColor:'#123456', secondaryColor:'#fff', version:1 };
@@ -55,7 +55,16 @@ test('walletAdapter resolves the classic fallback from GOOGLE_SERVICE_ACCOUNT_JS
   const result = await walletAdapter('google', { fetchFn: mockGoogleFetch(calls) }).issue(card, branding);
   expect(result.status).toBe('issued');
   expect(result.artifact?.split('.')).toHaveLength(3);
-  expect(calls.map(c => c.url)).toEqual(['https://oauth2.googleapis.com/token', 'https://walletobjects.googleapis.com/walletobjects/v1/loyaltyClass/123.stempelpass_loyalty']);
+  // Deterministic provisioning chain: oauth token → GET class (exists) →
+  // PATCH class with the tenant branding (class GET returns only {id}, so the
+  // branding-relevant fields differ). The class id is the APPROVED pilot class.
+  expect(calls.map(c => c.url)).toEqual([
+    'https://oauth2.googleapis.com/token',
+    'https://walletobjects.googleapis.com/walletobjects/v1/loyaltyClass/123.stempelpass_loyalty',
+    'https://walletobjects.googleapis.com/walletobjects/v1/loyaltyClass/123.stempelpass_loyalty',
+  ]);
+  const classCalls = calls.filter(c => c.url.includes('/loyaltyClass/'));
+  expect(classCalls.map(c => c.init?.method ?? 'GET')).toEqual(['GET', 'PATCH']);
 }));
 
 const EAC_CONFIG = JSON.stringify({
@@ -128,6 +137,7 @@ test('keyless external-account mode issues a signed JWT without any private key 
     'https://sts.googleapis.com/v1/token',
     'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/wallet-sa@project.iam.gserviceaccount.com:generateAccessToken',
     'https://walletobjects.googleapis.com/walletobjects/v1/loyaltyClass/123.stempelpass_loyalty',
+    'https://walletobjects.googleapis.com/walletobjects/v1/loyaltyClass/123.stempelpass_loyalty',
     'https://sts.googleapis.com/v1/token',
     'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/wallet-sa@project.iam.gserviceaccount.com:generateAccessToken',
     'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/wallet-sa@project.iam.gserviceaccount.com:signBlob',
@@ -135,7 +145,7 @@ test('keyless external-account mode issues a signed JWT without any private key 
   const stsBody = JSON.parse(String(calls[0].init.body)) as Record<string, string>;
   expect(stsBody.subject_token).toBe('vercel-oidc-token');
   expect(stsBody.subject_token_type).toBe('urn:ietf:params:oauth:token-type:jwt');
-  const signBlobAuth = (calls[5].init.headers as Record<string, string>).Authorization;
+  const signBlobAuth = (calls[6].init.headers as Record<string, string>).Authorization;
   expect(signBlobAuth).toBe('Bearer sa-token');
 }));
 
@@ -221,7 +231,11 @@ test('refresh PATCHes the loyaltyObject with the new balance and text module (mo
   expect(auth).toBe('Bearer oauth-token');
   const body = JSON.parse(String(patch!.init.body)) as Record<string, any>;
   expect(body.loyaltyPoints).toEqual({ balance: { int: card.stampCount } });
-  expect(body.textModulesData).toEqual([{ header: branding.cardTitle, body: '3/10 Stempel · Gratis' }]);
+  // Branding flows through to the object: progress module + cardText module.
+  expect(body.textModulesData).toEqual([
+    { header: branding.cardTitle, body: '3/10 Stempel · Gratis' },
+    { header: branding.cardTitle, body: branding.cardText },
+  ]);
   // The PATCH is the ONLY loyaltyObject call: no GET, no class provisioning.
   expect(calls.filter(c => c.url.includes('/loyaltyObject/'))).toHaveLength(1);
 }));
@@ -271,4 +285,133 @@ test('refresh PATCHes with fallback branding/rule when no context is supplied', 
   expect(result.status).toBe('issued');
   const body = JSON.parse(String(calls.find(c => c.url === WALLET_PATCH_URL)!.init.body)) as Record<string, any>;
   expect(body.textModulesData).toEqual([{ header: 'StempelPass', body: '3/? Stempel · Prämie' }]);
+}));
+
+// ---------------------------------------------------------------------------
+// Tenant branding: class model, object model, class provisioning (owner
+// feature request 15.09.: companies customize the Wallet pass).
+// ---------------------------------------------------------------------------
+const LOGO_URL = 'https://cdn.example.invalid/cafe-logo.png';
+const branded = { cardTitle: 'Café Herz', cardText: 'Sammle Stempel', primaryColor: '#123456', secondaryColor: '#f8fafc', logoUrl: LOGO_URL, version: 2 };
+
+test('tenantClassModel reflects tenant branding (title, colors, logo) and keeps the APPROVED pilot class id', () => {
+  const model = tenantClassModel('123', branded);
+  // The class id stays on the APPROVED production class — never a new class id
+  // that would orphan the owner's saved pass or force a new Google review.
+  expect(model.id).toBe('123.stempelpass_loyalty');
+  expect(model.programName).toBe('Café Herz');
+  expect(model.issuerName).toBe('Stempelpass');
+  expect(model.hexBackgroundColor).toBe('#123456');
+  expect(model.programLogo?.sourceUri.uri).toBe(LOGO_URL);
+  expect(model.reviewStatus).toBe('UNDER_REVIEW');
+  // Unbranded/invalid values degrade deterministically to the platform defaults
+  // and NEVER send invalid fields to Google (no hexBackgroundColor for 'rot').
+  const fallback = tenantClassModel('123', { cardTitle: '', cardText: '', primaryColor: 'rot', secondaryColor: '', version: 1 });
+  expect(fallback.programName).toBe('StempelPass');
+  expect(fallback.hexBackgroundColor).toBeUndefined();
+  expect(fallback.programLogo?.sourceUri.uri).toBe(DEFAULT_CLASS_LOGO_URI);
+});
+
+test('class suffix derives a tenant-specific class id without breaking the default', () => {
+  const model = tenantClassModel('123', branded, 'tenant-1');
+  expect(model.id).toBe('123.tenant-1');
+  expect(model.programName).toBe('Café Herz');
+});
+
+
+test('issue() embeds branding in the object model: tenant class id + progress and cardText modules', async () => {
+  const key = await Bun.$`openssl genrsa 2048 2>/dev/null`.text();
+  const adapter = new GoogleWalletAdapter('123', new PrivateKeyJwtSigner(key), 'test@example.invalid', 'service-account-json', undefined, undefined, fetch, 'tenant-1');
+  const result = await adapter.issue(card, branded, { stampRequired: 10, rewardTitle: 'Gratis Kaffee' });
+  const payload = JSON.parse(Buffer.from(result.artifact!.split('.')[1], 'base64url').toString('utf8'));
+  const obj = payload.payload.loyaltyObjects[0];
+  expect(obj.id).toBe('123.card-1');
+  expect(obj.classId).toBe('123.tenant-1');
+  expect(obj.textModulesData).toEqual([
+    { header: 'Café Herz', body: '3/10 Stempel · Gratis Kaffee' },
+    { header: 'Café Herz', body: 'Sammle Stempel' },
+  ]);
+});
+
+/** Reusable scripted Google credentials fixture (no real network). */
+function mockCredentials() {
+  return {
+    mode: 'service-account-json' as const, clientEmail: 'sa@example.invalid', description: 'test',
+    signBlob: async () => new Uint8Array(),
+    getAccessToken: async (scope?: string) => { expect(scope).toBe('https://www.googleapis.com/auth/wallet_object.issuer'); return { token: 'access', expiresAt: Date.now() + 3_600_000 }; },
+  };
+}
+
+test('class provisioning PATCHes an existing class only when branding differs (idempotent patch once)', async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  let stored = { id: '123.stempelpass_loyalty', issuerName: 'Stempelpass', programName: 'Alter Name', hexBackgroundColor: '#000000', programLogo: { sourceUri: { uri: 'https://old.example.invalid/logo.png' } } };
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); calls.push({ url, init: init ?? {} });
+    if (url.includes('/loyaltyClass/')) {
+      if (init?.method === 'PATCH') {
+        stored = { ...stored, ...(JSON.parse(String(init.body)) as Record<string, unknown>) };
+        return new Response(JSON.stringify(stored), { status: 200 });
+      }
+      return new Response(JSON.stringify(stored), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    throw new Error(`unexpected URL in mock: ${url}`);
+  }) as unknown as typeof fetch;
+  const provisioner = new GoogleWalletApiClassProvisioner(mockCredentials(), fetchFn);
+  const model = tenantClassModel('123', branded);
+  await provisioner.ensureClassExists(model);
+  await provisioner.ensureClassExists(model); // GET now matches → NO second PATCH
+  const patches = calls.filter(c => c.init?.method === 'PATCH');
+  expect(patches).toHaveLength(1);
+  const body = JSON.parse(String(patches[0].init.body)) as Record<string, unknown>;
+  // Partial-update body: branding fields ONLY — never reviewStatus or id.
+  expect(body).toEqual({ programName: 'Café Herz', hexBackgroundColor: '#123456', programLogo: { sourceUri: { uri: LOGO_URL } } });
+  expect(body.reviewStatus).toBeUndefined();
+  expect(body.id).toBeUndefined();
+  expect(stored.programName).toBe('Café Herz');
+  expect(stored.programLogo).toEqual({ sourceUri: { uri: LOGO_URL } });
+});
+
+test('class provisioning surfaces explicit errors: GET non-404 and PATCH failures', async () => {
+  const denied = (async () => new Response('denied', { status: 403 })) as unknown as typeof fetch;
+  await expect(new GoogleWalletApiClassProvisioner(mockCredentials(), denied).ensureClassExists(tenantClassModel('123', branded)))
+    .rejects.toThrow('GOOGLE_WALLET_CLASS_GET_FAILED_403');
+  const failPatch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.includes('/loyaltyClass/')) {
+      return init?.method === 'PATCH' ? new Response('denied', { status: 500 }) : new Response(JSON.stringify({ id: '123.stempelpass_loyalty' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    throw new Error(`unexpected URL in mock: ${url}`);
+  }) as unknown as typeof fetch;
+  await expect(new GoogleWalletApiClassProvisioner(mockCredentials(), failPatch).ensureClassExists(tenantClassModel('123', branded)))
+    .rejects.toThrow('GOOGLE_WALLET_CLASS_PATCH_FAILED_500');
+});
+
+test('class provisioning creates a fresh class on 404 with the branding-derived model (create body carries reviewStatus)', async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); calls.push({ url, init: init ?? {} });
+    // Class-specific GET (…/loyaltyClass/<id>) → 404 so the provisioner creates;
+    // the collection POST (…/loyaltyClass) → 200 with the created class.
+    if (url.includes('/loyaltyClass/')) return new Response('not found', { status: 404 });
+    if (url.endsWith('/loyaltyClass')) return new Response(JSON.stringify({ id: '123.stempelpass_loyalty' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    throw new Error(`unexpected URL in mock: ${url}`);
+  }) as unknown as typeof fetch;
+  await new GoogleWalletApiClassProvisioner(mockCredentials(), fetchFn).ensureClassExists(tenantClassModel('123', branded));
+  const create = calls.find(c => c.url === 'https://walletobjects.googleapis.com/walletobjects/v1/loyaltyClass' && c.init?.method === 'POST');
+  expect(create).toBeDefined();
+  const body = JSON.parse(String(create!.init.body)) as Record<string, unknown>;
+  expect(body.id).toBe('123.stempelpass_loyalty');
+  expect(body.programName).toBe('Café Herz');
+  expect(body.hexBackgroundColor).toBe('#123456');
+  expect(body.reviewStatus).toBe('UNDER_REVIEW');
+});
+
+test('ensureGoogleWalletClass syncs the class from env credentials and is a silent no-op without them', async () => withCleanEnv(async () => {
+  await ensureGoogleWalletClass(branded); // no GOOGLE_ISSUER_ID → silent no-op
+  const key = await Bun.$`openssl genrsa 2048 2>/dev/null`.text();
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  process.env.GOOGLE_ISSUER_ID = '123';
+  process.env.GOOGLE_SERVICE_ACCOUNT_JSON = JSON.stringify({ client_email: 'sa@example.invalid', private_key: key });
+  await ensureGoogleWalletClass(branded, { fetchFn: mockGoogleFetch(calls) });
+  expect(calls.some(c => c.url.includes('/loyaltyClass/') && (c.init?.method ?? 'GET') === 'PATCH')).toBe(true);
 }));

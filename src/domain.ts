@@ -6,7 +6,7 @@ export type Provider = 'apple' | 'google';
 
 export const PLAN_LIMITS: Record<PlanCode, number> = { up_to_500: 500, up_to_1000: 1000 };
 export interface Tenant { id: string; slug: string; planCode: PlanCode; customerLimit: number; }
-export interface Branding { cardTitle: string; cardText: string; primaryColor: string; secondaryColor: string; iconAssetId?: string; logoAssetId?: string; version: number; }
+export interface Branding { cardTitle: string; cardText: string; primaryColor: string; secondaryColor: string; iconAssetId?: string; logoAssetId?: string; /** Hosted https URL used as the Google Wallet class programLogo (tenant_branding.logo_url). */ logoUrl?: string; version: number; }
 export interface StampRule { id: string; tenantId: string; name: string; stampsRequired: number; rewardTitle: string; rewardDescription: string; active: boolean; version: number; }
 export interface Card { id: string; tenantId: string; customerId: string; publicTokenHash: string; status: 'active'|'archived'; stampCount: number; revision: number; ruleId: string; }
 /** Minimal card view for public/wallet output: never carries customerId or publicTokenHash. */
