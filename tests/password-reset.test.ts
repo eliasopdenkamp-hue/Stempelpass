@@ -6,22 +6,27 @@
  * Covers all three reset endpoints:
  *   POST /api/auth/reset/request  — neutral answer always (anti-enumeration),
  *                                   hashed token storage, SMTP not_configured
- *                                   and configured-send paths, rate limits;
+ *                                   and configured-send paths, rate limits,
+ *                                   timing equalizer (dummy scrypt also runs
+ *                                   for unknown emails);
  *   GET  /reset/:token            — form page vs neutral 404, format guard;
- *   POST /api/auth/reset/confirm  — password rotation (scrypt hash stored,
- *                                   never the plaintext), ALL-session revoke,
- *                                   single-use token (consumed_at), audit row
- *                                   with operationId idempotency, rate limits,
+ *   POST /api/auth/reset/confirm  — password rotation through the SECURITY
+ *                                   DEFINER function public.reset_user_password
+ *                                   (scrypt hash stored, never the plaintext),
+ *                                   atomic single-use consume (exactly ONE of
+ *                                   two parallel confirms wins), ALL-session
+ *                                   revoke, audit row, rate limits,
  *                                   short-password and invalid-token failures.
  */
-import { test, expect, beforeEach } from 'bun:test';
+import { test, expect, beforeEach, spyOn } from 'bun:test';
 import { CardRepository, type DbPool, type TxClient } from '../src/repository';
 import { SmtpEmailAdapter } from '../src/email';
 import {
   hashPassword, hashSessionToken, loginAccountKey, randomToken, resetResolveKey, verifyPassword,
   resetConfirmIpLimiter, resetConfirmTokenLimiter, resetRequestAccountLimiter,
-  resetRequestIpLimiter, resetResolveLimiter,
+  resetRequestIpLimiter, resetResolveLimiter, verifyPasswordAgainstDummy,
 } from '../src/security';
+import * as securityModule from '../src/security';
 import { loginPage } from '../src/staff-ui';
 
 // --- boot: scrub every secret/config var BEFORE importing the server module ---
@@ -216,6 +221,28 @@ test('reset request with configured SMTP sends the reset e-mail with a /reset/<t
   }, () => adapter);
 });
 
+test('reset request with an unknown email ALSO burns the dummy-scrypt timing budget (no response-time enumeration oracle)', async () => {
+  // Security-Review 91292cdf, MITTEL: the known path spends a bounded
+  // wall-clock budget on the mail; the unknown path must burn the same budget
+  // class. Pin the equalizer: verifyPasswordAgainstDummy IS called for an
+  // unknown account (DB-free spy on the security module).
+  const spy = spyOn(securityModule, 'verifyPasswordAgainstDummy');
+  try {
+    const pool = new FakePool([{ match: contains('from users where'), rows: [] }]);
+    await runWith(pool, async () => {
+      const res = await fetchHandler(new Request('http://test.local/api/auth/reset/request', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-forwarded-for': '203.0.113.57' },
+        body: JSON.stringify({ email: 'wer-auch-immer@example.com' }),
+      }));
+      expect(res.status).toBe(200);
+    });
+    expect(spy).toHaveBeenCalled();
+  } finally {
+    spy.mockRestore();
+  }
+});
+
 test('reset request is rate-limited per hashed account key (4th request for the same email → 429)', async () => {
   const email = 'rate@example.com';
   const accountKey = loginAccountKey(email);
@@ -301,15 +328,14 @@ test('GET /reset/:token with a malformed token answers 404 without touching the 
 /** Handlers for a successful confirm (fresh operationId → no prior audit rows).
  *  Order matters: the audit INSERT contains "from audit_log where action"
  *  inside its NOT EXISTS subquery, so the INSERT handler MUST come first
- *  (first-match semantics of FakePool). */
+ *  (first-match semantics of FakePool). The rotation runs through the SECURITY
+ *  DEFINER function public.reset_user_password (migration 020) — a single
+ *  atomic statement that resolves+consumes the token and writes the hash. */
 function confirmSuccessHandlers(): FakePool['handlers'] {
   return [
     { match: contains('insert into audit_log(tenant_id'), rows: [{ id: 'audit-1' }] },
-    { match: contains('from audit_log where action'), rows: [] },
-    { match: contains('resolve_password_reset_user'), rows: [{ user_id: USER_ID }] },
-    { match: contains('update users set password_hash'), rows: [{ id: USER_ID }] },
+    { match: contains('select user_id from public.reset_user_password'), rows: [{ user_id: USER_ID }] },
     { match: contains('update sessions set revoked_at=now() where user_id'), rows: [] },
-    { match: contains('update password_reset_tokens set consumed_at'), rows: [] },
   ];
 }
 
@@ -320,13 +346,15 @@ test('reset confirm rotates the password (scrypt hash stored, never the plaintex
     expect(res.status).toBe(200);
     expect(((await res.json()) as { data: { status: string } }).data.status).toBe('password_reset_confirmed');
 
-    const update = pool.queries.find(q => q.sql.includes('update users set password_hash'));
-    expect(update).toBeDefined();
-    const storedHash = String(update!.params[0]);
+    // The atomic SECURITY DEFINER rotation carries [token_hash, scrypt_hash] —
+    // the plaintext password never reaches a query parameter or the DB.
+    const rotate = pool.queries.find(q => q.sql.includes('select user_id from public.reset_user_password'));
+    expect(rotate).toBeDefined();
+    expect(rotate!.params[0]).toBe(TOKEN_HASH);
+    const storedHash = String(rotate!.params[1]);
     expect(storedHash.startsWith('$scrypt$N=32768,r=8,p=1$')).toBe(true);
     expect(storedHash).not.toContain(NEW_PASSWORD);
     expect(storedHash).not.toBe(NEW_PASSWORD);
-    expect(update!.params[1]).toBe(USER_ID);
     // The stored digest verifies against the submitted password — the rotation
     // really landed a usable hash.
     expect(await verifyPassword(NEW_PASSWORD, storedHash)).toBe(true);
@@ -336,10 +364,9 @@ test('reset confirm rotates the password (scrypt hash stored, never the plaintex
     expect(revoke).toBeDefined();
     expect(revoke!.params[0]).toBe(USER_ID);
 
-    // Token is single-use: consumed_at set via the hash lookup.
-    const consume = pool.queries.find(q => q.sql.includes('update password_reset_tokens set consumed_at'));
-    expect(consume).toBeDefined();
-    expect(consume!.params[0]).toBe(TOKEN_HASH);
+    // Token is single-use: the CONSUME happens INSIDE the atomic function
+    // (consumed_at is not a separate statement anymore, migration 020).
+    expect(pool.queries.some(q => q.sql.includes('update password_reset_tokens set consumed_at'))).toBe(false);
 
     // Audit row: tenantId null (global-isolation branch 009), actor = user.
     const audit = pool.queries.find(q => q.sql.includes('insert into audit_log'));
@@ -352,8 +379,7 @@ test('reset confirm rotates the password (scrypt hash stored, never the plaintex
 
 test('reset confirm with an unknown/expired/consumed token answers RESET_TOKEN_INVALID and never writes', async () => {
   const pool = new FakePool([
-    { match: contains('from audit_log where action'), rows: [] },
-    { match: contains('resolve_password_reset_user'), rows: [] },
+    { match: contains('select user_id from public.reset_user_password'), rows: [] },
   ]);
   await runWith(pool, async () => {
     const res = await fetchHandler(resetJson({ token: RAW_TOKEN, password: NEW_PASSWORD }));
@@ -361,19 +387,19 @@ test('reset confirm with an unknown/expired/consumed token answers RESET_TOKEN_I
     expect(((await res.json()) as { data: { error: string } }).data.error).toBe('RESET_TOKEN_INVALID');
     expect(pool.queries.some(q => q.sql.includes('update users set password_hash'))).toBe(false);
     expect(pool.queries.some(q => q.sql.includes('update sessions set revoked_at'))).toBe(false);
+    expect(pool.queries.some(q => q.sql.includes('insert into audit_log'))).toBe(false);
   });
 });
 
 test('reset confirm replay of a consumed token (second use) is rejected — single-use semantics', async () => {
   const pool = new FakePool(confirmSuccessHandlers());
   await runWith(pool, async () => {
-    // First use succeeds; on replay the resolver (which filters consumed_at is
-    // null) finds nothing → the same neutral RESET_TOKEN_INVALID.
+    // First use succeeds; on replay the atomic function (consumed_at is null
+    // guard inside 020) finds nothing → the same neutral RESET_TOKEN_INVALID.
     const first = await fetchHandler(resetJson({ token: RAW_TOKEN, password: NEW_PASSWORD }));
     expect(first.status).toBe(200);
     const replayPool = new FakePool([
-      { match: contains('from audit_log where action'), rows: [] },
-      { match: contains('resolve_password_reset_user'), rows: [] },
+      { match: contains('select user_id from public.reset_user_password'), rows: [] },
     ]);
     const restore = withTestDependencies({ configured: true, pool: replayPool, repository: new CardRepository(replayPool) });
     try {
@@ -381,26 +407,41 @@ test('reset confirm replay of a consumed token (second use) is rejected — sing
       expect(second.status).toBe(400);
       expect(((await second.json()) as { data: { error: string } }).data.error).toBe('RESET_TOKEN_INVALID');
       expect(replayPool.queries.some(q => q.sql.includes('update users set password_hash'))).toBe(false);
+      expect(replayPool.queries.some(q => q.sql.includes('insert into audit_log'))).toBe(false);
     } finally {
       restore();
     }
   });
 });
 
-test('reset confirm with an already-applied operationId (audit row for the same user) answers success without re-applying', async () => {
+test('two parallel confirms of the same token — exactly one wins (atomic single-use consume, TOCTOU closed)', async () => {
+  // The atomic SECURITY DEFINER statement (migration 020) consumes the token in
+  // the same statement that rotates the password. Two concurrent confirms
+  // serialize on the token row: exactly one gets the user_id back, the loser
+  // sees 0 rows and answers RESET_TOKEN_INVALID. The stateful handler below
+  // simulates that serialization (first call wins, every later call is empty).
+  let rotationsLeft = 1;
   const pool = new FakePool([
-    // prior audit row exists for this user (same operationId)
-    { match: contains('from audit_log where action'), rows: [{ tenant_id: null, entity_id: USER_ID }] },
-    { match: contains('resolve_password_reset_user'), rows: [{ user_id: USER_ID }] },
+    { match: contains('insert into audit_log(tenant_id'), rows: [{ id: 'audit-1' }] },
+    {
+      match: contains('select user_id from public.reset_user_password'),
+      rows: () => (rotationsLeft-- > 0 ? [{ user_id: USER_ID }] : []),
+    },
+    { match: contains('update sessions set revoked_at=now() where user_id'), rows: [] },
   ]);
   await runWith(pool, async () => {
-    const res = await fetchHandler(resetJson({ token: RAW_TOKEN, password: NEW_PASSWORD }));
-    expect(res.status).toBe(200);
-    expect(((await res.json()) as { data: { status: string } }).data.status).toBe('password_reset_confirmed');
-    // Nothing re-applied: no password update, no session revoke, no token consume.
-    expect(pool.queries.some(q => q.sql.includes('update users set password_hash'))).toBe(false);
-    expect(pool.queries.some(q => q.sql.includes('update sessions set revoked_at'))).toBe(false);
-    expect(pool.queries.some(q => q.sql.includes('update password_reset_tokens set consumed_at'))).toBe(false);
+    const [a, b] = await Promise.all([
+      fetchHandler(resetJson({ token: RAW_TOKEN, password: NEW_PASSWORD })),
+      fetchHandler(resetJson({ token: RAW_TOKEN, password: NEW_PASSWORD })),
+    ]);
+    const statuses = [a.status, b.status].sort();
+    expect(statuses).toEqual([200, 400]);
+    // The winner committed exactly one rotation: one audit row, one session
+    // revoke — the token was consumed at most once.
+    expect(pool.queries.filter(q => q.sql.includes('select user_id from public.reset_user_password')).length).toBe(2);
+    expect(pool.queries.filter(q => q.sql.includes('insert into audit_log')).length).toBe(1);
+    expect(pool.queries.filter(q => q.sql.includes('update sessions set revoked_at')).length).toBe(1);
+    expect(pool.queries.filter(q => q.sql.includes('update password_reset_tokens set consumed_at')).length).toBe(0);
   });
 });
 
@@ -436,8 +477,7 @@ test('reset confirm with a malformed token hits RESET_TOKEN_INVALID before any d
 
 test('reset confirm is rate-limited per IP+token (6th attempt with the same token → 429)', async () => {
   const pool = new FakePool([
-    { match: contains('from audit_log where action'), rows: [] },
-    { match: contains('resolve_password_reset_user'), rows: [] }, // invalid-token path: no scrypt per attempt
+    { match: contains('select user_id from public.reset_user_password'), rows: [] }, // invalid-token path
   ]);
   await runWith(pool, async () => {
     let lastStatus = 0;

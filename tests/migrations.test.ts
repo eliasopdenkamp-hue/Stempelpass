@@ -36,6 +36,7 @@ const EXPECTED = [
   '017_customers_insert_grant.sql',
   '018_tenant_branding_logo_url.sql',
   '019_password_reset_tokens.sql',
+  '020_reset_user_password_function.sql',
 ];
 
 test('migration files: exact expected set, runner-compatible names, stable order', async () => {
@@ -638,5 +639,44 @@ test('019 grants UPDATE on users to the runtime role (customers-017 incident cla
   expect(stmts).toMatch(/execute 'grant select, insert, update on table public\.password_reset_tokens to app_role'/i);
   expect(stmts).not.toMatch(/\b(alter role|drop role|create role)\b/i);
   expect(stmts).not.toMatch(/revoke [^;]*(stempelpass_runtime|app_role)/i);
+  expect(stmts).not.toMatch(/force row level security/i);
+});
+
+test('020 replaces the users UPDATE grant with an atomic SECURITY DEFINER reset_user_password function', async () => {
+  const m020 = await readFile(join(MIGRATIONS_DIR, '020_reset_user_password_function.sql'), 'utf8');
+  expect(m020).toMatch(/create or replace function public\.reset_user_password\(p_token_hash text, p_password_hash text\)/);
+  expect(m020).toMatch(/returns table \(user_id uuid\)/);
+  expect(m020).toMatch(/\bsecurity definer\b/i);
+  expect(m020).toMatch(/set search_path = pg_catalog/i);
+  // Atomic single-statement consume + rotation (TOCTOU): the token consume
+  // (consumed_at = now()) and the users.password_hash write share ONE
+  // statement so two concurrent confirms serialize on the token row.
+  expect(m020).toMatch(/update public\.password_reset_tokens\s+set consumed_at = now\(\)/i);
+  expect(m020).toMatch(/update public\.users\s+u\s+set password_hash = p_password_hash/i);
+  expect(m020).toMatch(/returning u\.id/i);
+  // Resolver hygiene: returns ONLY user_id — no secrets in any RETURNING/
+  // SELECT output list. password_hash is legitimate ONLY as the UPDATE-SET
+  // target column (and its p_password_hash parameter); the table name
+  // password_reset_tokens (lookup key) may appear anywhere except as a
+  // selected value. A password_hash in an output line would be a leak.
+  const body = m020.match(/as \$\$\n?([\s\S]*?)\n?\$\$/)?.[1] ?? '';
+  expect(body).not.toMatch(/select \*/i);
+  expect(body).not.toMatch(/email|mfa_|csrf/i);
+  expect(body).not.toMatch(/(?:returning|select)[^\n]*password_hash/i);
+  expect(body).toMatch(/p_token_hash ~ '\^\[a-f0-9\]\{64\}\$'/);
+  expect(body).toMatch(/consumed_at is null/i);
+  expect(body).toMatch(/expires_at > now\(\)/i);
+  expect(body).toMatch(/status = 'active'/i);
+  // Explicitly no PUBLIC execute; conditional revoke of the 019 UPDATE grant +
+  // conditional grant of EXECUTE (convention 008/009/014/019).
+  expect(m020).toMatch(/revoke all on function public\.reset_user_password\(text, text\) from public/);
+  const stmts = m020.replace(/^--.*$/gm, '');
+  expect(stmts).toMatch(/execute 'revoke update on public\.users from stempelpass_runtime'/i);
+  expect(stmts).toMatch(/execute 'revoke update on public\.users from app_role'/i);
+  expect(stmts).toMatch(/execute 'grant execute on function public\.reset_user_password\(text, text\) to stempelpass_runtime'/i);
+  expect(stmts).toMatch(/execute 'grant execute on function public\.reset_user_password\(text, text\) to app_role'/i);
+  expect(stmts).toMatch(/if exists \(select 1 from pg_roles where rolname = 'stempelpass_runtime'\)/i);
+  expect(stmts).toMatch(/if exists \(select 1 from pg_roles where rolname = 'app_role'\)/i);
+  expect(stmts).not.toMatch(/\b(alter role|drop role|create role)\b/i);
   expect(stmts).not.toMatch(/force row level security/i);
 });

@@ -477,6 +477,42 @@ const RESET_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 const RESET_TOKEN_TTL_SQL = "now() + interval '60 minutes'";
 /** Audit action for a confirmed reset; metadata.operationId is the idempotency anchor. */
 const RESET_CONFIRM_AUDIT_ACTION = 'user.password_reset_confirmed';
+/**
+ * Wall-clock budget the reset-request response spends on the mail path (ms).
+ *
+ * Security-Review 91292cdf (timing oracle): the SMTP send must never hold the
+ * response hostage — a known account would otherwise be distinguishable from an
+ * unknown one by response time. Both branches (known → bounded send wait,
+ * unknown → dummy scrypt) consume the same budget, and a Vercel serverless
+ * freeze after the response can truncate at most a still-in-flight send
+ * (operational: the user re-requests; not a security signal).
+ */
+const RESET_MAIL_BUDGET_MS = 250;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Awaits `promise` for at most `budgetMs` WITHOUT cancelling it: the underlying
+ * promise keeps progressing on the event loop (its I/O is registered with the
+ * runtime), only the response path is released after the budget. Returns
+ * 'completed' when the promise settled within the budget, 'budget' when the
+ * timer won. Used so a slow SMTP provider can never delay the neutral answer —
+ * on Vercel serverless the still-pending work may be cut off after the
+ * response (accepted trade-off, see RESET_MAIL_BUDGET_MS).
+ */
+async function raceWithBudget(promise: Promise<unknown>, budgetMs: number): Promise<'completed' | 'budget'> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<'budget'>((resolve) => {
+    timer = setTimeout(() => resolve('budget'), budgetMs);
+  });
+  try {
+    return await Promise.race([promise.then(() => 'completed' as const), timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 /**
  * POST /api/auth/reset/request — always answers the SAME neutral body
@@ -521,10 +557,37 @@ async function handleResetRequest(req: Request, id: string): Promise<Response> {
     const origin = new URL(req.url).origin;
     const link = origin + '/reset/' + rawToken;
     const adapter = emailFactory ? emailFactory() : new SmtpEmailAdapter();
-    const result = await adapter.send({ to: email, subject: 'Passwort zurücksetzen – StempelPass', text: passwordResetEmailText(link), html: passwordResetEmailHtml(link) });
-    // Neutral either way; logs carry only the hashed account key (never the
-    // raw address) and the classified status (never provider details).
-    if (result.status !== 'sent') console.warn('password_reset_email_not_sent request_id=' + id + ' status=' + result.status + ' account=' + accountKey);
+    // Timing oracle (Security-Review 91292cdf, MITTEL): the send is NEVER
+    // awaited to completion. A slow SMTP provider must not make a known account
+    // distinguishable from an unknown one by response time, and a plain
+    // fire-and-forget promise could be cut off when Vercel serverless freezes
+    // the process right after the response without draining the event loop.
+    // So the send starts as an unmanaged promise and the response path gives it
+    // a short bounded budget on the event loop (raceWithBudget) — long enough
+    // for a healthy SMTP round-trip to settle and be drained, short enough that
+    // a hostile/hung provider cannot hold the answer hostage. The unknown
+    // branch below burns the same budget with a dummy scrypt, so both paths
+    // take statistically indistinguishable wall-clock time. If the budget
+    // expires while the mail is still in flight, delivery is best-effort (the
+    // user re-requests); the neutral answer and the logs stay unchanged.
+    const budgetDeadline = Date.now() + RESET_MAIL_BUDGET_MS;
+    const sendOutcome = await raceWithBudget(
+      adapter.send({ to: email, subject: 'Passwort zurücksetzen – StempelPass', text: passwordResetEmailText(link), html: passwordResetEmailHtml(link) }).then((result) => {
+        // Neutral either way; logs carry only the hashed account key (never the
+        // raw address) and the classified status (never provider details).
+        if (result.status !== 'sent') console.warn('password_reset_email_not_sent request_id=' + id + ' status=' + result.status + ' account=' + accountKey);
+      }).catch(() => undefined),
+      RESET_MAIL_BUDGET_MS,
+    );
+    if (sendOutcome === 'budget') console.warn('password_reset_email_budget_exceeded request_id=' + id + ' account=' + accountKey);
+    if (Date.now() < budgetDeadline) await sleep(budgetDeadline - Date.now());
+  } else {
+    // Unknown/invalid account: burn the SAME wall-clock budget the known path
+    // spends, so account existence cannot be inferred from response time —
+    // same pattern as the login route's verifyPasswordAgainstDummy equalizer.
+    const budgetDeadline = Date.now() + RESET_MAIL_BUDGET_MS;
+    await verifyPasswordAgainstDummy('reset-request-timing-equalizer');
+    if (Date.now() < budgetDeadline) await sleep(budgetDeadline - Date.now());
   }
   return json(toResetRequestResponse(), 200, id as Parameters<typeof json>[2]);
 }
@@ -553,12 +616,22 @@ async function handleResetPage(req: Request): Promise<Response> {
 /**
  * POST /api/auth/reset/confirm — token + new password. Pre-auth like the login
  * POST: no CSRF, rate limits + the token itself as secret. On success the
- * password_hash is replaced (migration 019 grants UPDATE on users to the
- * runtime role — WARNING 1 in PASSWORD_RESET_PREP), ALL sessions of the user
- * are revoked (rotate-owner-password.ts:126 pattern — the next login re-runs
- * MFA), the token is single-use (consumed_at) and an audit row (tenantId null,
- * global-isolation policy 009 — no app.tenant_id is ever set here) records the
- * rotation with a fresh operationId as idempotency anchor.
+ * password_hash is replaced through the SECURITY DEFINER function
+ * public.reset_user_password(token_hash, password_hash) (migration 020 — the
+ * runtime role holds no direct UPDATE on users), ALL sessions of the user are
+ * revoked (rotate-owner-password.ts:126 pattern — the next login re-runs MFA)
+ * and an audit row (tenantId null, global-isolation policy 009 — no
+ * app.tenant_id is ever set here) records the rotation.
+ *
+ * Single-use semantics are enforced ATOMICALLY inside the function: the token
+ * consume (consumed_at) and the password write happen in one statement, so two
+ * concurrent confirms of the same token serialize on the token row — exactly
+ * one wins, the loser gets the neutral RESET_TOKEN_INVALID (TOCTOU closed, no
+ * separate resolver-lookup + consume-update race). The operationId in the
+ * audit row is a fresh UUID per request and only anchors the audit entry; the
+ * NOT-EXISTS guard on the INSERT is a cheap fail-closed backstop for the
+ * (previously dead, see Security-Review 91292cdf) operationId replay branch —
+ * real replay protection is the atomic single-use consume.
  */
 async function handleResetConfirm(req: Request, id: string): Promise<Response> {
   if (!pool) throw new Error('DATABASE_REQUIRED');
@@ -575,30 +648,20 @@ async function handleResetConfirm(req: Request, id: string): Promise<Response> {
   const db = await pool.connect();
   try {
     await db.query('begin');
-    // operationId-Idempotenz (rotate-owner-password pattern): the audit trail
-    // is the source of truth; the guarded INSERT below refuses a duplicate
-    // audit row for a replayed operation. The single-use token (consumed_at)
-    // is the primary replay guard of this self-service flow.
-    const prior = (await db.query<{ entity_id: string | null }>('select entity_id from audit_log where action = $1 and metadata->>\'operationId\' = $2 limit 2', [RESET_CONFIRM_AUDIT_ACTION, operationId])).rows;
-    const resolved = (await db.query<{ user_id: string }>('select user_id from public.resolve_password_reset_user($1)', [hashSessionToken(token)])).rows;
-    if (!resolved[0]?.user_id) throw new Error('RESET_TOKEN_INVALID');
-    const userId = resolved[0].user_id;
-    if (prior.length) {
-      if (prior.some(r => r.entity_id !== userId)) throw new Error('RESET_TOKEN_INVALID');
-      await db.query('commit');
-      return json(toResetConfirmResponse(), 200, id as Parameters<typeof json>[2]);
-    }
-    // User context for the RLS-scoped writes below (session revoke + token
-    // consume); app.tenant_id stays unset so the audit row lands in the
-    // global-isolation branch (009 policy).
+    // Atomic SECURITY DEFINER rotation (migration 020): resolves the token
+    // (format guard, unconsumed, unexpired), consumes it and writes the new
+    // password_hash in ONE statement — 0 rows = unknown/consumed/expired token
+    // or inactive user → the same neutral RESET_TOKEN_INVALID.
+    const rotated = (await db.query<{ user_id: string }>('select user_id from public.reset_user_password($1, $2)', [hashSessionToken(token), passwordHash])).rows;
+    if (!rotated[0]?.user_id) throw new Error('RESET_TOKEN_INVALID');
+    const userId = rotated[0].user_id;
+    // User context for the RLS-scoped session revoke below; app.tenant_id stays
+    // unset so the audit row lands in the global-isolation branch (009 policy).
     await db.query("select set_config('app.user_id', $1, true)", [userId]);
-    const updated = (await db.query<{ id: string }>('update users set password_hash=$1, updated_at=now() where id=$2 and status=\'active\' returning id', [passwordHash, userId])).rows;
-    if (!updated[0]) throw new Error('RESET_TOKEN_INVALID');
     // Revoke ALL sessions — the reset itself bypasses MFA, so every existing
     // session dies and the next login must re-verify MFA (login flow requires
     // mfa_verified for memberships that need it).
     await db.query('update sessions set revoked_at=now() where user_id=$1 and revoked_at is null', [userId]);
-    await db.query('update password_reset_tokens set consumed_at=now() where token_hash=$1 and consumed_at is null', [hashSessionToken(token)]);
     const audit = (await db.query<{ id: string }>('insert into audit_log(tenant_id,actor_user_id,action,entity_type,entity_id,metadata) select null, $1, $2, \'user\', $1, $3::jsonb where not exists (select 1 from audit_log where action = $2 and metadata->>\'operationId\' = $4) returning id', [userId, RESET_CONFIRM_AUDIT_ACTION, JSON.stringify({ operationId }), operationId])).rows;
     // Fail closed: a password change without an audit row must never commit
     // (RESET_AUDIT_FAILED is not a public code → INTERNAL_ERROR, tx rolled back).

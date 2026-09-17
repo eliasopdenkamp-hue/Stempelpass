@@ -105,9 +105,11 @@ export const APP_WRITE_TABLES: readonly string[] = [
  */
 export const REQUIRED_GRANTS: Readonly<Record<string, readonly ('SELECT' | 'INSERT' | 'UPDATE' | 'DELETE')[]>> = {
   tenants: ['SELECT', 'UPDATE'],
-  // 2026-09-16 (customers-017 incident class): reset confirm writes
-  // users.password_hash — UPDATE is required (granted by migration 019).
-  users: ['SELECT', 'UPDATE'],
+  // users rows are SELECT-only for the runtime role. Migration 019 briefly
+  // granted UPDATE for the reset-confirm write; migration 020 revokes it and
+  // moves the write into SECURITY DEFINER reset_user_password(text,text) (see
+  // REQUIRED_FUNCTION_GRANTS), so the runtime role needs no direct UPDATE.
+  users: ['SELECT'],
   sessions: ['SELECT', 'INSERT', 'UPDATE'],
   password_reset_tokens: ['SELECT', 'INSERT', 'UPDATE'],
   tenant_memberships: ['SELECT', 'INSERT', 'UPDATE'],
@@ -137,6 +139,9 @@ export const REQUIRED_FUNCTION_GRANTS: readonly { name: string; identityArgument
   { name: 'membership_mfa_required', identityArguments: 'uuid' },
   { name: 'resolve_user_tenants', identityArguments: 'uuid' },
   { name: 'resolve_password_reset_user', identityArguments: 'text' },
+  // Migration 020: the reset-confirm password write runs inside this SECURITY
+  // DEFINER function (the runtime role holds users SELECT only, see above).
+  { name: 'reset_user_password', identityArguments: 'text,text' },
 ];
 
 // ---------------------------------------------------------------------------
