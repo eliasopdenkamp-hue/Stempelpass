@@ -119,7 +119,14 @@ async function waitForReadiness(): Promise<void> {
 const json=(value:unknown,status=200,id=crypto.randomUUID(),headers:HeadersInit={})=>Response.json({request_id:id,data:value},{status,headers:{'Cache-Control':'no-store',...headers}});
 function error(e:unknown,id:string){const {code,status,detail}=classifyError(e);if(detail)console.error(`request_failed request_id=${id} error=${detail}`);return json({error:code},status,id as `${string}-${string}-${string}-${string}-${string}`)}
 function cookie(req:Request,name:string){return req.headers.get('cookie')?.split(';').map(x=>x.trim()).find(x=>x.startsWith(`${name}=`))?.slice(name.length+1)}
-async function auth(req:Request,tenantId:string,mutating=true){if(!pool||!repository)throw new Error('DATABASE_REQUIRED');const token=cookie(req,'__Host-sp_session');if(!token)throw new Error('UNAUTHENTICATED');const db=await pool.connect();try{await db.query('begin');await db.query("select set_config('app.tenant_id', $1, true)",[tenantId]);const resolved=await db.query<{user_id:string}>('select user_id from public.resolve_session_user($1)',[hashSessionToken(token)]);if(!resolved.rows[0]?.user_id)throw new Error('UNAUTHENTICATED');await db.query("select set_config('app.user_id', $1, true)",[resolved.rows[0].user_id]);const rows=await db.query<{id:string,user_id:string,csrf_token_hash:string,tenant_id:string,role:string;membership_id:string;mfa_required:boolean;mfa_verified:boolean}>('select s.id,s.user_id,s.csrf_token_hash,s.mfa_verified,m.id as membership_id,m.tenant_id,m.role,(u.mfa_required or m.mfa_required) as mfa_required from sessions s join users u on u.id=s.user_id join tenant_memberships m on m.user_id=s.user_id and m.status=$2 where s.token_hash=$1 and s.revoked_at is null and s.expires_at>now() and m.tenant_id=$3 and u.status=$4',[hashSessionToken(token),'active',tenantId,'active']);const s=rows.rows[0];if(!s)throw new Error('UNAUTHENTICATED');if(s.mfa_required&&!s.mfa_verified)throw new Error('MFA_REQUIRED');if(mutating&&!csrfValid(req,s.csrf_token_hash))throw new Error('CSRF_INVALID');assertTenant(tenantId,s.tenant_id);const actor={userId:s.user_id,role:s.role as any,sessionId:s.id,membershipId:s.membership_id,token,mfaVerified:s.mfa_verified,csrfTokenHash:s.csrf_token_hash};await db.query('commit');return actor;}catch(e){try{await db.query('rollback');}catch{}throw e;}finally{db.release();}}
+async function auth(req:Request,tenantId:string,mutating=true){if(!pool||!repository)throw new Error('DATABASE_REQUIRED');const token=cookie(req,'__Host-sp_session');if(!token)throw new Error('UNAUTHENTICATED');const db=await pool.connect();try{await db.query('begin');await db.query("select set_config('app.tenant_id', $1, true)",[tenantId]);const resolved=await db.query<{user_id:string}>('select user_id from public.resolve_session_user($1)',[hashSessionToken(token)]);if(!resolved.rows[0]?.user_id)throw new Error('UNAUTHENTICATED');await db.query("select set_config('app.user_id', $1, true)",[resolved.rows[0].user_id]);const rows=await db.query<{id:string,user_id:string,csrf_token_hash:string,tenant_id:string,role:string;membership_id:string;mfa_required:boolean;mfa_verified:boolean}>('select s.id,s.user_id,s.csrf_token_hash,s.mfa_verified,m.id as membership_id,m.tenant_id,m.role,(u.mfa_required or m.mfa_required) as mfa_required from sessions s join users u on u.id=s.user_id join tenant_memberships m on m.user_id=s.user_id and m.status=$2 where s.token_hash=$1 and s.revoked_at is null and s.expires_at>now() and m.tenant_id=$3 and u.status=$4',[hashSessionToken(token),'active',tenantId,'active']);const s=rows.rows[0];if(!s)throw new Error('UNAUTHENTICATED');if(s.mfa_required&&!s.mfa_verified)throw new Error('MFA_REQUIRED');if(mutating&&!csrfValid(req,s.csrf_token_hash)){const sent=req.headers.get('x-csrf-token');/* CSRF rejection split: a MISSING/EMPTY token keeps the hard 403 "Sitzung abgelaufen" (PR #29 contract — a broken/foreign client), while a PRESENT-but-stale token on an OTHERWISE VALID session is the owner's reproducible two-tab flow: the session row above resolved fine, so the user is authenticated — only the token lags because another tab rotated it. Throw the typed CsrfStaleError (message stays CSRF_INVALID so the JSON API keeps its 403 contract unchanged) and let the staff handler answer a retry envelope instead of a fake "session expired".*/if(!sent||!sent.trim())throw new Error('CSRF_INVALID');throw new CsrfStaleError({userId:s.user_id,token,mfaVerified:s.mfa_verified});}assertTenant(tenantId,s.tenant_id);const actor={userId:s.user_id,role:s.role as any,sessionId:s.id,membershipId:s.membership_id,token,mfaVerified:s.mfa_verified,csrfTokenHash:s.csrf_token_hash};await db.query('commit');return actor;}catch(e){try{await db.query('rollback');}catch{}throw e;}finally{db.release();}}
+/** Typed error for "session valid, CSRF token stale" (another tab rotated the
+ *  session). message stays CSRF_INVALID so classifyError keeps answering 403
+ *  CSRF_INVALID for the JSON API — this type is only consumed by the staff
+ *  mutation handlers, which turn it into a 409 retry envelope. */
+class CsrfStaleError extends Error {
+  constructor(readonly actor: { userId: string; token: string; mfaVerified: boolean }) { super('CSRF_INVALID'); }
+}
 async function rotate(a:{userId:string;token:string;mfaVerified:boolean}){if(!pool||!repository)throw new Error('DATABASE_REQUIRED');const db=await pool.connect();try{await db.query('begin');await db.query("select set_config('app.user_id', $1, true)",[a.userId]);await db.query('update sessions set revoked_at=now() where token_hash=$1',[hashSessionToken(a.token)]);const raw=randomToken(),csrf=randomToken();await db.query("insert into sessions(user_id,token_hash,csrf_token_hash,mfa_verified,expires_at) values($1,$2,$3,$4,now()+interval '12 hours')",[a.userId,hashSessionToken(raw),hashSessionToken(csrf),a.mfaVerified]);await db.query('commit');return {csrf,header:{'Set-Cookie':sessionCookie(raw, 43200),'x-csrf-token':hashSessionToken(csrf)}}}catch(e){try{await db.query('rollback');}catch{}throw e;}finally{db.release();}}
 /**
  * Best-effort Google Wallet balance sync after a committed stamp/redeem.
@@ -152,6 +159,29 @@ const htmlResponse=(html:string,status=200,headers:HeadersInit={})=>new Response
 const staffRedirect=(location:string,headers:HeadersInit={})=>new Response(null,{status:302,headers:{Location:location,'Cache-Control':'no-store',...headers}});
 /** Friendly HTML error page for the staff UI (never internal details). */
 function staffError(e:unknown,id:string):Response{const {code,status}=classifyError(e);return htmlResponse(staffErrorPage(status,code,id),status);}
+/**
+ * Staff mutation error handler with the stale-CSRF retry envelope.
+ *
+ * When auth() finds a VALID session carrying a PRESENT-but-stale CSRF token
+ * (the owner's reproducible two-tab flow: tab A stamped and rotated the
+ * session; tab B still holds the old meta token), the user is authenticated —
+ * only the token lags. Instead of a fake "Sitzung abgelaufen" the server
+ * rotates the session once (fresh cookie + fresh CSRF, exactly like a
+ * successful mutation), performs NO business write (auth() threw BEFORE any
+ * repository call), and answers 409 + `x-csrf-retry: 1` so the staff script
+ * re-sends the SAME request once with the fresh token. The JSON API keeps its
+ * plain 403 CSRF_INVALID (CsrfStaleError.message === 'CSRF_INVALID' →
+ * classifyError → 403); only the staff HTML path consumes the envelope.
+ */
+async function staffMutationError(e:unknown,id:string):Promise<Response>{
+  if(e instanceof CsrfStaleError){
+    try{
+      const rotated=await rotate(e.actor);
+      return json({error:'CSRF_INVALID',retry:true},409,id as `${string}-${string}-${string}-${string}-${string}`,{...rotated.header,'x-csrf-retry':'1'});
+    }catch{/* rotation failed → fall back to the normal error page */}
+  }
+  return staffError(e,id);
+}
 /** Parse a staff POST body: JSON or form-urlencoded, strings only. */
 async function parseBody(req: Request): Promise<Record<string, string>> {
   const ct = req.headers.get('content-type') ?? '';
@@ -275,7 +305,7 @@ async function handleStaffEntry(req:Request,id:string):Promise<Response>{
     if(ctx.tenants.length===0)return htmlResponse(noTenantPage());
     if(ctx.tenants.length===1)return staffRedirect(`/staff/${ctx.tenants[0].tenantId}`);
     return htmlResponse(tenantChooserPage(ctx.tenants));
-  }catch(e){return staffError(e,id);}
+  }catch(e){return staffMutationError(e,id);}
 }
 async function handleStaffDashboard(req:Request,tenantId:string,id:string):Promise<Response>{
   try{
@@ -317,7 +347,7 @@ async function handleStaffStamp(req:Request,tenantId:string,id:string):Promise<R
     const newCard=await dashboardNewCard(req,tenantId,actor.role);
     const flash=`Stempel vergeben: Karte ${cardId.slice(0,8)} hat jetzt ${value.card.stampCount} Stempel.`+(value.reward?' Die Prämie ist jetzt einlösbar.':'');
     return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,stats,rotated.header['x-csrf-token'],newCard),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
-  }catch(e){return staffError(e,id);}
+  }catch(e){return staffMutationError(e,id);}
 }
 async function handleStaffRedeem(req:Request,tenantId:string,id:string):Promise<Response>{
   try{
@@ -338,7 +368,7 @@ async function handleStaffRedeem(req:Request,tenantId:string,id:string):Promise<
     const newCard=await dashboardNewCard(req,tenantId,actor.role);
     const flash=value.status==='redeemed'?'Prämie erfolgreich eingelöst.':'Prämie eingelöst.';
     return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,stats,rotated.header['x-csrf-token'],newCard),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
-  }catch(e){return staffError(e,id);}
+  }catch(e){return staffMutationError(e,id);}
 }
 /**
  * Staff "Neue Karte anlegen": create an ANONYMOUS card (no customer name,
@@ -376,7 +406,7 @@ async function handleStaffCreateCard(req:Request,tenantId:string,id:string):Prom
     const newCard={id:created.id,url:`${origin}/card/${tenantId}/${created.token ?? rawToken}`,token:created.token ?? rawToken};
     const flash='Neue Karte angelegt — QR-Code und Link unten direkt weitergeben.';
     return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash2,stats,rotated.header['x-csrf-token'],newCard),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
-  }catch(e){return staffError(e,id);}
+  }catch(e){return staffMutationError(e,id);}
 }
 async function handleStaffBranding(req:Request,tenantId:string,id:string):Promise<Response>{
   try{
@@ -420,7 +450,7 @@ async function handleStaffBranding(req:Request,tenantId:string,id:string):Promis
     const newCard=await dashboardNewCard(req,tenantId,actor.role);
     const flash='Branding gespeichert — die Google-Wallet-Klasse wird bei der nächsten Kartenausstellung bzw. sofort aktualisiert.';
     return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash2,stats,rotated.header['x-csrf-token'],newCard),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
-  }catch(e){return staffError(e,id);}
+  }catch(e){return staffMutationError(e,id);}
 }
 async function handleStaffLogout(req:Request,tenantId:string,id:string):Promise<Response>{
   try{
@@ -429,7 +459,7 @@ async function handleStaffLogout(req:Request,tenantId:string,id:string):Promise<
     const actor=await auth(req,tenantId,true);
     await repository.revokeSession(actor.userId,hashSessionToken(actor.token));
     return staffRedirect('/login',{'Set-Cookie':sessionCookie('',0)});
-  }catch(e){return staffError(e,id);}
+  }catch(e){return staffMutationError(e,id);}
 }
 /**
  * Password reset ("Passwort vergessen", owner wish).

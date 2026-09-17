@@ -117,8 +117,9 @@ const STAFF_SCRIPT = `
     }
     return out;
   }
-  function post(url, data) {
+  function post(url, data, attempt) {
     hideError();
+    if (!attempt) attempt = 0;
     // Actions are sent as JSON — the content type live-verified working on
     // every runtime. The deployed Vercel Node runtime delivers urlencoded
     // form bodies unusably (live 400 CARD_FIELDS_REQUIRED on stamp / 404
@@ -132,6 +133,16 @@ const STAFF_SCRIPT = `
     }).then(function (res) {
       var next = res.headers.get('x-csrf-token');
       if (next && /^[0-9a-f]{64}$/.test(next)) csrf = next;
+      // Stale-CSRF retry (owner bug "Sitzung abgelaufen beim Speichern"):
+      // another tab (or this tab before the rotation was seen) holds an old
+      // meta token. The server keeps the session valid, rotates it once and
+      // answers 409 + x-csrf-retry: 1 with the fresh cookie+token — re-send
+      // the SAME request exactly once. One retry max: a genuinely dead
+      // session never answers 409, so there is no reload/retry loop and the
+      // error path below stays reachable for real failures.
+      if (res.status === 409 && res.headers.get('x-csrf-retry') === '1' && attempt < 1) {
+        return post(url, data, attempt + 1);
+      }
       return res.text().then(function (html) {
         var doc = new DOMParser().parseFromString(html, 'text/html');
         if (!res.ok) {
