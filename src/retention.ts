@@ -13,6 +13,15 @@ export const CUSTOMER_HARD_DELETE_RETENTION = '30 days';
 export const REVOKED_SESSION_RETENTION = '7 days';
 export const MESSAGE_LOG_RETENTION = '24 months';
 export const CONSENT_EVENT_RETENTION_AFTER_REVOCATION = '3 years';
+/**
+ * Password-reset tokens are single-use by design (consumed_at on use) and
+ * expire 60 minutes after issue. Consumed or expired tokens are dead rows:
+ * the retention job (operator context, see runRetention) removes them once
+ * they are consumed, or one day after their expiry (users/link are long gone
+ * by then; the window also covers a token consumed while its mailbox link was
+ * still being opened). Security-Review 91292cdf, NIEDRIG.
+ */
+export const PASSWORD_RESET_TOKEN_RETENTION = '1 day';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -60,6 +69,7 @@ export interface RetentionCounts {
   sessionsDeleted: number;
   messageLogsRetentionDeleted: number;
   consentEventsRetentionDeleted: number;
+  passwordResetTokensDeleted: number;
   customersHardDeleted: number;
   cardsHardDeleted: number;
   communicationMessageLogsDeleted: number;
@@ -75,6 +85,7 @@ const emptyCounts = (): RetentionCounts => ({
   sessionsDeleted: 0,
   messageLogsRetentionDeleted: 0,
   consentEventsRetentionDeleted: 0,
+  passwordResetTokensDeleted: 0,
   customersHardDeleted: 0,
   cardsHardDeleted: 0,
   communicationMessageLogsDeleted: 0,
@@ -139,6 +150,14 @@ export async function runRetention(db: TxClient, tenantId: string | null, wallet
     tenantId ? [tenantId] : [],
   );
 
+  // Consumed/expired password-reset tokens (global — the table has no
+  // tenant_id column, so this cleanup is intentionally NOT tenant-scoped).
+  counts.passwordResetTokensDeleted = await deleteRows(
+    db,
+    `delete from password_reset_tokens where consumed_at is not null or expires_at < now() - interval '${PASSWORD_RESET_TOKEN_RETENTION}' returning id`,
+    [],
+  );
+
   const candidates = (tenantId
     ? await db.query<RetentionCustomer>(CANDIDATES_TENANT, [tenantId])
     : await db.query<RetentionCustomer>(CANDIDATES_GLOBAL)).rows;
@@ -193,6 +212,7 @@ export function formatRetentionResult(counts: RetentionCounts, durationMs: numbe
     `sessions_deleted=${counts.sessionsDeleted}`,
     `message_logs_retention_deleted=${counts.messageLogsRetentionDeleted}`,
     `consent_events_retention_deleted=${counts.consentEventsRetentionDeleted}`,
+    `password_reset_tokens_deleted=${counts.passwordResetTokensDeleted}`,
     `customers_hard_deleted=${counts.customersHardDeleted}`,
     `cards_hard_deleted=${counts.cardsHardDeleted}`,
     `communication_message_logs_deleted=${counts.communicationMessageLogsDeleted}`,

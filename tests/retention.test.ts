@@ -3,6 +3,7 @@ import {
   CONSENT_EVENT_RETENTION_AFTER_REVOCATION,
   formatRetentionResult,
   MESSAGE_LOG_RETENTION,
+  PASSWORD_RESET_TOKEN_RETENTION,
   parseRetentionEnv,
   REVOKED_SESSION_RETENTION,
   runRetention,
@@ -179,6 +180,7 @@ test('hard delete follows wallet then communication then card FK order and is id
     [{ id: 'expired-session' }], // sessions: expired/revoked-over-7-days
     [], // standalone message-log retention
     [], // standalone consent-event retention
+    [], // consumed/expired password-reset tokens
     [{ id: CUSTOMER, tenant_id: TENANT }], // customer candidate: deleted_at > 30 days, hold=false
     [{ id: CARD }], // cards
     [{ id: 'message-log' }],
@@ -194,6 +196,7 @@ test('hard delete follows wallet then communication then card FK order and is id
   expect(revokedWalletCards).toEqual([CARD]);
   expect(counts).toEqual({
     sessionsDeleted: 1, messageLogsRetentionDeleted: 0, consentEventsRetentionDeleted: 0,
+    passwordResetTokensDeleted: 0,
     customersHardDeleted: 1, cardsHardDeleted: 1,
     communicationMessageLogsDeleted: 1, communicationConsentEventsDeleted: 1,
     communicationPreferencesDeleted: 1, stampEventsDeleted: 1, rewardsDeleted: 1,
@@ -204,6 +207,7 @@ test('hard delete follows wallet then communication then card FK order and is id
     .map(q => q.sql.match(/delete from\s+([a-z_]+)/i)?.[1]);
   expect(mutationTables).toEqual([
     'sessions', 'communication_message_logs', 'communication_consent_events',
+    'password_reset_tokens',
     'communication_message_logs', 'communication_consent_events',
     'communication_preferences', 'stamp_events', 'rewards',
     'card_creation_idempotency', 'cards', 'customers',
@@ -214,6 +218,7 @@ test('hard delete follows wallet then communication then card FK order and is id
     [], // no expired sessions
     [], // no old message logs
     [], // no old consent events
+    [], // no consumed/expired reset tokens
     [], // no eligible customers
   ]);
   const noOp = await runRetention(rerun, null, wallet);
@@ -221,11 +226,12 @@ test('hard delete follows wallet then communication then card FK order and is id
   expect(noOp.cardsHardDeleted).toBe(0);
   expect(noOp.messageLogsRetentionDeleted).toBe(0);
   expect(noOp.consentEventsRetentionDeleted).toBe(0);
+  expect(noOp.passwordResetTokensDeleted).toBe(0);
   expect(revokedWalletCards).toEqual([CARD]);
 });
 
-test('tenant scope is repeated on standalone retention and hard-delete candidate queries', async () => {
-  const db = new FakeDb([[], [], [], []]);
+test('tenant scope is repeated on standalone retention and hard-delete candidate queries; reset-token cleanup is global', async () => {
+  const db = new FakeDb([[], [], [], [], []]);
   await runRetention(db, TENANT, wallet);
   expect(db.queries[0]?.params).toEqual([TENANT]);
   expect(db.queries[1]?.params).toEqual([TENANT]);
@@ -233,14 +239,20 @@ test('tenant scope is repeated on standalone retention and hard-delete candidate
   expect(db.queries[2]?.params).toEqual([TENANT]);
   expect(db.queries[2]?.sql).toContain('e.tenant_id = $1');
   expect(db.queries[2]?.sql).toContain('p.tenant_id = e.tenant_id');
-  expect(db.queries[3]?.params).toEqual([TENANT]);
-  expect(db.queries[3]?.sql).toContain('tenant_id = $1');
+  // Password-reset tokens are global (no tenant column): the cleanup must run
+  // WITHOUT a tenant predicate even in a tenant-scoped retention run.
+  expect(db.queries[3]?.sql).toContain('delete from password_reset_tokens');
+  expect(db.queries[3]?.params).toEqual([]);
+  expect(db.queries[3]?.sql).not.toContain('tenant_id');
+  expect(db.queries[4]?.params).toEqual([TENANT]);
+  expect(db.queries[4]?.sql).toContain('tenant_id = $1');
   expect(db.queries[2]?.sql).not.toContain(OTHER_TENANT);
 });
 
 test('retention output is anonymous and includes all counts plus duration', () => {
   const counts: RetentionCounts = {
     sessionsDeleted: 1, messageLogsRetentionDeleted: 2, consentEventsRetentionDeleted: 3,
+    passwordResetTokensDeleted: 4,
     customersHardDeleted: 4, cardsHardDeleted: 5,
     communicationMessageLogsDeleted: 6, communicationConsentEventsDeleted: 7,
     communicationPreferencesDeleted: 8, stampEventsDeleted: 9, rewardsDeleted: 10,
@@ -250,27 +262,38 @@ test('retention output is anonymous and includes all counts plus duration', () =
   expect(output).toContain('duration_ms=12');
   expect(output).toContain('message_logs_retention_deleted=2');
   expect(output).toContain('consent_events_retention_deleted=3');
+  expect(output).toContain('password_reset_tokens_deleted=4');
   expect(output).toContain('customers_hard_deleted=4');
   expect(output).not.toContain(CUSTOMER);
-  expect(output).not.toContain('token');
+  expect(output).not.toContain('token_hash');
 });
 
 describe('retention SQL contracts', () => {
   test('session retention includes active expiry and revoked seven-day cutoff', async () => {
-    const db = new FakeDb([[], [], [], []]);
+    const db = new FakeDb([[], [], [], [], []]);
     await runRetention(db, null, wallet);
     expect(db.queries[0]?.sql).toContain('expires_at <= now()');
     expect(db.queries[0]?.sql).toContain("revoked_at <= now() - interval '7 days'");
   });
 
   test('consent retention uses the latest non-null withdrawal and never deletes never-revoked customers', async () => {
-    const db = new FakeDb([[], [], [], []]);
+    const db = new FakeDb([[], [], [], [], []]);
     await runRetention(db, null, wallet);
     const sql = db.queries[2]?.sql ?? '';
     expect(sql).toContain('group by p.tenant_id, p.customer_id');
     expect(sql).toContain('having max(p.withdrawn_at) is not null');
     expect(sql).toContain(`max(p.withdrawn_at) <= now() - interval '${CONSENT_EVENT_RETENTION_AFTER_REVOCATION}'`);
     expect(sql).not.toContain('audit');
+  });
+
+  test('password-reset-token retention deletes consumed or expired-more-than-a-day rows without any tenant predicate', async () => {
+    const db = new FakeDb([[], [], [], [], []]);
+    await runRetention(db, TENANT, wallet);
+    const sql = db.queries[3]?.sql ?? '';
+    expect(sql).toContain('delete from password_reset_tokens');
+    expect(sql).toContain('consumed_at is not null');
+    expect(sql).toContain(`expires_at < now() - interval '${PASSWORD_RESET_TOKEN_RETENTION}'`);
+    expect(sql).not.toContain('tenant_id');
   });
 });
 
@@ -315,7 +338,7 @@ test('session TTL matrix: active/expired/revoked x age <7d / >7d classifies exac
 
 test('CLI is operator-only, takes the retention advisory lock, and logs anonymous duration', async () => {
   const operator = new FakeDb([[{ is_operator: true }]]);
-  const transaction = new FakeDb([[], [], [], [], [], [], []]); // begin, lock, sessions, message logs, consent events, candidates, commit
+  const transaction = new FakeDb([[], [], [], [], [], [], [], []]); // begin, lock, sessions, message logs, consent events, reset tokens, candidates, commit
   const connections = [operator, transaction];
   const pool = {
     async connect() { const db = connections.shift(); if (!db) throw new Error('unexpected connection'); return db; },
