@@ -153,6 +153,23 @@ export interface RlsQuery { name: string; sql: string; params?: unknown[] }
 
 const FROM_PG_CLASS = `from pg_class c join pg_namespace n on n.oid = c.relnamespace`;
 
+/**
+ * Identity-argument list normalized to the compact form REQUIRED_FUNCTION_GRANTS
+ * uses (e.g. 'text,text' — no spaces). Verified live (2026-09-17, prod catalog):
+ * on the target PostgreSQL `pg_get_function_identity_arguments` renders each
+ * argument as 'name type' (e.g. `reset_user_password` →
+ * 'p_token_hash text, p_password_hash text'), so the legacy regexp_replace
+ * strips the leading 'name ' fragment per argument, and the outer replace()
+ * collapses PostgreSQL's ', ' list separator to the compact form:
+ * 'text, text' → 'text,text'. 2026-09-17: without the collapse, the
+ * two-argument signature normalized to 'text, text', failed `= any($3)`, and
+ * the verifier reported a grant missing that provably exists
+ * (has_function_privilege true, exec_ok true, to_regprocedure resolves).
+ * Both templates below must use the SAME fragment in the select list and the
+ * WHERE predicate.
+ */
+const IDENTITY_ARGS_NORMALIZED = `replace(regexp_replace(pg_get_function_identity_arguments(p.oid), '(^|, )[^ ,]+ ', '\\1', 'g'), ', ', ',')`;
+
 /** as-role mode: the connection user IS the role to verify. */
 export function buildAsRoleQueries(schema: string): RlsQuery[] {
   return [
@@ -177,7 +194,7 @@ export function buildAsRoleQueries(schema: string): RlsQuery[] {
     },
     {
       name: 'function-grants',
-      sql: `select p.proname as function_name, regexp_replace(pg_get_function_identity_arguments(p.oid), '(^|, )[^ ,]+ ', '\\1', 'g') as identity_arguments, has_function_privilege(p.oid, 'EXECUTE') as execute_ok from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = $1 and p.proname = any($2) and regexp_replace(pg_get_function_identity_arguments(p.oid), '(^|, )[^ ,]+ ', '\\1', 'g') = any($3)`, 
+      sql: `select p.proname as function_name, ${IDENTITY_ARGS_NORMALIZED} as identity_arguments, has_function_privilege(p.oid, 'EXECUTE') as execute_ok from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = $1 and p.proname = any($2) and ${IDENTITY_ARGS_NORMALIZED} = any($3)`, 
       params: [schema, REQUIRED_FUNCTION_GRANTS.map(f => f.name), REQUIRED_FUNCTION_GRANTS.map(f => f.identityArguments)],
     },
     {
@@ -222,7 +239,7 @@ export function buildNamedRoleQueries(roleName: string, schema: string): RlsQuer
     },
     {
       name: 'function-grants',
-      sql: `select p.proname as function_name, regexp_replace(pg_get_function_identity_arguments(p.oid), '(^|, )[^ ,]+ ', '\\1', 'g') as identity_arguments, has_function_privilege($4::name, p.oid, 'EXECUTE') as execute_ok from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = $1 and p.proname = any($2) and regexp_replace(pg_get_function_identity_arguments(p.oid), '(^|, )[^ ,]+ ', '\\1', 'g') = any($3)`, 
+      sql: `select p.proname as function_name, ${IDENTITY_ARGS_NORMALIZED} as identity_arguments, has_function_privilege($4::name, p.oid, 'EXECUTE') as execute_ok from pg_proc p join pg_namespace n on n.oid = p.pronamespace where n.nspname = $1 and p.proname = any($2) and ${IDENTITY_ARGS_NORMALIZED} = any($3)`, 
       params: [schema, REQUIRED_FUNCTION_GRANTS.map(f => f.name), REQUIRED_FUNCTION_GRANTS.map(f => f.identityArguments), roleName],
     },
     {
