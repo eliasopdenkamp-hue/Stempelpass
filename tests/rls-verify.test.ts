@@ -114,6 +114,31 @@ describe('query builders (read-only, anonymized)', () => {
       if (mode === 'named-role') expect(q?.params?.[3]).toBe('app_role_x');
     }
   });
+
+  test('function-grants normalizes multi-arg identities to the compact form (2026-09-17 prod shape)', () => {
+    // migration 020: reset_user_password is the two-argument SECURITY DEFINER;
+    // its identityArguments must be the compact 'text,text' form.
+    expect(REQUIRED_FUNCTION_GRANTS.find(f => f.name === 'reset_user_password')?.identityArguments).toBe('text,text');
+    for (const [mode, queries] of [
+      ['as-role', buildAsRoleQueries('public')],
+      ['named-role', buildNamedRoleQueries('app_role_x', 'public')],
+    ] as const) {
+      const q = queries.find(q => q.name === 'function-grants');
+      expect(q).toBeDefined();
+      const sql = q!.sql;
+      // identity list is normalized in BOTH the select list and the WHERE
+      // predicate (same shared fragment, exactly twice per template): the
+      // legacy regexp strips 'name ' fragments, the outer replace collapses
+      // PostgreSQL's ', ' separator so 'text, text' matches 'text,text'.
+      const normalized = `replace(regexp_replace(pg_get_function_identity_arguments(p.oid), '(^|, )[^ ,]+ ', '\\1', 'g'), ', ', ',')`;
+      expect(sql.split(normalized).length - 1).toBe(2);
+      expect(sql).toContain(' = any($3)');
+      // single-arg compact forms and the multi-arg form are all bound as-is
+      expect(q?.params?.[2]).toContain('text');
+      expect(q?.params?.[2]).toContain('uuid');
+      expect(q?.params?.[2]).toContain('text,text');
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -230,6 +255,33 @@ describe('classifyRlsReport', () => {
     expect(r.checks.grantsComplete).toBe(false);
     expect(r.checks.missingFunctionGrants).toEqual(['resolve_session_user(text):EXECUTE']);
     expect(r.checks.missingGrants).toEqual(['resolve_session_user(text):EXECUTE']);
+  });
+
+  test('multi-arg SECURITY DEFINER grant reset_user_password(text,text) is recognized (2026-09-17 prod shape)', () => {
+    // migration 020 grant exists on prod; the fixed SQL now delivers the
+    // identity_arguments in the compact form the classifier expects, so the
+    // two-argument grant must NOT be reported missing.
+    const input = healthyInput();
+    const reset = input.functionGrantRows!.find(f => f.function_name === 'reset_user_password');
+    expect(reset).toEqual({ function_name: 'reset_user_password', identity_arguments: 'text,text', execute_ok: true });
+    const r = report(input);
+    expect(r.ok).toBe(true);
+    expect(r.checks.missingFunctionGrants).toEqual([]);
+  });
+
+  test('un-normalized identity (text, text — pre-fix SQL output) fails closed as missing, never false-passes', () => {
+    // What the OLD SQL emitted for the two-arg function: types joined with
+    // ', ' (space). The classifier requires the exact compact form, so this
+    // shape must be reported missing — the verifier fails closed instead of
+    // silently accepting an unverifiable signature.
+    const functionGrantRows = REQUIRED_FUNCTION_GRANTS.map(f => ({
+      function_name: f.name, identity_arguments: f.identityArguments, execute_ok: true,
+    }));
+    const resetIdx = functionGrantRows.findIndex(f => f.function_name === 'reset_user_password');
+    functionGrantRows[resetIdx] = { ...functionGrantRows[resetIdx], identity_arguments: 'text, text' };
+    const r = report(healthyInput({ functionGrantRows }));
+    expect(r.ok).toBe(false);
+    expect(r.checks.missingFunctionGrants).toContain('reset_user_password(text,text):EXECUTE');
   });
 
   test('missing schema_migrations (schema not migrated) fails', () => {
