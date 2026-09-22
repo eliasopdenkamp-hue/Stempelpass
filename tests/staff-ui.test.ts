@@ -1331,3 +1331,98 @@ test('staff wallet refresh failure never fails the committed stamp (best-effort 
     expect(res.headers.get('x-csrf-token')).toMatch(/^[0-9a-f]{64}$/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// (10) Client hardening (PR #35, Option 1 — owner bug "Sitzung abgelaufen
+// beim Branding-Speichern"): native form submits without a CSRF header caused
+// the hard full-page 403 CSRF_INVALID. The STAFF_SCRIPT is a static inline
+// bundle, so these DB-free tests pin its safety properties on the RENDERED
+// dashboard HTML (same marker style as the "JSON-only staff script" test):
+//   - never a post with an empty x-csrf-token header: an empty in-memory
+//     token is reloaded from the <meta> tag first, and only a still-missing
+//     token renders the in-page reload box (no request at all);
+//   - 401/403 answers render the in-page "Seite neu laden und erneut
+//     versuchen" box with a reload button — never the full-page error,
+//     never a forced logout;
+//   - the PR #32 stale-token envelope (409 + x-csrf-retry: 1, max 1 retry)
+//     is checked BEFORE the 401/403 handling and stays unchanged;
+//   - Enter, submit-button clicks and form.requestSubmit() all land in the
+//     identical post() path (direct form binding + guarded document
+//     delegation, no double-fire).
+// ---------------------------------------------------------------------------
+async function dashboardScriptHtml(): Promise<string> {
+  const pool = new FakePool([...sessionHandlers(validSession), ...dashboardHandlers()]);
+  let html = '';
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    html = await res.text();
+  });
+  return html;
+}
+
+test('client: an empty/missing CSRF is reloaded from the meta tag before the post — an empty x-csrf-token header can never leave the script', async () => {
+  const html = await dashboardScriptHtml();
+  // The old buggy line (post with `csrf || ''`) is gone.
+  expect(html).not.toContain("'x-csrf-token': csrf");
+  // Control flow inside post(): currentToken() reloads from the meta when the
+  // in-memory token is empty -> if it STAYS empty the request is aborted with
+  // the in-page reload box (Promise.resolve, no fetch) -> only then the post
+  // uses the (fresh) token as the header.
+  const iRefresh = html.indexOf('if (!csrf) refreshCsrf(document)');
+  const iAbort = html.indexOf('if (!token) { showReloadError(); return Promise.resolve(); }');
+  const iHeader = html.indexOf("'x-csrf-token': token");
+  expect(iRefresh).toBeGreaterThanOrEqual(0);
+  expect(iRefresh).toBeLessThan(iAbort);
+  expect(iAbort).toBeLessThan(iHeader);
+  expect(html).toContain('var token = currentToken();');
+  // Startup meta read (existing behavior) and the CSRF meta tag itself survive.
+  expect(html).toContain('refreshCsrf(document);');
+  expect(html).toContain(`name="sp-csrf" content="${CSRF_VALUE}"`);
+});
+
+test('client: 401/403 responses render the in-page reload box with a reload button — never the full-page error, never a hard logout', async () => {
+  const html = await dashboardScriptHtml();
+  expect(html).toContain('if (res.status === 401 || res.status === 403) {');
+  expect(html).toContain('Seite neu laden und erneut versuchen.');
+  expect(html).toContain("btn.addEventListener('click', function () { location.reload(); });");
+  expect(html).toContain('sp-errbox');
+  // The only navigation to /login in the client bundle is the explicit logout
+  // click handler — 401/403 never navigate the page and never force a
+  // re-login ('Sitzung abgelaufen' full pages stay a server-side HTML
+  // response only reachable without this script, e.g. plain curl).
+  const loginNavs = html.match(/location\.href = '\/login'/g) ?? [];
+  expect(loginNavs).toHaveLength(1);
+  // Non-401/403 errors keep extracting the server's #sp-error text in-page.
+  expect(html).toContain("doc.getElementById('sp-error')");
+});
+
+test('client: the stale-token 409 + x-csrf-retry envelope (PR #32) is checked BEFORE the 401/403 handling and stays max 1 retry', async () => {
+  const html = await dashboardScriptHtml();
+  expect(html).toContain("res.headers.get('x-csrf-retry') === '1'");
+  expect(html).toContain('attempt < 1');
+  expect(html).toContain('post(url, data, attempt + 1)');
+  const i409 = html.indexOf('res.status === 409 &&');
+  const i401 = html.indexOf('res.status === 401');
+  expect(i409).toBeGreaterThanOrEqual(0);
+  expect(i409).toBeLessThan(i401);
+});
+
+test('client: native submits (Enter, button click, form.requestSubmit) share one post() path — direct form binding + guarded document delegation', async () => {
+  const html = await dashboardScriptHtml();
+  // Delegated document listener (safety net, incl. swapped-in forms)…
+  expect(html).toContain("document.addEventListener('submit'");
+  // …plus direct listeners on every staff form, re-bound after each swap.
+  expect(html).toContain('function bindForms()');
+  expect(html).toContain("form.addEventListener('submit', function (ev) { submitStaffForm(ev, this); })");
+  expect(html).toContain('bindForms();');
+  // The double-fire guard: one submit event only ever produces one post().
+  expect(html).toContain('if (ev.defaultPrevented) return;');
+  expect(html).toContain('function submitStaffForm(ev, form)');
+});
+
+test('client: response-header CSRF adoption after session rotation is unchanged', async () => {
+  const html = await dashboardScriptHtml();
+  expect(html).toContain("var next = res.headers.get('x-csrf-token');");
+  expect(html).toContain('if (next && /^[0-9a-f]{64}$/.test(next)) csrf = next;');
+});
