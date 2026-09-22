@@ -77,6 +77,18 @@ function page(title: string, bodyHtml: string, extraHead = ''): string {
  * After a successful action the server re-renders the full #sp-app dashboard
  * (fresh CSRF embedded), which this script swaps in; document-level delegated
  * listeners make the swapped-in content interactive without re-binding.
+ *
+ * Hardening (owner bug "Sitzung abgelaufen beim Branding-Speichern" — a
+ * NATIVE form submit whose CSRF header never left this script): the script
+ * never posts with an empty x-csrf-token header. When the in-memory token is
+ * empty it reloads it from the <meta> tag first (refreshCsrf(document)) and
+ * only then posts; if even the meta stays empty it renders the in-page reload
+ * box instead of a request. 401/403 responses render that same in-page box
+ * ("Seite neu laden und erneut versuchen", button -> location.reload()) —
+ * never the full-page error and never a forced logout. The PR #32 stale-token
+ * envelope (409 + x-csrf-retry: 1 -> one re-send with the fresh token) is
+ * unchanged, and Enter/button clicks/form.requestSubmit() all land in the
+ * identical post() path (delegated + direct form binding, double-fire guard).
  */
 const STAFF_SCRIPT = `
 <script>
@@ -87,6 +99,14 @@ const STAFF_SCRIPT = `
     if (m) csrf = m.getAttribute('content');
   }
   refreshCsrf(document);
+  /** Token for the next post: missing/empty -> reload the fresh value from
+   *  the <meta name="sp-csrf"> tag (every server response re-renders it,
+   *  incl. session rotation). Never send an empty x-csrf-token header: the
+   *  caller aborts with the in-page reload box when it stays empty. */
+  function currentToken() {
+    if (!csrf) refreshCsrf(document);
+    return csrf;
+  }
   function showError(text) {
     var box = document.getElementById('sp-errbox');
     if (box) { box.textContent = text; box.style.display = 'block'; }
@@ -95,6 +115,25 @@ const STAFF_SCRIPT = `
   function hideError() {
     var box = document.getElementById('sp-errbox');
     if (box) { box.textContent = ''; box.style.display = 'none'; }
+  }
+  /** In-page recovery box for 401/403 and for a still-missing CSRF after the
+   *  meta refresh: the token/session state at the server differs from what
+   *  this page believes. Never navigate to the full-page error and never
+   *  force a logout — offer ONE action: reload (fresh meta; a truly dead
+   *  session lands on the login page after the reload). */
+  function showReloadError() {
+    var box = document.getElementById('sp-errbox');
+    if (!box) { window.alert('Seite neu laden und erneut versuchen.'); return; }
+    box.textContent = '';
+    box.appendChild(document.createTextNode('Seite neu laden und erneut versuchen.'));
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ghost';
+    btn.textContent = 'Seite neu laden';
+    btn.style.margin = '0 0 0 .75rem';
+    btn.addEventListener('click', function () { location.reload(); });
+    box.appendChild(btn);
+    box.style.display = 'block';
   }
   function dataBody(el) {
     var out = {};
@@ -120,6 +159,8 @@ const STAFF_SCRIPT = `
   function post(url, data, attempt) {
     hideError();
     if (!attempt) attempt = 0;
+    var token = currentToken();
+    if (!token) { showReloadError(); return Promise.resolve(); }
     // Actions are sent as JSON — the content type live-verified working on
     // every runtime. The deployed Vercel Node runtime delivers urlencoded
     // form bodies unusably (live 400 CARD_FIELDS_REQUIRED on stamp / 404
@@ -128,7 +169,7 @@ const STAFF_SCRIPT = `
     // quantity, rewardId) — only the wire format changes.
     return fetch(url, {
       method: 'POST',
-      headers: { 'x-csrf-token': csrf || '', 'content-type': 'application/json' },
+      headers: { 'x-csrf-token': token, 'content-type': 'application/json' },
       body: JSON.stringify(toObject(data || {}))
     }).then(function (res) {
       var next = res.headers.get('x-csrf-token');
@@ -143,6 +184,13 @@ const STAFF_SCRIPT = `
       if (res.status === 409 && res.headers.get('x-csrf-retry') === '1' && attempt < 1) {
         return post(url, data, attempt + 1);
       }
+      // 401/403 — dead session, missing/wrong CSRF header even after the meta
+      // refresh, or a role gate: never render the full-page error and never
+      // force a logout. One in-page recovery action: reload (fresh meta; a
+      // truly dead session lands on the login page after the reload).
+      if (res.status === 401 || res.status === 403) {
+        return res.text().then(function () { showReloadError(); });
+      }
       return res.text().then(function (html) {
         var doc = new DOMParser().parseFromString(html, 'text/html');
         if (!res.ok) {
@@ -154,6 +202,7 @@ const STAFF_SCRIPT = `
         var app = doc.getElementById('sp-app');
         var current = document.getElementById('sp-app');
         if (app && current) current.outerHTML = app.outerHTML;
+        bindForms();
       });
     }).catch(function () {
       showError('Dienst ist kurz nicht erreichbar. Bitte erneut versuchen.');
@@ -171,15 +220,39 @@ const STAFF_SCRIPT = `
     done.then(function () { el.disabled = false; });
     if (action === 'logout') done.then(function () { window.location.href = '/login'; });
   });
-  document.addEventListener('submit', function (ev) {
-    var form = ev.target;
-    if (!form || !form.getAttribute || !form.getAttribute('data-staff-form')) return;
+  /** Shared submit path — Enter, submit-button clicks and form.requestSubmit()
+   *  all fire a (bubbling) submit event and land here, whether the direct form
+   *  listener or the document delegation intercepted it. */
+  function submitStaffForm(ev, form) {
     ev.preventDefault();
     var action = form.getAttribute('action');
     var btn = form.querySelector('button[type="submit"]');
     if (btn) btn.disabled = true;
     post(action, new FormData(form)).then(function () { if (btn) btn.disabled = false; });
+  }
+  /** Direct listeners on every staff form (at boot and after every dashboard
+   *  swap) so a native submit is intercepted on the target element itself,
+   *  not only via document delegation — Enter, button clicks and
+   *  form.requestSubmit() all take the identical post() path. */
+  function bindForms() {
+    var forms = document.querySelectorAll('form[data-staff-form]');
+    for (var i = 0; i < forms.length; i++) {
+      var form = forms[i];
+      if (form.__spBound) continue;
+      form.__spBound = true;
+      form.addEventListener('submit', function (ev) { submitStaffForm(ev, this); });
+    }
+  }
+  // Document-level delegation stays as the safety net for every staff form
+  // (incl. swapped-in content). The direct listener runs first (target
+  // phase); defaultPrevented stops the delegation from double-sending.
+  document.addEventListener('submit', function (ev) {
+    var form = ev.target;
+    if (!form || !form.getAttribute || !form.getAttribute('data-staff-form')) return;
+    if (ev.defaultPrevented) return;
+    submitStaffForm(ev, form);
   });
+  bindForms();
 })();
 </script>`;
 
