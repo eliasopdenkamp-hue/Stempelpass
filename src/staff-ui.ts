@@ -62,9 +62,17 @@ code{font-size:.8rem;background:#f1f5f9;padding:.1rem .35rem;border-radius:.3rem
 /** Colors are additionally sanitized before interpolation into CSS. */
 const safeColor = (v: unknown, fallback: string) => safeCardColor(v, fallback);
 
-/** Full HTML document shell shared by all staff pages. */
-function page(title: string, bodyHtml: string, extraHead = ''): string {
-  return `<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><style>${BASE_CSS}</style>${extraHead}</head><body>${bodyHtml}</body></html>`;
+/** Full HTML document shell shared by all staff pages.
+ *  NOTE: the interactive staff script must be delivered via `extraBody` (end
+ *  of <body>), NOT via `extraHead`: live-verified in the real browser
+ *  (2026-09-23), an inline script rendered inside <head> is present in the DOM
+ *  with the full valid text but is never executed at page load — no listeners
+ *  are ever bound and every staff form falls back to a native submit without a
+ *  CSRF header (hard 403 "Sitzung abgelaufen"). The identical script text
+ *  inserted as a script element by JS executes and binds correctly, which
+ *  proves the delivery position was the problem. */
+function page(title: string, bodyHtml: string, extraHead = '', extraBody = ''): string {
+  return `<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><style>${BASE_CSS}</style>${extraHead}</head><body>${bodyHtml}${extraBody}</body></html>`;
 }
 
 /**
@@ -252,7 +260,18 @@ const STAFF_SCRIPT = `
     if (ev.defaultPrevented) return;
     submitStaffForm(ev, form);
   });
-  bindForms();
+  // bindForms() must run AFTER the forms exist in the DOM. The script is
+  // delivered at the end of <body> (live-verified 2026-09-23: in <head> the
+  // inline script did not execute/bind in real browsers), but stay defensive:
+  // if we ever boot before the body is parsed, rebind once the DOM is ready.
+  function boot() {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', boot);
+      return;
+    }
+    bindForms();
+  }
+  boot();
 })();
 </script>`;
 
@@ -581,5 +600,6 @@ ${statsHtml}
 <h2>Letzte Stempel-Ereignisse</h2>
 <table><thead><tr><th>Karte</th><th>Kunde</th><th>Stempel</th><th>Zeitpunkt</th></tr></thead><tbody>${eventRows}</tbody></table>
 </main>`,
-    `<meta name="sp-csrf" content="${esc(v.csrf)}">${STAFF_SCRIPT}`);
+    `<meta name="sp-csrf" content="${esc(v.csrf)}">`,
+    STAFF_SCRIPT);
 }

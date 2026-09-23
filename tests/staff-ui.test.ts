@@ -1426,3 +1426,24 @@ test('client: response-header CSRF adoption after session rotation is unchanged'
   expect(html).toContain("var next = res.headers.get('x-csrf-token');");
   expect(html).toContain('if (next && /^[0-9a-f]{64}$/.test(next)) csrf = next;');
 });
+test('client: the staff script is delivered at the END of <body>, never in <head> (live-verified 2026-09-23: an inline script rendered in <head> is present in the DOM but is NOT executed at page load — no submit listeners are bound, every staff form falls back to a native submit without a CSRF header and the server answers the hard 403 full-page error)', async () => {
+  const html = await dashboardScriptHtml();
+  // The CSRF meta tag stays in <head> (readable by the script from anywhere).
+  expect(html).toContain(`<meta name="sp-csrf" content="${CSRF_VALUE}">`);
+  // No staff script inside <head>: between <head> and </head> there must be
+  // no <script> element.
+  const headEnd = html.indexOf('</head>');
+  const head = html.slice(0, headEnd);
+  expect(head).not.toContain('<script>');
+  // The script element is the LAST child of <body>: it comes after the app
+  // markup (</main>) and before </body>, so bindForms() finds the forms.
+  const mainEnd = html.indexOf('</main>');
+  const scriptStart = html.indexOf('<script>');
+  const bodyEnd = html.indexOf('</body>');
+  expect(scriptStart).toBeGreaterThan(mainEnd);
+  expect(scriptStart).toBeLessThan(bodyEnd);
+  // DOM-ready fallback pins the defensive rebind (readyState guard).
+  expect(html).toContain("document.readyState === 'loading'");
+  expect(html).toContain("document.addEventListener('DOMContentLoaded', boot)");
+  expect(html).toContain('boot();');
+});
