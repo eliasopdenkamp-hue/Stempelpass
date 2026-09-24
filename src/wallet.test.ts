@@ -344,7 +344,7 @@ function mockCredentials() {
 
 test('class provisioning PATCHes an existing class only when branding differs (idempotent patch once)', async () => {
   const calls: Array<{ url: string; init: RequestInit }> = [];
-  let stored = { id: '123.stempelpass_loyalty', issuerName: 'Stempelpass', programName: 'Alter Name', hexBackgroundColor: '#000000', programLogo: { sourceUri: { uri: 'https://old.example.invalid/logo.png' } } };
+  let stored = { id: '123.stempelpass_loyalty', issuerName: 'Stempelpass', programName: 'Alter Name', hexBackgroundColor: '#000000', programLogo: { sourceUri: { uri: 'https://old.example.invalid/logo.png' } }, reviewStatus: 'APPROVED' };
   const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input); calls.push({ url, init: init ?? {} });
     if (url.includes('/loyaltyClass/')) {
@@ -363,12 +363,59 @@ test('class provisioning PATCHes an existing class only when branding differs (i
   const patches = calls.filter(c => c.init?.method === 'PATCH');
   expect(patches).toHaveLength(1);
   const body = JSON.parse(String(patches[0].init.body)) as Record<string, unknown>;
-  // Partial-update body: branding fields ONLY — never reviewStatus or id.
-  expect(body).toEqual({ programName: 'Café Herz', hexBackgroundColor: '#123456', programLogo: { sourceUri: { uri: LOGO_URL } } });
-  expect(body.reviewStatus).toBeUndefined();
+  // Partial-update body: branding fields PLUS the explicit review-status flip —
+  // Google rejects a PATCH on an APPROVED class without reviewStatus=UNDER_REVIEW
+  // (live-verified 400 "Invalid review status \"APPROVED\""). id stays excluded.
+  expect(body).toEqual({ programName: 'Café Herz', hexBackgroundColor: '#123456', programLogo: { sourceUri: { uri: LOGO_URL } }, reviewStatus: 'UNDER_REVIEW' });
   expect(body.id).toBeUndefined();
   expect(stored.programName).toBe('Café Herz');
   expect(stored.programLogo).toEqual({ sourceUri: { uri: LOGO_URL } });
+  expect(stored.reviewStatus).toBe('UNDER_REVIEW');
+});
+
+test('class provisioning PATCH body carries reviewStatus=UNDER_REVIEW so an APPROVED class is patchable (Google 400 regression, live-verified 2026-09-24)', async () => {
+  // Mimics the real Wallet API: an APPROVED class rejects any PATCH whose body
+  // does not contain reviewStatus=UNDER_REVIEW with 400 invalidResource.
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const stored = { id: '123.stempelpass_loyalty', issuerName: 'Stempelpass', programName: 'StempelPass', reviewStatus: 'APPROVED' };
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); calls.push({ url, init: init ?? {} });
+    if (url.includes('/loyaltyClass/')) {
+      if (init?.method === 'PATCH') {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        if (body.reviewStatus !== 'UNDER_REVIEW') {
+          return new Response(JSON.stringify({ error: { code: 400, message: 'Invalid review status "APPROVED". Use "UNDER_REVIEW" instead.', reason: 'invalidResource' } }), { status: 400 });
+        }
+        return new Response(JSON.stringify({ ...stored, ...body }), { status: 200 });
+      }
+      return new Response(JSON.stringify(stored), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    throw new Error(`unexpected URL in mock: ${url}`);
+  }) as unknown as typeof fetch;
+  const provisioner = new GoogleWalletApiClassProvisioner(mockCredentials(), fetchFn);
+  const model = tenantClassModel('123', branded);
+  // Must NOT reject: the body includes reviewStatus=UNDER_REVIEW.
+  await expect(provisioner.ensureClassExists(model)).resolves.toBeUndefined();
+  const patches = calls.filter(c => c.init?.method === 'PATCH');
+  expect(patches).toHaveLength(1);
+  expect((JSON.parse(String(patches[0].init.body)) as Record<string, unknown>).reviewStatus).toBe('UNDER_REVIEW');
+});
+
+test('class provisioning compares hex colors case-insensitively (Google serializes lowercase, branding keeps user casing)', async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const stored = { id: '123.stempelpass_loyalty', issuerName: 'Stempelpass', programName: 'Café Herz', hexBackgroundColor: '#AB12CD', programLogo: { sourceUri: { uri: LOGO_URL } }, reviewStatus: 'APPROVED' };
+  const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); calls.push({ url, init: init ?? {} });
+    if (url.includes('/loyaltyClass/')) {
+      if (init?.method === 'PATCH') return new Response(JSON.stringify(stored), { status: 200 });
+      return new Response(JSON.stringify(stored), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    throw new Error(`unexpected URL in mock: ${url}`);
+  }) as unknown as typeof fetch;
+  const provisioner = new GoogleWalletApiClassProvisioner(mockCredentials(), fetchFn);
+  // Model color #ab12cd vs stored #AB12CD: same color, different case → NO PATCH.
+  await provisioner.ensureClassExists(tenantClassModel('123', { ...branded, primaryColor: '#ab12cd' }));
+  expect(calls.filter(c => c.init?.method === 'PATCH')).toHaveLength(0);
 });
 
 test('class provisioning surfaces explicit errors: GET non-404 and PATCH failures', async () => {

@@ -113,10 +113,13 @@ export function tenantClassModel(issuerId: string, branding: Branding, classSuff
 
 /** Idempotently provisions the issuer-wide LoyaltyClass before issuing a pass.
  *  GET → 404: POST create. GET 200: compare ONLY the branding-relevant fields;
- *  when any differs, PATCH the existing class with exactly those fields
- *  (partial update, no reviewStatus/id) — idempotent "patch once": after the
- *  first PATCH the GET returns the new values and no further PATCH is issued.
- *  Patching the APPROVED pilot class can push it back into Google review
+ *  when any differs, PATCH the existing class with exactly those fields plus
+ *  reviewStatus UNDER_REVIEW — Google rejects every PATCH on an APPROVED class
+ *  whose body does not flip reviewStatus ("Invalid review status \"APPROVED\".
+ *  Use \"UNDER_REVIEW\" instead.", verified live 2026-09-24 against the Wallet
+ *  API: PATCH without reviewStatus → 400 invalidResource). After the first
+ *  PATCH the GET returns the new values and no further PATCH is issued.
+ *  Patching the APPROVED pilot class pushes it back into Google review
  *  (documented in the PR); the owner's saved pass object is NOT affected —
  *  objects reference the class by id, which never changes. */
 export class GoogleWalletApiClassProvisioner implements GoogleWalletClassProvisioner {
@@ -134,8 +137,15 @@ export class GoogleWalletApiClassProvisioner implements GoogleWalletClassProvisi
       if ((current.issuerName ?? '') !== classModel.issuerName) patch.issuerName = classModel.issuerName;
       if ((current.programName ?? '') !== classModel.programName) patch.programName = classModel.programName;
       if (classModel.programLogo && (current.programLogo?.sourceUri?.uri ?? '') !== classModel.programLogo.sourceUri.uri) patch.programLogo = classModel.programLogo;
-      if (classModel.hexBackgroundColor && (current.hexBackgroundColor ?? '') !== classModel.hexBackgroundColor) patch.hexBackgroundColor = classModel.hexBackgroundColor;
+      // Hex colors compare case-insensitively: Google serializes the stored
+      // class color lowercase (#00008b) while tenant branding keeps the user's
+      // casing (#00008B) — a case-sensitive compare would re-PATCH on every
+      // issue and defeat the "patch once" idempotency.
+      if (classModel.hexBackgroundColor && (current.hexBackgroundColor ?? '').toLowerCase() !== classModel.hexBackgroundColor.toLowerCase()) patch.hexBackgroundColor = classModel.hexBackgroundColor;
       if (Object.keys(patch).length === 0) return;
+      // Google requires an explicit review-status flip on every PATCH of an
+      // APPROVED class; without it the API answers 400 invalidResource.
+      patch.reviewStatus = 'UNDER_REVIEW';
       const patched = await this.fetchFn(url, { method: 'PATCH', headers, body: JSON.stringify(patch) });
       if (!patched.ok) throw new Error(`GOOGLE_WALLET_CLASS_PATCH_FAILED_${patched.status}`);
       return;
