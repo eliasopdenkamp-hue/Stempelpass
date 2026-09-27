@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { GoogleWalletAdapter } from '../src/wallet';
 
-const card = { id: 'card-uuid', stampCount: 4 };
+const card = { id: 'card-uuid', stampCount: 4, cardCode: 'ABCDEF' };
 const credentials = {
   mode: 'service-account-json' as const,
   clientEmail: 'wallet@example.invalid',

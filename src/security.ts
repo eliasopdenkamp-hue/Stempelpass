@@ -181,6 +181,16 @@ export const loginIpLimiter = new RateLimiter(20, 15 * 60_000, 50_000);
 export const loginAccountLimiter = new RateLimiter(5, 15 * 60_000, 50_000);
 export const cardResolveLimiter = new RateLimiter(60, 60_000, 50_000);
 export const stampLimiter = new RateLimiter(30, 60_000, 50_000);
+/**
+ * Staff code-search limiter (GET /staff/:tenantId/search-code). The search is
+ * authenticated (staff session, tenant-scoped RLS) — a per-actor+tenant budget
+ * caps lookups without ever exposing a raw input to a limiter key: the key is
+ * `{tenantId}:{userId}`, never the searched code. Same budget as the public
+ * card resolver (60/min); the staff register flows (stamper) additionally hit
+ * stampLimiter anyway. Per-instance only (see RATE_LIMITING.md), like every
+ * limiter on the request path.
+ */
+export const staffSearchLimiter = new RateLimiter(60, 60_000, 50_000);
 
 /**
  * Password-reset limits (mirror the login limiter split): a per-IP budget and

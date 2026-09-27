@@ -122,21 +122,21 @@ integration('grant matrix: migration 017 grants customers INSERT; the check catc
 
     // MUST-HAVE 2 shape: information_schema.role_table_grants must show the
     // INSERT grant migration 017 applied for the runtime role on customers.
+    // SELECT/UPDATE on customers are NOT granted by any migration — they come
+    // from the operator grant runbook (restore_grants.sql, applied below) —
+    // so only INSERT is pinned here, exactly the 017 regression.
     const grants = await q<{ privilege_type: string }>(
       `select privilege_type from information_schema.role_table_grants
        where grantee = $1 and table_schema = $2 and table_name = 'customers'`,
       [RUNTIME_ROLE, schema],
     );
     expect(grants.map(r => r.privilege_type)).toContain('INSERT');
-    expect(grants.map(r => r.privilege_type)).toContain('SELECT');
-    expect(grants.map(r => r.privilege_type)).toContain('UPDATE');
-
-    // Emulate the operator grant runbook (restore_grants.sql) for everything
-    // except customers (which migration 017 now covers), so the full matrix
-    // check can run against the runtime role in this schema.
+    // Emulate the operator grant runbook (restore_grants.sql) for the full
+    // REQUIRED_GRANTS matrix — customers included. 017 closed the INSERT gap
+    // for fresh environments, but the runbook remains the source of the
+    // complete matrix (SELECT/UPDATE on customers are not in any migration).
     const grantStatements: string[] = [];
     for (const [table, privileges] of Object.entries(REQUIRED_GRANTS)) {
-      if (table === 'customers') continue; // already granted by 017
       if (!ALL_APP_TABLES.includes(table)) continue;
       grantStatements.push(`grant ${privileges.join(', ')} on "${schema}".${table} to ${RUNTIME_ROLE}`);
     }
@@ -145,6 +145,17 @@ integration('grant matrix: migration 017 grants customers INSERT; the check catc
       grantStatements.push(`grant execute on function "${schema}".${fn.name}(${fn.identityArguments}) to ${RUNTIME_ROLE}`);
     }
     for (const stmt of grantStatements) await q(stmt);
+
+    // After the runbook emulation the FULL customers matrix is present
+    // (017-INSERT + runbook SELECT/UPDATE) — the drift shape the matrix
+    // check guards against is the absence of ANY of these three.
+    const afterRunbook = await q<{ privilege_type: string }>(
+      `select privilege_type from information_schema.role_table_grants
+       where grantee = $1 and table_schema = $2 and table_name = 'customers'`,
+      [RUNTIME_ROLE, schema],
+    );
+    expect(afterRunbook.map(r => r.privilege_type)).toContain('SELECT');
+    expect(afterRunbook.map(r => r.privilege_type)).toContain('UPDATE');
 
     // -- Positive proof ----------------------------------------------------
     // Named-role check against the disposable schema: customers now has

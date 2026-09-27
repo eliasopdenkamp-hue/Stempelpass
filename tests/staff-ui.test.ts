@@ -334,6 +334,74 @@ test('GET /staff/:tenantId hides stamp actions for viewer roles', async () => {
     expect(html).not.toContain('<form data-staff-form');
   });
 });
+test('dashboard renders the card code column (K-XXXXXX) and the code-search box', async () => {
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    ...dashboardHandlers({ cards: [{ id: CARD, customerRef: 'Kunde-42', stampCount: 3, cardCode: '7F3D2A', updatedAt: '2026-08-26T10:00:00.000Z' }] }),
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // Dedicated Code column + search form bound to the fragment endpoint.
+    expect(html).toContain('<th>Code</th>');
+    expect(html).toContain('<code>K-7F3D2A</code>');
+    expect(html).toContain('Karte per Code finden');
+    expect(html).toContain(`<form id="sp-code-search" data-search-url="/staff/${TENANT}/search-code"`);
+    expect(html).toContain('<div id="sp-code-result"></div>');
+    // Cards without a code render a neutral dash instead of a broken K-.
+    expect(html).not.toContain('K-</code>');
+  });
+});
+test('GET /staff/:tenantId/search-code finds the card by code (prefix optional), scoped to the caller tenant', async () => {
+  const searchHandlers = [
+    { match: contains('from cards c join customers'), rows: [{ id: CARD, cardCode: '7F3D2A', stampCount: 4, stampsRequired: 6, updatedAt: '2026-09-25T10:00:00.000Z', customerRef: 'Kunde-42' }] },
+    { match: contains('from rewards where tenant_id'), rows: [{ id: REWARD, status: 'issued' }] },
+  ];
+  const pool = new FakePool([...sessionHandlers(validSession), ...searchHandlers]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/search-code?q=k-7F3D2A`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/html');
+    const html = await res.text();
+    // Slim fragment: found card + direct stamp button (no full page).
+    expect(html).toContain('Karte gefunden:');
+    expect(html).toContain('<code>K-7F3D2A</code>');
+    expect(html).toContain('Kunde-42');
+    expect(html).toContain(`data-action="stamp" data-url="/staff/${TENANT}/stamp" data-card="${CARD}"`);
+    expect(html).toContain('data-action="redeem"');
+    expect(html).not.toContain('<html');
+    // The lookup is tenant-scoped: the SQL carries the session tenant + the
+    // NORMALIZED code (bare, uppercase — prefix stripped server-side).
+    const lookup = pool.queries.find(q => q.sql.includes('join stamp_rules'));
+    expect(lookup).toBeDefined();
+    expect(lookup!.params).toEqual([TENANT, '7F3D2A', 'active']);
+  });
+});
+test('GET /staff/:tenantId/search-code answers a neutral fragment for unknown/invalid codes without a DB lookup leak', async () => {
+  // Unknown but well-formed code: the search query runs inside the tenant and
+  // returns nothing (foreign/deleted codes are indistinguishable from missing).
+  const pool = new FakePool([...sessionHandlers(validSession), ...dashboardHandlers()]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/search-code?q=ZZZZZZ`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('Karte nicht gefunden.');
+    expect(html).not.toContain('data-action="stamp"');
+  });
+  // Malformed/ambiguous input (0/O/1/I, wrong length): rejected by the format
+  // gate BEFORE any database query beyond the session itself.
+  const pool2 = new FakePool([...sessionHandlers(validSession)]);
+  await runWith(pool2, async () => {
+    // dashboardHandlers are intentionally absent: the route must not fire any
+    // dashboard read. A lookup query would match no handler and return [] —
+    // the assertion below proves it never ran.
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/search-code?q=K-0F3D2A`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    expect((await res.text())).toContain('Karte nicht gefunden.');
+    expect(pool2.queries.some(q => q.sql.includes('join stamp_rules'))).toBe(false);
+  });
+});
 
 test('GET /staff/:tenantId renders the statistics section: KPIs, trend with German formatting and reward-progress rows (visible to every role)', async () => {
   const pool = new FakePool([...sessionHandlers(validSession), ...dashboardHandlers()]);
@@ -653,7 +721,12 @@ test('dashboard HTML embeds a JSON-only staff script (no urlencoded client fetch
     const html = await res.text();
     expect(html).toContain("'content-type': 'application/json'");
     expect(html).toContain('JSON.stringify(toObject(data || {}))');
-    expect(html).not.toContain('new URLSearchParams');
+    // Every action POST is JSON — the script must never send an urlencoded
+    // form body (the deployed Vercel Node runtime delivers those unusably).
+    // URLSearchParams IS allowed for the code-search GET query string, so the
+    // pin targets the wire format of POST bodies, not the API name.
+    expect(html).not.toContain("'content-type': 'application/x-www-form-urlencoded'");
+    expect(html).not.toContain('x-www-form-urlencoded');
   });
 });
 

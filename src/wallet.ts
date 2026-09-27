@@ -1,5 +1,6 @@
 import type { Branding, Provider, WalletArtifact, WalletCardView } from './domain.js';
 import { createSign } from 'node:crypto';
+import { formatCardCode } from './card-code.js';
 import { resolveGcpCredentials, gcpCredentialMode, base64url, WALLET_OBJECT_SCOPE, type GcpCredentialProvider } from './gcp-credentials.js';
 
 export interface LoyaltyClass {
@@ -192,6 +193,13 @@ export class GoogleWalletAdapter implements WalletAdapter {
     const modules: Array<{ header: string; body: string }> = [
       { header: title, body: `${card.stampCount}/${context?.stampRequired ?? '?'} Stempel · ${context?.rewardTitle ?? 'Prämie'}` },
     ];
+    // Visible card code (owner wish 2026-09-24): the pass shows the same
+    // K-XXXXXX code as the webcard, so the register can read it off the phone.
+    // The code is identification only — never a permission. Defensive: the
+    // module is emitted only when the code is present (the migration 021
+    // backfill guarantees it in production; pre-backfill rows stay gray).
+    const code = card.cardCode?.trim();
+    if (code) modules.push({ header: 'Kartennummer', body: formatCardCode(code) });
     const cardText = branding.cardText?.trim();
     if (cardText) modules.push({ header: title, body: cardText });
     return { id: `${this.issuerId}.${card.id}`, classId, state: 'ACTIVE', loyaltyPoints: { balance: { int: card.stampCount } }, textModulesData: modules };

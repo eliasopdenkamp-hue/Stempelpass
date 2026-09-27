@@ -1,14 +1,15 @@
 import { assertTenant, canStamp, hashToken } from './domain.js';
-import { cardResolveLimiter, clientIpKey, csrfValid, hashPassword, joinResolveKey, loginAccountKey, loginAccountLimiter, loginFailureReason, loginIpLimiter, resetConfirmIpLimiter, resetConfirmTokenLimiter, resetRequestAccountLimiter, resetRequestIpLimiter, resetResolveKey, resetResolveLimiter, stampLimiter, verifyPassword, verifyPasswordAgainstDummy, randomToken, hashSessionToken } from './security.js';
+import { cardResolveLimiter, clientIpKey, csrfValid, hashPassword, joinResolveKey, loginAccountKey, loginAccountLimiter, loginFailureReason, loginIpLimiter, resetConfirmIpLimiter, resetConfirmTokenLimiter, resetRequestAccountLimiter, resetRequestIpLimiter, resetResolveKey, resetResolveLimiter, staffSearchLimiter, stampLimiter, verifyPassword, verifyPasswordAgainstDummy, randomToken, hashSessionToken } from './security.js';
 import { createPostgresPool, runMigrations, type DbPool } from './db.js';
 import { CardRepository, type StaffDashboardData, type StaffStats } from './repository.js';
 import { configurationStatus } from './config.js';
 import { EncryptedMfaSecretStore, verifyTotp } from './mfa.js';
 import { walletAdapter, ensureGoogleWalletClass } from './wallet.js';
 import { classifyError } from './http-error.js';
+import { formatCardCode, normalizeCardCode } from './card-code.js';
 import { DEFAULT_PRIMARY_CARD_COLOR, DEFAULT_SECONDARY_CARD_COLOR, joinPageHtml, safeBranding, toPublicCardResponse, toWalletCardView } from './public-card.js';
 import { publicHealthResponse } from './health.js';
-import { loginPage, resetPasswordPage, resetRequestPage, resetTokenInvalidPage, tenantChooserPage, noTenantPage, dashboardPage, staffErrorPage, type DashboardView } from './staff-ui.js';
+import { codeSearchEmptyHtml, codeSearchResultHtml, loginPage, resetPasswordPage, resetRequestPage, resetTokenInvalidPage, tenantChooserPage, noTenantPage, dashboardPage, staffErrorPage, type DashboardView } from './staff-ui.js';
 import { SmtpEmailAdapter, passwordResetEmailHtml, passwordResetEmailText } from './email.js';
 import { requireVerifiedMfaBootstrap } from './mfa-bootstrap.js';
 import { toCreateCardResponse, toDeleteResponse, toLoginResponse, toPilotResponse, toRedeemResponse, toResetConfirmResponse, toResetRequestResponse, toStaffResponse, toStampResponse } from './contracts.js';
@@ -145,7 +146,11 @@ async function syncWalletBalance(tenantId:string,card:{id:string;stampCount:numb
   try{
     const ctx=await repository.cardWalletContext(tenantId,card.id);
     const adapter=walletFactory('google',{oidcToken:oidcToken??undefined});
-    const result=await adapter.refresh(toWalletCardView(card),['loyaltyPoints','textModulesData'],{
+    // The card code travels into the Wallet refresh through the deterministic
+    // loyaltyObject path (cardWalletContext reads card_code); existing saved
+    // passes pick it up via this same refresh/sync path (PR #30) — no new
+    // mechanism, no new artifact column.
+    const result=await adapter.refresh(toWalletCardView({id:card.id,stampCount:card.stampCount,cardCode:ctx.cardCode??''}),['loyaltyPoints','textModulesData'],{
       branding:safeBranding(ctx.branding)??{cardTitle:'StempelPass',cardText:'',primaryColor:DEFAULT_PRIMARY_CARD_COLOR,secondaryColor:DEFAULT_SECONDARY_CARD_COLOR,version:1},
       stampRequired:ctx.rule?.stampsRequired??undefined,
       rewardTitle:ctx.rule?.rewardTitle??undefined,
@@ -317,6 +322,40 @@ async function handleStaffDashboard(req:Request,tenantId:string,id:string):Promi
     const stats=await repository.staffStats(tenantId);
     const newCard=await dashboardNewCard(req,tenantId,actor.role);
     return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,stats,actor.csrfTokenHash,newCard)));
+  }catch(e){
+    if(e instanceof Error&&e.message==='UNAUTHENTICATED')return staffRedirect('/login');
+    return staffError(e,id);
+  }
+}
+/**
+ * GET /staff/:tenantId/search-code?q=… — staff "Karte per Code finden".
+ *
+ * Read-only lookup (GET, session auth, no CSRF — stamping keeps its CSRF'd
+ * POST path): normalizes the input (optional K- prefix, uppercase), resolves
+ * the card through repository.findByCardCode INSIDE the caller's tenant RLS
+ * transaction and answers a slim HTML FRAGMENT (found card incl. a direct
+ * stamp/redeem button when the role may stamp, or a "not found" message) that
+ * the dashboard script injects into #sp-code-result. Security model unchanged:
+ * the code is pure identification, never a permission — the fragment's stamp
+ * button still goes through /staff/:tenantId/stamp (auth + CSRF + stamp
+ * limiter), and the lookup can only ever see the caller's own tenant (a
+ * foreign code → null → "Karte nicht gefunden", identical to a missing card;
+ * no cross-tenant oracle, no format leak). The per-actor+tenant search
+ * limiter (staffSearchLimiter) caps the endpoint; the searched code never
+ * becomes a limiter key or a log line.
+ */
+async function handleStaffSearchCode(req:Request,tenantId:string,id:string):Promise<Response>{
+  try{
+    if(!UUID_RE.test(tenantId))return htmlResponse(staffErrorPage(404,'TENANT_NOT_FOUND',id),404);
+    if(!pool||!repository)throw new Error('DATABASE_REQUIRED');
+    const actor=await auth(req,tenantId,false);
+    const q=String(new URL(req.url).searchParams.get('q')??'').trim();
+    const code=normalizeCardCode(q);
+    if(!code)return htmlResponse(codeSearchEmptyHtml(),200);
+    if(!staffSearchLimiter.allow(`${tenantId}:${actor.userId}`))throw new Error('RATE_LIMITED');
+    const found=await repository.findByCardCode(tenantId,code);
+    if(!found)return htmlResponse(codeSearchEmptyHtml(),200);
+    return htmlResponse(codeSearchResultHtml(found,tenantId,canStamp(actor.role)),200);
   }catch(e){
     if(e instanceof Error&&e.message==='UNAUTHENTICATED')return staffRedirect('/login');
     return staffError(e,id);
@@ -686,7 +725,11 @@ if(parts[0]==='api'&&!configured)throw new Error('CONFIGURATION_REQUIRED');
         if(parts[6]==='wallet'&&parts[7]==='google'&&parts[8]==='redirect'){const adapter=walletFactory('google',{oidcToken:req.headers.get('x-vercel-oidc-token')??undefined});const branding: Branding=safeBranding(result.branding) ?? {cardTitle:'StempelPass',cardText:'',primaryColor:DEFAULT_PRIMARY_CARD_COLOR,secondaryColor:DEFAULT_SECONDARY_CARD_COLOR,version:1};const rule: StampRule|null=result.rule;const value=await adapter.issue(toWalletCardView(result.card),branding,{stampRequired:rule?.stampsRequired,rewardTitle:rule?.rewardTitle});if(value.status!=='issued'||!value.artifact)throw new Error('WALLET_NOT_CONFIGURED');return new Response(null,{status:302,headers:{Location:`https://pay.google.com/gp/v/save/${encodeURIComponent(value.artifact)}`}});}
         if(parts[6]==='wallet'&&parts[7]==='google'){const artifact=walletAdapter('google',{oidcToken:req.headers.get('x-vercel-oidc-token')??undefined});const branding: Branding=safeBranding(result.branding) ?? {cardTitle:'StempelPass',cardText:'',primaryColor:DEFAULT_PRIMARY_CARD_COLOR,secondaryColor:DEFAULT_SECONDARY_CARD_COLOR,version:1};const rule: StampRule|null=result.rule;const value=await artifact.issue(toWalletCardView(result.card),branding,{stampRequired:rule?.stampsRequired,rewardTitle:rule?.rewardTitle});return json(value,200,id);}
         return json(toPublicCardResponse(result,parts[3]),200,id);}
-    if(parts[0]==='card'&&parts.length===3&&req.method==='GET'){if(!repository||!cardResolveLimiter.allow(clientIpKey(req)))throw new Error(!repository?'DATABASE_REQUIRED':'RATE_LIMITED');const result=await repository.publicCard(parts[1],hashToken(parts[2]));if(!result)throw new Error('CARD_NOT_FOUND');const b: Branding=safeBranding(result.branding) ?? {cardTitle:'StempelPass',cardText:'',primaryColor:DEFAULT_PRIMARY_CARD_COLOR,secondaryColor:DEFAULT_SECONDARY_CARD_COLOR,version:1};const r: StampRule=result.rule ?? {id:'',tenantId:parts[1],name:'',stampsRequired:1,rewardTitle:'Prämie',rewardDescription:'',active:true,version:1};const esc=(v:unknown)=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]!));const progress=Math.min(100,Math.round((result.card.stampCount/Math.max(1,Number(r.stampsRequired||1)))*100));return new Response(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(b.cardTitle||'StempelPass')}</title><style>body{font:16px system-ui;margin:0;padding:2rem;background:${esc(b.secondaryColor||'#f8fafc')};color:#172033}.card{max-width:28rem;margin:auto;padding:2rem;border-radius:1.5rem;background:white;border-top:1rem solid ${esc(b.primaryColor||'#155e75')};box-shadow:0 8px 30px #0002}progress{width:100%;accent-color:${esc(b.primaryColor||'#155e75')}}.privacy{margin-top:1.5rem;padding-top:1rem;border-top:1px solid #e2e8f0;font-size:.85rem;color:#475569}.privacy h3{margin:0 0 .4rem;font-size:inherit;color:#334155}.privacy p{margin:.4rem 0}</style><main class="card"><h1>${esc(b.cardTitle)}</h1><p>${esc(b.cardText)}</p><p><strong>${result.card.stampCount}</strong> / ${esc(r.stampsRequired)} Stempel</p><progress max="100" value="${progress}"></progress><h2>${esc(r.rewardTitle)}</h2><p>${esc(r.rewardDescription)}</p><a style="display:block;width:100%;box-sizing:border-box;text-align:center;background:${esc(b.primaryColor)};color:#fff;text-decoration:none;padding:.9rem 1rem;border-radius:.75rem;font-weight:600;margin-top:1.5rem" href="/api/public/tenants/${esc(parts[1])}/cards/${esc(parts[2])}/wallet/google/redirect">Zu Google Wallet hinzufügen</a><p style="margin:.5rem 0 0;font-size:.8rem;color:#475569;text-align:center">Auf dem Handy öffnen, um die Karte ins Wallet zu legen.</p><section class="privacy"><h3>Datenschutz</h3><p>${esc('Verantwortlich für die Verarbeitung: '+(result.controllerName||'<Tenant>'))}</p><p>${esc('Diese Stempelkarte speichert nur den Stempelstand und den Fortschritt zur Prämie. StempelPass Deutschland verarbeitet die Daten als Auftragsverarbeiter (Art. 28 DSGVO).')}</p><p>${esc('Die Karte wird nach 12 Monaten ohne Stempelaktivität deaktiviert. Kundendaten werden 30 Tage nach der Soft-Löschung endgültig gelöscht. Falls Sie Kommunikationsnachrichten erhalten oder eine Einwilligung erteilen, wird die Kommunikationshistorie 24 Monate gespeichert; der Nachweis Ihrer Einwilligung wird für einen Zeitraum von 3 Jahren nach Ihrem Widerruf gespeichert. Audit-Aufzeichnungen werden zur Beweissicherung dauerhaft aufbewahrt.')}</p>${result.privacyContact?'<p>'+esc('Sie haben das Recht auf Auskunft, Berichtigung, Löschung und Widerspruch. Kontakt für Anfragen: '+result.privacyContact)+'</p>':''}</section></main>`,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'}});}
+    if(parts[0]==='card'&&parts.length===3&&req.method==='GET'){if(!repository||!cardResolveLimiter.allow(clientIpKey(req)))throw new Error(!repository?'DATABASE_REQUIRED':'RATE_LIMITED');const result=await repository.publicCard(parts[1],hashToken(parts[2]));if(!result)throw new Error('CARD_NOT_FOUND');const b: Branding=safeBranding(result.branding) ?? {cardTitle:'StempelPass',cardText:'',primaryColor:DEFAULT_PRIMARY_CARD_COLOR,secondaryColor:DEFAULT_SECONDARY_CARD_COLOR,version:1};const r: StampRule=result.rule ?? {id:'',tenantId:parts[1],name:'',stampsRequired:1,rewardTitle:'Prämie',rewardDescription:'',active:true,version:1};const esc=(v:unknown)=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]!));const progress=Math.min(100,Math.round((result.card.stampCount/Math.max(1,Number(r.stampsRequired||1)))*100));// Visible card code: same K-XXXXXX as the Google Wallet pass. The webcard is
+    // already authenticated by the one-time card token in the URL; the code is a
+    // second identifier for the SAME card and exposes nothing the token holder
+    // does not already see (balance, rule, reward). Identification only.
+    const cardCodeLine=result.card.cardCode?`<p><strong>Kartennummer:</strong> <code>${esc(formatCardCode(result.card.cardCode))}</code></p>`:'';return new Response(`<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(b.cardTitle||'StempelPass')}</title><style>body{font:16px system-ui;margin:0;padding:2rem;background:${esc(b.secondaryColor||'#f8fafc')};color:#172033}.card{max-width:28rem;margin:auto;padding:2rem;border-radius:1.5rem;background:white;border-top:1rem solid ${esc(b.primaryColor||'#155e75')};box-shadow:0 8px 30px #0002}progress{width:100%;accent-color:${esc(b.primaryColor||'#155e75')}}.privacy{margin-top:1.5rem;padding-top:1rem;border-top:1px solid #e2e8f0;font-size:.85rem;color:#475569}.privacy h3{margin:0 0 .4rem;font-size:inherit;color:#334155}.privacy p{margin:.4rem 0}</style><main class="card"><h1>${esc(b.cardTitle)}</h1><p>${esc(b.cardText)}</p>${cardCodeLine}<p><strong>${result.card.stampCount}</strong> / ${esc(r.stampsRequired)} Stempel</p><progress max="100" value="${progress}"></progress><h2>${esc(r.rewardTitle)}</h2><p>${esc(r.rewardDescription)}</p><a style="display:block;width:100%;box-sizing:border-box;text-align:center;background:${esc(b.primaryColor)};color:#fff;text-decoration:none;padding:.9rem 1rem;border-radius:.75rem;font-weight:600;margin-top:1.5rem" href="/api/public/tenants/${esc(parts[1])}/cards/${esc(parts[2])}/wallet/google/redirect">Zu Google Wallet hinzufügen</a><p style="margin:.5rem 0 0;font-size:.8rem;color:#475569;text-align:center">Auf dem Handy öffnen, um die Karte ins Wallet zu legen.</p><section class="privacy"><h3>Datenschutz</h3><p>${esc('Verantwortlich für die Verarbeitung: '+(result.controllerName||'<Tenant>'))}</p><p>${esc('Diese Stempelkarte speichert nur den Stempelstand und den Fortschritt zur Prämie. StempelPass Deutschland verarbeitet die Daten als Auftragsverarbeiter (Art. 28 DSGVO).')}</p><p>${esc('Die Karte wird nach 12 Monaten ohne Stempelaktivität deaktiviert. Kundendaten werden 30 Tage nach der Soft-Löschung endgültig gelöscht. Falls Sie Kommunikationsnachrichten erhalten oder eine Einwilligung erteilen, wird die Kommunikationshistorie 24 Monate gespeichert; der Nachweis Ihrer Einwilligung wird für einen Zeitraum von 3 Jahren nach Ihrem Widerruf gespeichert. Audit-Aufzeichnungen werden zur Beweissicherung dauerhaft aufbewahrt.')}</p>${result.privacyContact?'<p>'+esc('Sie haben das Recht auf Auskunft, Berichtigung, Löschung und Widerspruch. Kontakt für Anfragen: '+result.privacyContact)+'</p>':''}</section></main>`,{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'}});}
     if(parts[0]==='join'&&parts.length===2&&req.method==='GET'){if(!/^[a-f0-9]{32}$/i.test(parts[1]))throw new Error('ENTRY_POINT_NOT_FOUND');if(!repository||!cardResolveLimiter.allow(joinResolveKey(req,parts[1])))throw new Error(!repository?'DATABASE_REQUIRED':'RATE_LIMITED');const ctx=await repository.joinContext(parts[1]);if(!ctx)throw new Error('ENTRY_POINT_NOT_FOUND');const origin=new URL(req.url).origin;return htmlResponse(joinPageHtml(ctx,`${origin}${ctx.joinPath}`),200,{'Cache-Control':'public, max-age=60'});}
     if(parts[0]==='reset'&&parts.length===1&&req.method==='GET')return htmlResponse(resetRequestPage());
     if(parts[0]==='reset'&&parts.length===2&&req.method==='GET')return await handleResetPage(req);
@@ -697,6 +740,7 @@ if(parts[0]==='api'&&!configured)throw new Error('CONFIGURATION_REQUIRED');
     if(parts[0]==='staff'&&req.method==='GET'){
       if(parts.length===1)return handleStaffEntry(req,id);
       if(parts.length===2)return handleStaffDashboard(req,parts[1],id);
+      if(parts.length===3&&parts[2]==='search-code')return handleStaffSearchCode(req,parts[1],id);
     }
     if(parts[0]==='staff'&&parts.length===3&&req.method==='POST'){
       if(parts[2]==='stamp')return handleStaffStamp(req,parts[1],id);

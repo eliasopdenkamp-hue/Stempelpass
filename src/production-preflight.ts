@@ -262,6 +262,7 @@ export const EXPECTED_MIGRATIONS: readonly string[] = [
   '018_tenant_branding_logo_url.sql',
   '019_password_reset_tokens.sql',
   '020_reset_user_password_function.sql',
+  '021_card_code.sql',
 ];
 
 export interface MigrationCheck {
@@ -273,7 +274,7 @@ export interface MigrationCheck {
   errors: string[];
 }
 
-/** Filesystem-only: 001–018 present, runner-compatible names, contiguous. */
+/** Filesystem-only: 001–021 present, runner-compatible names, contiguous. */
 export async function migrationCheck(dir: string, io: PreflightIo = realIo): Promise<MigrationCheck> {
   const errors: string[] = [];
   let files: string[] = [];

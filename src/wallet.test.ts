@@ -1,7 +1,7 @@
 import { test, expect } from 'bun:test';
 import { GoogleWalletAdapter, GoogleWalletApiClassProvisioner, PrivateKeyJwtSigner, IamSignBlobJwtSigner, walletAdapter, googleWalletConfiguration, ensureGoogleWalletClass, tenantClassModel, DEFAULT_CLASS_LOGO_URI } from './wallet';
 import { ExternalAccountCredentials, ServiceAccountJsonCredentials } from './gcp-credentials';
-const card = { id:'card-1', tenantId:'tenant-1', customerId:'customer-1', publicTokenHash:'hash', status:'active' as const, stampCount:3, revision:2, ruleId:'rule-1' };
+const card = { id:'card-1', tenantId:'tenant-1', customerId:'customer-1', publicTokenHash:'hash', status:'active' as const, stampCount:3, revision:2, ruleId:'rule-1', cardCode:'7F3D2A' };
 const branding = { cardTitle:'Café', cardText:'Treuekarte', primaryColor:'#123456', secondaryColor:'#fff', version:1 };
 const GOOGLE_ENV = ['GOOGLE_ISSUER_ID', 'GOOGLE_SERVICE_ACCOUNT_JSON', 'GOOGLE_SERVICE_ACCOUNT_EMAIL', 'GOOGLE_PRIVATE_KEY', 'GOOGLE_EXTERNAL_ACCOUNT_JSON', 'GOOGLE_APPLICATION_CREDENTIALS', 'VERCEL_OIDC_TOKEN'] as const;
 function withCleanEnv<T>(fn: () => Promise<T>): Promise<T> {
@@ -231,9 +231,11 @@ test('refresh PATCHes the loyaltyObject with the new balance and text module (mo
   expect(auth).toBe('Bearer oauth-token');
   const body = JSON.parse(String(patch!.init.body)) as Record<string, any>;
   expect(body.loyaltyPoints).toEqual({ balance: { int: card.stampCount } });
-  // Branding flows through to the object: progress module + cardText module.
+  // Branding flows through to the object: progress module + cardText module;
+  // the visible card code appears as its own Kartennummer module.
   expect(body.textModulesData).toEqual([
     { header: branding.cardTitle, body: '3/10 Stempel · Gratis' },
+    { header: 'Kartennummer', body: 'K-7F3D2A' },
     { header: branding.cardTitle, body: branding.cardText },
   ]);
   // The PATCH is the ONLY loyaltyObject call: no GET, no class provisioning.
@@ -284,7 +286,10 @@ test('refresh PATCHes with fallback branding/rule when no context is supplied', 
   const result = await adapter.refresh(card, []);
   expect(result.status).toBe('issued');
   const body = JSON.parse(String(calls.find(c => c.url === WALLET_PATCH_URL)!.init.body)) as Record<string, any>;
-  expect(body.textModulesData).toEqual([{ header: 'StempelPass', body: '3/? Stempel · Prämie' }]);
+  expect(body.textModulesData).toEqual([
+    { header: 'StempelPass', body: '3/? Stempel · Prämie' },
+    { header: 'Kartennummer', body: 'K-7F3D2A' },
+  ]);
 }));
 
 // ---------------------------------------------------------------------------
@@ -329,6 +334,7 @@ test('issue() embeds branding in the object model: tenant class id + progress an
   expect(obj.classId).toBe('123.tenant-1');
   expect(obj.textModulesData).toEqual([
     { header: 'Café Herz', body: '3/10 Stempel · Gratis Kaffee' },
+    { header: 'Kartennummer', body: 'K-7F3D2A' },
     { header: 'Café Herz', body: 'Sammle Stempel' },
   ]);
 });

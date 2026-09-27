@@ -13,6 +13,7 @@
 import type { StaffDashboardCard, StaffDashboardEvent, StaffStats } from './repository.js';
 import { DEFAULT_PRIMARY_CARD_COLOR, DEFAULT_SECONDARY_CARD_COLOR, safeCardColor } from './public-card.js';
 import { qrSvgDataUri } from './qr.js';
+import { formatCardCode } from './card-code.js';
 
 /** HTML-escape a dynamic value (same character set as the public webcard). */
 export function esc(v: unknown): string {
@@ -238,6 +239,39 @@ const STAFF_SCRIPT = `
     if (btn) btn.disabled = true;
     post(action, new FormData(form)).then(function () { if (btn) btn.disabled = false; });
   }
+  /**
+   * Code search ("Karte per Code finden"): GET the search endpoint, inject the
+   * returned HTML FRAGMENT into #sp-code-result. Deliberately NOT the full
+   * dashboard post() path — the search answer is a fragment (found card +
+   * stamp button), and a full #sp-app swap would scroll the user away from the
+   * search box. The injected stamp/redeem buttons work through the document-
+   * level [data-action] delegation without rebinding. Read-only GET: no CSRF
+   * header needed (stamping itself keeps its CSRF'd POST path unchanged).
+   */
+  function submitSearch(ev, form) {
+    ev.preventDefault();
+    var input = document.getElementById('sp-code-input');
+    var result = document.getElementById('sp-code-result');
+    var btn = form.querySelector('button[type="submit"]');
+    var q = input && input.value.trim();
+    if (!q) return;
+    if (btn) btn.disabled = true;
+    fetch(form.getAttribute('data-search-url') + '?' + new URLSearchParams({ q: q }).toString(), { headers: { 'accept': 'text/html' } })
+      .then(function (res) {
+        if (res.status === 401 || res.status === 403) { showReloadError(); return; }
+        return res.text().then(function (html) {
+          if (!res.ok) {
+            var doc = new DOMParser().parseFromString(html, 'text/html');
+            var err = doc.getElementById('sp-error');
+            showError(err ? err.textContent : 'Suche fehlgeschlagen. Bitte erneut versuchen.');
+            return;
+          }
+          if (result) result.innerHTML = html;
+        });
+      })
+      .catch(function () { showError('Dienst ist kurz nicht erreichbar. Bitte erneut versuchen.'); })
+      .then(function () { if (btn) btn.disabled = false; });
+  }
   /** Direct listeners on every staff form (at boot and after every dashboard
    *  swap) so a native submit is intercepted on the target element itself,
    *  not only via document delegation — Enter, button clicks and
@@ -249,6 +283,13 @@ const STAFF_SCRIPT = `
       if (form.__spBound) continue;
       form.__spBound = true;
       form.addEventListener('submit', function (ev) { submitStaffForm(ev, this); });
+    }
+    // The code-search form is intentionally NOT data-staff-form (its answer is
+    // a fragment, not a full dashboard swap). Bind it on every boot/swap.
+    var search = document.getElementById('sp-code-search');
+    if (search && !search.__spBound) {
+      search.__spBound = true;
+      search.addEventListener('submit', function (ev) { submitSearch(ev, this); });
     }
   }
   // Document-level delegation stays as the safety net for every staff form
@@ -301,6 +342,43 @@ export function staffErrorPage(status: number, code: string, requestId?: string)
   const detail = code === 'INTERNAL_ERROR' && requestId
     ? `<p class="hint">Fehlerkennung: ${esc(requestId)}</p>` : '';
   return page('Fehler – StempelPass', `<main class="card"><h1>Fehler</h1><p class="error" id="sp-error">${esc(staffErrorMessage(code))}</p>${detail}<p><a href="/staff">Zurück zur Übersicht</a></p></main>`);
+}
+
+/**
+ * HTML FRAGMENT for the staff code-search result (GET /staff/:tenantId/
+ * search-code). NOT a full page: the client injects it into the
+ * `#sp-code-result` container on the dashboard. The stamp/redeem buttons use
+ * the exact same `[data-action]` attributes as the cards table, so the
+ * document-level delegated listeners of STAFF_SCRIPT make the injected buttons
+ * work without rebinding — the direct stamp path, no list scrolling.
+ * `card` comes from repository.findByCardCode: a card OF THE CALLER'S TENANT
+ * only (tenant RLS), carrying no token/session data.
+ */
+export function codeSearchResultHtml(card: StaffDashboardCard & { stampsRequired: number }, tenantId: string, canStamp: boolean): string {
+  const primary = DEFAULT_PRIMARY_CARD_COLOR;
+  const code = formatCardCode(card.cardCode ?? '');
+  const progress = Math.min(100, Math.round((card.stampCount / Math.max(1, Number(card.stampsRequired || 1))) * 100));
+  const statusBadge = card.rewardStatus === 'issued'
+    ? '<span class="badge issued">Prämie einlösbar</span>'
+    : card.rewardStatus === 'redeemed' ? '<span class="badge redeemed">Prämie eingelöst</span>' : '';
+  const actions: string[] = [];
+  if (canStamp) {
+    actions.push(`<button type="button" class="ghost" data-action="stamp" data-url="/staff/${esc(tenantId)}/stamp" data-card="${esc(card.id)}" data-quantity="1">+1 Stempel</button>`);
+    if (card.rewardStatus === 'issued' && card.rewardId) {
+      actions.push(`<button type="button" class="ghost" data-action="redeem" data-url="/staff/${esc(tenantId)}/redeem" data-reward="${esc(card.rewardId)}">Prämie einlösen</button>`);
+    }
+  }
+  return `<div class="search-result" id="sp-search-result">
+<p><strong>Karte gefunden:</strong> <code>${esc(code)}</code> <span class="meta">${esc(card.customerRef ?? '—')}</span></p>
+<p>Stempelstand: <strong>${esc(card.stampCount)}</strong> / ${esc(card.stampsRequired)} <progress max="100" value="${progress}" style="width:8rem;accent-color:${esc(primary)};vertical-align:middle"></progress> ${statusBadge}</p>
+<div class="row" style="margin-top:.25rem">${actions.join('')}</div>
+<p class="hint">Stempel direkt vergeben — die Karte wird nicht in der Liste gesucht.</p>
+</div>`;
+}
+
+/** HTML FRAGMENT for the code-search empty/not-found case (always HTTP 200). */
+export function codeSearchEmptyHtml(text = 'Karte nicht gefunden.'): string {
+  return `<div class="search-result" id="sp-search-result"><p class="meta">${esc(text)}</p></div>`;
 }
 
 /** GET /login — staff login form (email + password + optional MFA code). */
@@ -569,19 +647,28 @@ export function dashboardPage(v: DashboardView, flash?: { kind: 'ok' | 'error'; 
             actions.push(`<button type="button" class="ghost" data-action="redeem" data-url="/staff/${esc(v.tenantId)}/redeem" data-reward="${esc(c.rewardId)}">Prämie einlösen</button>`);
           }
         }
-        return `<tr><td><code>${esc(c.id.slice(0, 8))}</code> <span class="meta">${esc(c.customerRef ?? '—')}</span></td><td>${esc(c.stampCount)} / ${esc(v.stampsRequired ?? '?')}</td><td><progress max="100" value="${progress}" style="width:5rem;accent-color:${esc(primary)}"></progress></td><td>${statusBadge || '<span class="meta">—</span>'}</td><td class="row">${actions.join('')}</td></tr>`;
+        return `<tr><td><code>${esc(c.id.slice(0, 8))}</code> <span class="meta">${esc(c.customerRef ?? '—')}</span></td><td>${c.cardCode ? `<code>${esc(formatCardCode(c.cardCode))}</code>` : '<span class="meta">—</span>'}</td><td>${esc(c.stampCount)} / ${esc(v.stampsRequired ?? '?')}</td><td><progress max="100" value="${progress}" style="width:5rem;accent-color:${esc(primary)}"></progress></td><td>${statusBadge || '<span class="meta">—</span>'}</td><td class="row">${actions.join('')}</td></tr>`;
       }).join('')
-    : '<tr><td colspan="5"><span class="meta">Noch keine Karten.</span></td></tr>';
+    : '<tr><td colspan="6"><span class="meta">Noch keine Karten.</span></td></tr>';
   const eventRows = v.events.length
     ? v.events.map(e => `<tr><td><code>${esc(e.cardId.slice(0, 8))}</code></td><td>${esc(e.customerRef ?? '—')}</td><td>+${esc(e.quantity)}</td><td>${esc(fmtTs(e.createdAt))}</td></tr>`).join('')
     : '<tr><td colspan="4"><span class="meta">Noch keine Stempel-Ereignisse.</span></td></tr>';
   const stampForm = v.canStamp
     ? `<form data-staff-form action="/staff/${esc(v.tenantId)}/stamp" method="post" class="row" style="gap:.5rem;margin-top:.5rem">
-        <input name="cardId" placeholder="Karten-ID oder Karten-Token" required style="flex:1;margin:0">
+        <input name="cardId" placeholder="Karten-ID, Kartencode oder Karten-Token" required style="flex:1;margin:0">
         <input name="quantity" type="number" min="1" max="10" value="1" style="width:5.5rem;margin:0">
         <button type="submit" class="secondary" style="margin:0">Stempel vergeben</button>
-      </form><p class="hint">Karten-ID aus der Liste kopieren oder den Token vom Kunden-Gerät/QR eingeben.</p>`
+      </form><p class="hint">Karten-ID aus der Liste kopieren, den Kartencode (K-XXXXXX) oder den Token vom Kunden-Gerät/QR eingeben.</p>`
     : '<p class="meta">Diese Rolle kann keine Stempel vergeben oder Prämien einlösen.</p>';
+  const codeSearchHtml = `<h2>Karte per Code finden</h2>
+<form id="sp-code-search" data-search-url="/staff/${esc(v.tenantId)}/search-code" autocomplete="off">
+<div class="row" style="gap:.5rem">
+<input id="sp-code-input" name="code" placeholder="K-7F3D2A oder 7F3D2A" required style="flex:1;margin:0">
+<button type="submit" class="secondary" style="margin:0">Karte finden</button>
+</div>
+</form>
+<div id="sp-code-result"></div>
+<p class="hint">Kartencode von der Webkarte oder aus Google Wallet eingeben (Präfix K- optional) — die passende Karte erscheint direkt mit Stempel-Button.</p>`;
   const createCardButton = v.canStamp
     ? `<button type="button" class="secondary" data-action="create-card" data-url="/staff/${esc(v.tenantId)}/cards" style="margin:1.75rem 0 .5rem">Neue Karte anlegen</button>`
     : '';
@@ -594,9 +681,10 @@ ${newCardHtml}
 ${brandingCanEdit}
 <h2>Stempelregel &amp; Prämie</h2>${rewardHtml}
 ${statsHtml}
-<h2>Links für die Demo</h2>${joinHtml}<p class="hint">Kunden-Webkarte: <code>/card/${esc(v.tenantId)}/{Karten-Token}</code> — der Karten-Token wird bei der Kartenerstellung einmalig ausgegeben und ist nur dem Kunden/Personal bekannt.</p>
+<h2>Links für die Demo</h2>${joinHtml}<p class="hint">Kunden-Webkarte: <code>/card/${esc(v.tenantId)}/{Karten-Token}</code> — der Karten-Token wird bei der Kartenerstellung einmalig ausgegeben und ist nur dem Kunden/Personal bekannt. Jede Karte trägt außerdem den sichtbaren Kartencode (K-XXXXXX) auf der Webkarte und im Google-Wallet-Pass.</p>
 <div class="row" style="flex-wrap:nowrap"><h2 style="flex:1">Karten</h2>${createCardButton}</div>
-<table><thead><tr><th>Karte / Kunde</th><th>Stempel</th><th>Fortschritt</th><th>Prämie</th><th>Aktion</th></tr></thead><tbody>${cardRows}</tbody></table>${stampForm}
+${codeSearchHtml}
+<table><thead><tr><th>Karte / Kunde</th><th>Code</th><th>Stempel</th><th>Fortschritt</th><th>Prämie</th><th>Aktion</th></tr></thead><tbody>${cardRows}</tbody></table>${stampForm}
 <h2>Letzte Stempel-Ereignisse</h2>
 <table><thead><tr><th>Karte</th><th>Kunde</th><th>Stempel</th><th>Zeitpunkt</th></tr></thead><tbody>${eventRows}</tbody></table>
 </main>`,

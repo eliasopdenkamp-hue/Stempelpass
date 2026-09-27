@@ -303,6 +303,31 @@ test('public card HTML omits the contact line without privacy email and falls ba
     expect(html).not.toContain('<Tenant>');
   });
 });
+test('public card HTML shows the visible card code (K-XXXXXX) next to the balance', async () => {
+  const fullCardRow = {
+    id: 'card-1', tenantId: TENANT, customerId: CUSTOMER, publicTokenHash: 'f'.repeat(64),
+    status: 'active', stampCount: 3, revision: 2, ruleId: RULE, cardCode: '7F3D2A',
+  };
+  const pool = new FakePool([
+    { match: contains('from cards where'), rows: [fullCardRow] },
+    { match: contains('from tenant_branding'), rows: [{ cardTitle: 'StempelPass Demo', cardText: 'Deine Karte', primaryColor: '#155e75', secondaryColor: '#f8fafc', version: 1 }] },
+    { match: contains('select legal_name from tenants'), rows: [{ legal_name: 'Beispiel GmbH' }] },
+    { match: contains('from stamp_rules'), rows: [{ id: RULE, tenantId: TENANT, name: 'R', stampsRequired: 5, rewardTitle: 'Prämie', rewardDescription: 'D', active: true, version: 1 }] },
+    { match: contains('from rewards'), rows: [] },
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/card/${TENANT}/public-token-abc`));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The code is a card IDENTIFIER like the QR token, not a permission: it is
+    // rendered only to the token holder; the webcard never carries raw tokens,
+    // customer ids or tenant/customer internals.
+    expect(html).toContain('<strong>Kartennummer:</strong> <code>K-7F3D2A</code>');
+    expect(html).not.toContain('7F3D2A-without-prefix');
+    expect(html).not.toContain('customerId');
+    expect(html).not.toContain('publicTokenHash');
+  });
+});
 // ---------------------------------------------------------------------------
 // (2a) Save-to-Wallet redirect + webcard button — same public-card guardrail
 // ---------------------------------------------------------------------------
