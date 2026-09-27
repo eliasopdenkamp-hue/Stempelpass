@@ -173,7 +173,7 @@ export async function runRetention(db: TxClient, tenantId: string | null, wallet
     // anonymous code. A later retry is safe (404 is treated as already absent).
     for (const card of cards) {
       counts.walletRevocationAttempts++;
-      await wallet.revoke({ id: card.id, stampCount: 0 });
+      await wallet.revoke({ id: card.id, stampCount: 0, cardCode: '' });
     }
 
     counts.communicationMessageLogsDeleted += await deleteRows(db,

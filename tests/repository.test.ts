@@ -97,7 +97,9 @@ test('createCard succeeds for a valid active customer of the tenant and inserts 
   const card = await repo.createCard(TENANT, CUSTOMER, RULE, TOKEN_HASH);
   expect(card).toEqual({ id: 'card-1', ruleId: RULE, stampCount: 0, revision: 1 });
   const insert = pool.queries.find(q => q.sql.startsWith('insert into cards'));
-  expect(insert?.params).toEqual([TENANT, CUSTOMER, RULE, TOKEN_HASH]);
+  // Params: tenant, customer, rule, token hash, then the fresh card code.
+  expect(insert?.params?.slice(0, 4)).toEqual([TENANT, CUSTOMER, RULE, TOKEN_HASH]);
+  expect(String(insert?.params?.[4])).toMatch(/^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{6}$/);
   expect(insert?.sql).toContain('returning id, rule_id as "ruleId", stamp_count as "stampCount", revision');
   expect(insert?.sql).not.toContain('returning *');
   // The client-facing projection never carries tenant/customer/token internals.

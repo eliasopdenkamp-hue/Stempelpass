@@ -37,6 +37,7 @@ const EXPECTED = [
   '018_tenant_branding_logo_url.sql',
   '019_password_reset_tokens.sql',
   '020_reset_user_password_function.sql',
+  '021_card_code.sql',
 ];
 
 test('migration files: exact expected set, runner-compatible names, stable order', async () => {

@@ -8,9 +8,9 @@ export const PLAN_LIMITS: Record<PlanCode, number> = { up_to_500: 500, up_to_100
 export interface Tenant { id: string; slug: string; planCode: PlanCode; customerLimit: number; }
 export interface Branding { cardTitle: string; cardText: string; primaryColor: string; secondaryColor: string; iconAssetId?: string; logoAssetId?: string; /** Hosted https URL used as the Google Wallet class programLogo (tenant_branding.logo_url). */ logoUrl?: string; version: number; }
 export interface StampRule { id: string; tenantId: string; name: string; stampsRequired: number; rewardTitle: string; rewardDescription: string; active: boolean; version: number; }
-export interface Card { id: string; tenantId: string; customerId: string; publicTokenHash: string; status: 'active'|'archived'; stampCount: number; revision: number; ruleId: string; }
-/** Minimal card view for public/wallet output: never carries customerId or publicTokenHash. */
-export type WalletCardView = Pick<Card, 'id' | 'stampCount'>;
+export interface Card { id: string; tenantId: string; customerId: string; publicTokenHash: string; status: 'active'|'archived'; stampCount: number; revision: number; ruleId: string; /** Tenant-unique visible card code (migration 021; NOT NULL in the DB). */ cardCode: string; }
+/** Minimal card view for public/wallet output: never carries customerId or publicTokenHash. The cardCode is included (when the card has one) because it is customer-visible by design (webcard/wallet display) — it is identification only, never a permission. */
+export type WalletCardView = Pick<Card, 'id' | 'stampCount'> & { cardCode?: string };
 export interface Reward { id: string; tenantId: string; cardId: string; ruleId: string; status: 'issued'|'redeemed'; }
 export interface WalletArtifact { provider: Provider; status: 'not_configured'|'issued'; message: string; artifact?: string; }
 

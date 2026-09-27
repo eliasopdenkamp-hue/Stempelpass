@@ -4,7 +4,7 @@ import { qrSvgDataUri } from '../src/qr';
 import type { Card } from '../src/domain';
 import type { JoinPageData } from '../src/repository';
 
-const fullCard: Card = { id: 'card-1', tenantId: 'tenant-1', customerId: 'customer-1', publicTokenHash: 'deadbeef-public-token-hash', status: 'active', stampCount: 3, revision: 2, ruleId: 'rule-1' };
+const fullCard: Card = { id: 'card-1', tenantId: 'tenant-1', customerId: 'customer-1', publicTokenHash: 'deadbeef-public-token-hash', status: 'active', stampCount: 3, revision: 2, ruleId: 'rule-1', cardCode: '7F3D2A' };
 const branding = { cardTitle: 'Café', cardText: 'Treuekarte', primaryColor: '#123456', secondaryColor: '#ffffff', version: 1 };
 const rule = { id: 'rule-1', tenantId: 'tenant-1', name: 'Regel', stampsRequired: 10, rewardTitle: 'Prämie', rewardDescription: '', active: true, version: 1 };
 const reward = { id: 'reward-1', status: 'issued' as const, issuedAt: null, redeemedAt: null };
@@ -31,7 +31,7 @@ test('public card response is strictly allowlisted (no customerId, no publicToke
   expect(payload.privacyContact).toBe('datenschutz@beispiel.de');
 });
 test('public card response keeps null branding/rule/reward without leaking card internals', () => { const payload = toPublicCardResponse({ card: fullCard, branding: null, rule: null, reward: null, controllerName: null, privacyContact: null }, 'tenant-1'); expect(payload.branding).toBeNull(); expect(payload.rule).toBeNull(); expect(payload.reward).toBeNull(); expect(payload.controllerName).toBeNull(); expect(payload.privacyContact).toBeNull(); expect(JSON.stringify(payload)).not.toContain('publicTokenHash'); expect(JSON.stringify(payload)).not.toContain('customer-1'); });
-test('wallet card view carries exactly id and stampCount, never customer data', () => { const view = toWalletCardView(fullCard); expect(Object.keys(view).sort()).toEqual(['id', 'stampCount']); expect(view.id).toBe('card-1'); expect(view.stampCount).toBe(3); const serialized = JSON.stringify(view); expect(serialized).not.toContain('customerId'); expect(serialized).not.toContain('publicTokenHash'); });
+test('wallet card view carries exactly id, stampCount and cardCode — never customer data', () => { const view = toWalletCardView(fullCard); expect(Object.keys(view).sort()).toEqual(['cardCode', 'id', 'stampCount']); expect(view.id).toBe('card-1'); expect(view.stampCount).toBe(3); expect(view.cardCode).toBe('7F3D2A'); const serialized = JSON.stringify(view); expect(serialized).not.toContain('customerId'); expect(serialized).not.toContain('publicTokenHash'); });
 
 // ---------------------------------------------------------------------------
 // joinPageHtml (GET /join/:publicKey, owner fix 2026-09-13): branded customer
