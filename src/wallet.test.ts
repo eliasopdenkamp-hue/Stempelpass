@@ -231,6 +231,10 @@ test('refresh PATCHes the loyaltyObject with the new balance and text module (mo
   expect(auth).toBe('Bearer oauth-token');
   const body = JSON.parse(String(patch!.init.body)) as Record<string, any>;
   expect(body.loyaltyPoints).toEqual({ balance: { int: card.stampCount } });
+  // Card-front member-number line: accountId + accountIdLabel ride along with
+  // every refresh so the front number stays in sync (owner wish, backlog #4).
+  expect(body.accountId).toBe('K-7F3D2A');
+  expect(body.accountIdLabel).toBe('Kartennummer');
   // Branding flows through to the object: progress module + cardText module;
   // the visible card code appears as its own Kartennummer module.
   expect(body.textModulesData).toEqual([
@@ -332,11 +336,49 @@ test('issue() embeds branding in the object model: tenant class id + progress an
   const obj = payload.payload.loyaltyObjects[0];
   expect(obj.id).toBe('123.card-1');
   expect(obj.classId).toBe('123.tenant-1');
+  // Card-FRONT member-number line (backlog #4): accountId+accountIdLabel are
+  // part of the save-to-wallet object, not only the details text module.
+  expect(obj.accountId).toBe('K-7F3D2A');
+  expect(obj.accountIdLabel).toBe('Kartennummer');
   expect(obj.textModulesData).toEqual([
     { header: 'Café Herz', body: '3/10 Stempel · Gratis Kaffee' },
     { header: 'Kartennummer', body: 'K-7F3D2A' },
     { header: 'Café Herz', body: 'Sammle Stempel' },
   ]);
+});
+
+test('issue and refresh payloads omit accountId/accountIdLabel when the card has no cardCode', async () => {
+  // Keyless path (IamSignBlob + mocked Google surface) — no RSA key needed.
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const creds = new ExternalAccountCredentials(JSON.parse(EAC_CONFIG), () => 't', mockGoogleFetch(calls));
+  const signer = new IamSignBlobJwtSigner(creds);
+  const uncoded = { ...card, cardCode: undefined };
+  // issue: the JWT loyaltyObject carries NO accountId, NO accountIdLabel and no
+  // Kartennummer text module — the exact pre-021 object shape must be kept.
+  const adapter = new GoogleWalletAdapter('123', signer, creds.clientEmail!, 'external-account', undefined, undefined, fetch, 'tenant-1');
+  const result = await adapter.issue(uncoded, branding, { stampRequired: 10, rewardTitle: 'Gratis' });
+  expect(result.status).toBe('issued');
+  const payload = JSON.parse(Buffer.from(result.artifact!.split('.')[1], 'base64url').toString('utf8'));
+  const obj = payload.payload.loyaltyObjects[0];
+  expect(obj.id).toBe('123.card-1');
+  expect(obj.classId).toBe('123.tenant-1');
+  expect(obj.accountId).toBeUndefined();
+  expect(obj.accountIdLabel).toBeUndefined();
+  expect(obj.textModulesData).toEqual([
+    { header: 'Café', body: '3/10 Stempel · Gratis' },
+    { header: 'Café', body: 'Treuekarte' },
+  ]);
+  // refresh: the loyaltyObject PATCH body carries NO accountId/accountIdLabel
+  // either — and no reviewStatus anywhere (that is CLASS-PATCH-only, PR #37).
+  const patchCalls: Array<{ url: string; init: RequestInit }> = [];
+  const refreshAdapter = new GoogleWalletAdapter('123', signer, creds.clientEmail!, 'external-account', undefined, creds, mockGoogleFetch(patchCalls));
+  const refreshResult = await refreshAdapter.refresh(uncoded, ['loyaltyPoints', 'textModulesData'], { branding, stampRequired: 10, rewardTitle: 'Gratis' });
+  expect(refreshResult.status).toBe('issued');
+  const patch = patchCalls.find(c => c.url === WALLET_PATCH_URL);
+  expect(patch).toBeDefined();
+  expect(patch!.init.method).toBe('PATCH');
+  const body = JSON.parse(String(patch!.init.body)) as Record<string, any>;
+  expect(body).toEqual({ loyaltyPoints: { balance: { int: 3 } }, textModulesData: [{ header: 'Café', body: '3/10 Stempel · Gratis' }, { header: 'Café', body: 'Treuekarte' }] });
 });
 
 /** Reusable scripted Google credentials fixture (no real network). */
