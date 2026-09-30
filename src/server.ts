@@ -1,7 +1,7 @@
 import { assertTenant, canStamp, hashToken } from './domain.js';
 import { cardResolveLimiter, clientIpKey, csrfValid, hashPassword, joinResolveKey, loginAccountKey, loginAccountLimiter, loginFailureReason, loginIpLimiter, resetConfirmIpLimiter, resetConfirmTokenLimiter, resetRequestAccountLimiter, resetRequestIpLimiter, resetResolveKey, resetResolveLimiter, staffSearchLimiter, stampLimiter, verifyPassword, verifyPasswordAgainstDummy, randomToken, hashSessionToken } from './security.js';
 import { createPostgresPool, runMigrations, type DbPool } from './db.js';
-import { CardRepository, type StaffDashboardData, type StaffStats } from './repository.js';
+import { CardRepository, type StaffDashboardData, type StaffSearchCard, type StaffStats } from './repository.js';
 import { configurationStatus } from './config.js';
 import { EncryptedMfaSecretStore, verifyTotp } from './mfa.js';
 import { walletAdapter, ensureGoogleWalletClass } from './wallet.js';
@@ -224,13 +224,40 @@ async function parseBody(req: Request): Promise<Record<string, string>> {
   for (const [k, v] of new URLSearchParams(text)) out[k] = v;
   return out;
 }
-/** Resolve a stamp target: card UUID directly, or a raw card token via the
- *  existing findByPublicTokenHash lookup (hashToken, never the raw token). */
-async function resolveCardId(tenantId:string,input:string):Promise<string>{
-  if(UUID_RE.test(input))return input;
-  const card=await repository!.findByPublicTokenHash(tenantId,hashToken(input));
-  if(!card)throw new Error('CARD_NOT_FOUND');
-  return card.id;
+/**
+ * Shared staff stamp/search target resolver (UUID | card code | raw token).
+ *
+ * ONE resolution path for both the "Stempel vergeben" form and the
+ * "Karte per Code finden" search, in this order:
+ *   (a) exact card UUID  → findCardById (tenant-scoped RLS),
+ *   (b) card code        → normalizeCardCode (optional K- prefix, case-
+ *                          insensitive) → findByCardCode,
+ *   (c) raw customer token → the existing findByPublicTokenHash lookup
+ *                          (hashToken, never the raw token) + findCardById
+ *                          for the same rich display shape.
+ * Every lookup runs INSIDE the caller's tenant RLS transaction, so a foreign
+ * uuid/code/token is indistinguishable from a missing card: the resolver
+ * returns null and BOTH handlers answer the identical "Karte nicht gefunden"
+ * (no cross-tenant oracle, no format leak). Codes (6 chars) and tokens (43
+ * chars) are syntactically disjoint, so a valid code format ends the
+ * resolution without a pointless token lookup. The raw token never reaches
+ * the database, a log line or an error message — only its SHA-256 hash.
+ * Exported for the DB-free unit tests; behavior-neutral in production.
+ */
+export async function resolveStampTarget(tenantId:string,input:string):Promise<StaffSearchCard|null>{
+  if(!repository)return null;
+  const v=String(input??'').trim();
+  if(!v)return null;
+  // (a) Exact card UUID — resolved ONLY through the tenant-scoped query, so a
+  // uuid-shaped foreign/deleted card yields null, never a pass-through.
+  if(UUID_RE.test(v))return repository.findCardById(tenantId,v);
+  // (b) Visible card code (optional K- prefix, case-insensitive).
+  const code=normalizeCardCode(v);
+  if(code)return repository.findByCardCode(tenantId,code);
+  // (c) Raw customer token via the existing hash lookup; the found card is
+  // re-read through findCardById so search rendering gets the same rich shape.
+  const card=await repository.findByPublicTokenHash(tenantId,hashToken(v));
+  return card?await repository.findCardById(tenantId,card.id):null;
 }
 function dashboardView(tenantId:string,role:string,dash:StaffDashboardData,stats:StaffStats,csrf:string,newCard:{id:string;url:string;token:string}|null=null):DashboardView{
   const branding=dash.branding;
@@ -331,18 +358,19 @@ async function handleStaffDashboard(req:Request,tenantId:string,id:string):Promi
  * GET /staff/:tenantId/search-code?q=… — staff "Karte per Code finden".
  *
  * Read-only lookup (GET, session auth, no CSRF — stamping keeps its CSRF'd
- * POST path): normalizes the input (optional K- prefix, uppercase), resolves
- * the card through repository.findByCardCode INSIDE the caller's tenant RLS
- * transaction and answers a slim HTML FRAGMENT (found card incl. a direct
- * stamp/redeem button when the role may stamp, or a "not found" message) that
- * the dashboard script injects into #sp-code-result. Security model unchanged:
- * the code is pure identification, never a permission — the fragment's stamp
- * button still goes through /staff/:tenantId/stamp (auth + CSRF + stamp
- * limiter), and the lookup can only ever see the caller's own tenant (a
- * foreign code → null → "Karte nicht gefunden", identical to a missing card;
- * no cross-tenant oracle, no format leak). The per-actor+tenant search
- * limiter (staffSearchLimiter) caps the endpoint; the searched code never
- * becomes a limiter key or a log line.
+ * POST path): resolves the input through the SHARED resolveStampTarget
+ * (exact card UUID, card code with optional K- prefix / case-insensitive, or
+ * raw customer token) INSIDE the caller's tenant RLS transaction and answers
+ * a slim HTML FRAGMENT (found card incl. a direct stamp/redeem button when
+ * the role may stamp, or a "not found" message) that the dashboard script
+ * injects into #sp-code-result. Security model unchanged: every identifier is
+ * pure identification, never a permission — the fragment's stamp button still
+ * goes through /staff/:tenantId/stamp (auth + CSRF + stamp limiter), and the
+ * lookup can only ever see the caller's own tenant (a foreign identifier →
+ * null → "Karte nicht gefunden", identical to a missing card; no cross-tenant
+ * oracle, no format leak). The per-actor+tenant search limiter
+ * (staffSearchLimiter) caps the endpoint and runs BEFORE any resolution; the
+ * searched term never becomes a limiter key or a log line.
  */
 async function handleStaffSearchCode(req:Request,tenantId:string,id:string):Promise<Response>{
   try{
@@ -350,10 +378,9 @@ async function handleStaffSearchCode(req:Request,tenantId:string,id:string):Prom
     if(!pool||!repository)throw new Error('DATABASE_REQUIRED');
     const actor=await auth(req,tenantId,false);
     const q=String(new URL(req.url).searchParams.get('q')??'').trim();
-    const code=normalizeCardCode(q);
-    if(!code)return htmlResponse(codeSearchEmptyHtml(),200);
+    if(!q)return htmlResponse(codeSearchEmptyHtml(),200);
     if(!staffSearchLimiter.allow(`${tenantId}:${actor.userId}`))throw new Error('RATE_LIMITED');
-    const found=await repository.findByCardCode(tenantId,code);
+    const found=await resolveStampTarget(tenantId,q);
     if(!found)return htmlResponse(codeSearchEmptyHtml(),200);
     return htmlResponse(codeSearchResultHtml(found,tenantId,canStamp(actor.role)),200);
   }catch(e){
@@ -371,7 +398,9 @@ async function handleStaffStamp(req:Request,tenantId:string,id:string):Promise<R
     const body=await parseBody(req);
     const input=String(body.cardId??body.cardToken??'').trim();if(!input)throw new Error('CARD_FIELDS_REQUIRED');
     const quantityRaw=Number(body.quantity??1);const quantity=Number.isInteger(quantityRaw)?quantityRaw:1;
-    const cardId=await resolveCardId(tenantId,input);
+    const card=await resolveStampTarget(tenantId,input);
+    if(!card)throw new Error('CARD_NOT_FOUND');
+    const cardId=card.id;
     const value=await repository.stamp(tenantId,cardId,quantity,actor.membershipId,crypto.randomUUID());
     const rotated=await rotate(actor);
     // Best-effort Google Wallet balance sync (same contract as the tenant API
