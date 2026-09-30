@@ -10,7 +10,7 @@
  * event delegation on `document`, so swapping #sp-app content keeps the page
  * interactive without re-binding listeners.
  */
-import type { StaffDashboardCard, StaffDashboardEvent, StaffStats } from './repository.js';
+import type { StaffDashboardCard, StaffDashboardEvent, StaffSearchCard, StaffStats } from './repository.js';
 import { DEFAULT_PRIMARY_CARD_COLOR, DEFAULT_SECONDARY_CARD_COLOR, safeCardColor } from './public-card.js';
 import { qrSvgDataUri } from './qr.js';
 import { formatCardCode } from './card-code.js';
@@ -325,7 +325,7 @@ export function staffErrorMessage(code: string): string {
     case 'CARD_NOT_FOUND': return 'Karte nicht gefunden.';
     case 'RULE_NOT_FOUND': return 'Keine aktive Stempelregel eingerichtet.';
     case 'CUSTOMER_LIMIT_REACHED': return 'Kundenlimit erreicht.';
-    case 'CARD_FIELDS_REQUIRED': return 'Bitte eine Karten-ID oder einen Karten-Token angeben.';
+    case 'CARD_FIELDS_REQUIRED': return 'Bitte Karten-ID, Kartencode (K-XXXXXX) oder Kunden-Token angeben.';
     case 'INVALID_STAMP_QUANTITY': return 'Ungültige Stempelanzahl (1–10).';
     case 'RATE_LIMITED': return 'Zu viele Anfragen. Bitte kurz warten.';
     case 'REWARD_NOT_FOUND': return 'Keine einlösbare Prämie für diese Karte.';
@@ -351,10 +351,11 @@ export function staffErrorPage(status: number, code: string, requestId?: string)
  * the exact same `[data-action]` attributes as the cards table, so the
  * document-level delegated listeners of STAFF_SCRIPT make the injected buttons
  * work without rebinding — the direct stamp path, no list scrolling.
- * `card` comes from repository.findByCardCode: a card OF THE CALLER'S TENANT
- * only (tenant RLS), carrying no token/session data.
+ * `card` comes from the shared resolveStampTarget (resolveStampTarget →
+ * findCardById / findByCardCode / findByPublicTokenHash): a card OF THE
+ * CALLER'S TENANT only (tenant RLS), carrying no token/session data.
  */
-export function codeSearchResultHtml(card: StaffDashboardCard & { stampsRequired: number }, tenantId: string, canStamp: boolean): string {
+export function codeSearchResultHtml(card: StaffSearchCard, tenantId: string, canStamp: boolean): string {
   const primary = DEFAULT_PRIMARY_CARD_COLOR;
   const code = formatCardCode(card.cardCode ?? '');
   const progress = Math.min(100, Math.round((card.stampCount / Math.max(1, Number(card.stampsRequired || 1))) * 100));
@@ -655,20 +656,20 @@ export function dashboardPage(v: DashboardView, flash?: { kind: 'ok' | 'error'; 
     : '<tr><td colspan="4"><span class="meta">Noch keine Stempel-Ereignisse.</span></td></tr>';
   const stampForm = v.canStamp
     ? `<form data-staff-form action="/staff/${esc(v.tenantId)}/stamp" method="post" class="row" style="gap:.5rem;margin-top:.5rem">
-        <input name="cardId" placeholder="Karten-ID, Kartencode oder Karten-Token" required style="flex:1;margin:0">
+        <input name="cardId" placeholder="Karten-ID, Kartencode (K-XXXXXX) oder Kunden-Token eingeben" required style="flex:1;margin:0">
         <input name="quantity" type="number" min="1" max="10" value="1" style="width:5.5rem;margin:0">
         <button type="submit" class="secondary" style="margin:0">Stempel vergeben</button>
-      </form><p class="hint">Karten-ID aus der Liste kopieren, den Kartencode (K-XXXXXX) oder den Token vom Kunden-Gerät/QR eingeben.</p>`
+      </form><p class="hint">Karten-ID, Kartencode (K-XXXXXX) oder Kunden-Token eingeben — die passende Karte wird direkt gestempelt.</p>`
     : '<p class="meta">Diese Rolle kann keine Stempel vergeben oder Prämien einlösen.</p>';
   const codeSearchHtml = `<h2>Karte per Code finden</h2>
 <form id="sp-code-search" data-search-url="/staff/${esc(v.tenantId)}/search-code" autocomplete="off">
 <div class="row" style="gap:.5rem">
-<input id="sp-code-input" name="code" placeholder="K-7F3D2A oder 7F3D2A" required style="flex:1;margin:0">
+<input id="sp-code-input" name="code" placeholder="Kartencode (K-XXXXXX), Karten-ID oder Kunden-Token" required style="flex:1;margin:0">
 <button type="submit" class="secondary" style="margin:0">Karte finden</button>
 </div>
 </form>
 <div id="sp-code-result"></div>
-<p class="hint">Kartencode von der Webkarte oder aus Google Wallet eingeben (Präfix K- optional) — die passende Karte erscheint direkt mit Stempel-Button.</p>`;
+<p class="hint">Kartencode (K-XXXXXX), Karten-ID oder Kunden-Token eingeben — die passende Karte erscheint direkt mit Stempel-Button.</p>`;
   const createCardButton = v.canStamp
     ? `<button type="button" class="secondary" data-action="create-card" data-url="/staff/${esc(v.tenantId)}/cards" style="margin:1.75rem 0 .5rem">Neue Karte anlegen</button>`
     : '';

@@ -49,6 +49,15 @@ const SESSION_HASH = hashSessionToken(SESSION_TOKEN);
 const CSRF_VALUE = hashSessionToken(randomToken());
 /** Raw card token shape (base64url, as returned once at card creation). */
 const CARD_TOKEN = 'M'.repeat(43);
+/** Rich search shape returned by the shared resolver's findCardById /
+ *  findByCardCode lookups (the stamp form and the search resolve through
+ *  resolveStampTarget → repository before repository.stamp runs). */
+const RICH_CARD = { id: CARD, cardCode: '7F3D2A', stampCount: 3, stampsRequired: 5, updatedAt: '2026-08-26T10:00:00.000Z', customerRef: 'Kunde-42' };
+/** Handler feeding the shared resolver's tenant-scoped rich card lookup
+ *  (findCardById / findByCardCode share the same SELECT — they differ only
+ *  in the WHERE column: c.id=$2 / c.card_code=$2). Defined with an inline
+ *  matcher because the `contains` helper is declared below. */
+const richCardHandler = { match: (sql: string) => sql.includes('from cards c join customers'), rows: [RICH_CARD] } satisfies FakeHandler;
 
 interface FakeHandler { match: (sql: string, params: unknown[]) => boolean; rows: unknown[] | ((sql: string, params: unknown[]) => unknown[]); }
 class FakePool implements DbPool {
@@ -403,6 +412,58 @@ test('GET /staff/:tenantId/search-code answers a neutral fragment for unknown/in
   });
 });
 
+test('GET /staff/:tenantId/search-code finds the card by an exact card UUID (shared resolver)', async () => {
+  const searchHandlers = [
+    { match: contains('from cards c join customers'), rows: [{ id: CARD, cardCode: '7F3D2A', stampCount: 4, stampsRequired: 6, updatedAt: '2026-09-25T10:00:00.000Z', customerRef: 'Kunde-42' }] },
+    { match: contains('from rewards where tenant_id'), rows: [{ id: REWARD, status: 'issued' }] },
+  ];
+  const pool = new FakePool([...sessionHandlers(validSession), ...searchHandlers]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/search-code?q=${CARD}`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('Karte gefunden:');
+    expect(html).toContain(`data-action="stamp" data-url="/staff/${TENANT}/stamp" data-card="${CARD}"`);
+    // The UUID lookup is tenant-scoped: params carry the session tenant + the UUID.
+    const lookup = pool.queries.find(q => q.sql.includes('join stamp_rules'));
+    expect(lookup).toBeDefined();
+    expect(lookup!.params).toEqual([TENANT, CARD, 'active']);
+  });
+});
+test('GET /staff/:tenantId/search-code finds the card by a raw customer token (hash only, never the raw token)', async () => {
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('public_token_hash'), rows: [{ id: CARD, tenantId: TENANT, customerId: '22222222-2222-4222-8222-222222222222', publicTokenHash: 'f'.repeat(64), status: 'active', stampCount: 3, revision: 2, ruleId: RULE, createdAt: null, updatedAt: null }] },
+    { match: contains('from cards c join customers'), rows: [{ id: CARD, cardCode: '7F3D2A', stampCount: 4, stampsRequired: 6, updatedAt: '2026-09-25T10:00:00.000Z', customerRef: 'Kunde-42' }] },
+    { match: contains('from rewards where tenant_id'), rows: [{ id: REWARD, status: 'issued' }] },
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/search-code?q=${CARD_TOKEN}`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('Karte gefunden:');
+    expect(html).toContain(`data-card="${CARD}"`);
+    // Only the SHA-256 hash ever reached the token lookup; the raw token
+    // never appears in any query or the response.
+    const lookup = pool.queries.find(q => q.sql.includes('public_token_hash'));
+    expect(lookup).toBeDefined();
+    expect(String(lookup!.params[1])).toMatch(/^[a-f0-9]{64}$/);
+    expect(String(lookup!.params[1])).not.toBe(CARD_TOKEN);
+    expect(JSON.stringify(pool.queries)).not.toContain(CARD_TOKEN);
+  });
+});
+test('GET /staff/:tenantId/search-code answers the identical neutral fragment for a foreign card UUID', async () => {
+  // A UUID-shaped string from another tenant: findCardById runs inside THIS
+  // caller's tenant RLS transaction and returns nothing — indistinguishable
+  // from a missing card, so the answer is byte-identical.
+  const pool = new FakePool([...sessionHandlers(validSession)]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/search-code?q=${OTHER_TENANT}`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('Karte nicht gefunden.');
+  });
+});
+
 test('GET /staff/:tenantId renders the statistics section: KPIs, trend with German formatting and reward-progress rows (visible to every role)', async () => {
   const pool = new FakePool([...sessionHandlers(validSession), ...dashboardHandlers()]);
   await runWith(pool, async () => {
@@ -446,6 +507,7 @@ test('GET /staff/:tenantId renders an em dash trend when the previous 30-day win
 function stampFlowHandlers(): FakeHandler[] {
   return [
     ...sessionHandlers(validSession),
+    richCardHandler, // resolveStampTarget: UUID via findCardById, code via findByCardCode, token via findByPublicTokenHash + findCardById
     { match: contains('from stamp_events where'), rows: [] }, // no replay
     { match: contains('from cards where'), rows: [{ id: CARD, stampCount: 3, revision: 2, ruleId: RULE }] },
     { match: contains('insert into stamp_events'), rows: [] },
@@ -491,6 +553,7 @@ test('POST staff stamp by card token resolves through findByPublicTokenHash (has
   const pool = new FakePool([
     ...sessionHandlers(validSession),
     { match: contains('public_token_hash'), rows: [{ id: CARD, tenantId: TENANT, customerId: '22222222-2222-4222-8222-222222222222', publicTokenHash: 'f'.repeat(64), status: 'active', stampCount: 3, revision: 2, ruleId: RULE, createdAt: null, updatedAt: null }] },
+    richCardHandler, // resolveStampTarget: token path re-reads the card via findCardById (rich shape)
     { match: contains('from stamp_events where'), rows: [] },
     { match: contains('from cards where'), rows: [{ id: CARD, stampCount: 3, revision: 2, ruleId: RULE }] },
     { match: contains('insert into stamp_events'), rows: [] },
@@ -512,6 +575,54 @@ test('POST staff stamp by card token resolves through findByPublicTokenHash (has
     expect(String(lookup!.params[1])).toMatch(/^[a-f0-9]{64}$/);
     expect(String(lookup!.params[1])).not.toBe(CARD_TOKEN);
     expect(JSON.stringify(pool.queries)).not.toContain(CARD_TOKEN);
+  });
+});
+
+test('POST staff stamp accepts the visible card code (owner-reported bug: K-XXXXXX was only searchable, not stampable)', async () => {
+  stampLimiter.clear();
+  const pool = new FakePool(stampFlowHandlers());
+  await runWith(pool, async () => {
+    // Lowercase + prefix: normalizeCardCode strips K-, upper-cases → 7F3D2A.
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/stamp`, {
+      method: 'POST',
+      headers: authedHeaders(),
+      body: new URLSearchParams({ cardId: 'k-7F3D2A', quantity: '1' }),
+    }));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('hat jetzt 4 Stempel');
+    // The shared resolver ran the tenant-scoped findByCardCode with the bare
+    // normalized code (prefix stripped, upper-cased).
+    const lookup = pool.queries.find(q => q.sql.includes('join stamp_rules') && q.params[1] === '7F3D2A');
+    expect(lookup).toBeDefined();
+    expect(lookup!.params).toEqual([TENANT, '7F3D2A', 'active']);
+    // Exactly one stamp_events insert — the code is pure identification, the
+    // stamp write uses the resolved card id (same row as every other path).
+    const inserts = pool.queries.filter(q => q.sql.startsWith('insert into stamp_events'));
+    expect(inserts).toHaveLength(1);
+  });
+});
+test('POST staff stamp with an unknown or foreign identifier answers the identical 404 and never inserts', async () => {
+  stampLimiter.clear();
+  // No rich-card handler: every resolver path (UUID/code/token) returns null
+  // inside the caller's tenant RLS — identical "Karte nicht gefunden".
+  const pool = new FakePool([...sessionHandlers(validSession)]);
+  await runWith(pool, async () => {
+    const unknown: Array<[string, string]> = [
+      ['foreign uuid', OTHER_TENANT],
+      ['unknown but well-formed code', 'ZZZZZZ'],
+      ['unknown raw token', CARD_TOKEN],
+    ];
+    for (const [, input] of unknown) {
+      const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/stamp`, {
+        method: 'POST',
+        headers: authedHeaders(),
+        body: new URLSearchParams({ cardId: input, quantity: '1' }),
+      }));
+      expect(res.status).toBe(404);
+      expect(await res.text()).toContain('Karte nicht gefunden.');
+      expect(pool.queries.some(q => q.sql.startsWith('insert into stamp_events'))).toBe(false);
+      expect(JSON.stringify(pool.queries)).not.toContain(CARD_TOKEN);
+    }
   });
 });
 
@@ -556,7 +667,7 @@ test('POST staff stamp without a card id is rejected with CARD_FIELDS_REQUIRED',
       body: new URLSearchParams({ quantity: '1' }),
     }));
     expect(res.status).toBe(400);
-    expect(await res.text()).toContain('Bitte eine Karten-ID oder einen Karten-Token angeben.');
+    expect(await res.text()).toContain('Bitte Karten-ID, Kartencode (K-XXXXXX) oder Kunden-Token angeben.');
   });
 });
 
@@ -757,6 +868,7 @@ test('POST staff stamp with the UI JSON payload (raw card token) resolves via to
   const pool = new FakePool([
     ...sessionHandlers(validSession),
     { match: contains('public_token_hash'), rows: [{ id: CARD, tenantId: TENANT, customerId: '22222222-2222-4222-8222-222222222222', publicTokenHash: 'f'.repeat(64), status: 'active', stampCount: 3, revision: 2, ruleId: RULE, createdAt: null, updatedAt: null }] },
+    richCardHandler, // resolveStampTarget: token path re-reads the card via findCardById (rich shape)
     { match: contains('from stamp_events where'), rows: [] },
     { match: contains('from cards where'), rows: [{ id: CARD, stampCount: 3, revision: 2, ruleId: RULE }] },
     { match: contains('insert into stamp_events'), rows: [] },
@@ -1312,6 +1424,7 @@ test('POST staff stamp resolves a card TOKEN and syncs the wallet for the resolv
   const pool = new FakePool([
     ...sessionHandlers(validSession),
     { match: contains('public_token_hash'), rows: [{ id: CARD, tenantId: TENANT, customerId: '22222222-2222-4222-8222-222222222222', publicTokenHash: 'f'.repeat(64), status: 'active', stampCount: 3, revision: 2, ruleId: RULE, createdAt: null, updatedAt: null }] },
+    richCardHandler, // resolveStampTarget: token path re-reads the card via findCardById (rich shape)
     { match: contains('from stamp_events where'), rows: [] },
     { match: contains('from cards where'), rows: [{ id: CARD, stampCount: 3, revision: 2, ruleId: RULE }] },
     { match: contains('insert into stamp_events'), rows: [] },

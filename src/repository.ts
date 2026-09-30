@@ -51,6 +51,13 @@ export interface PublicCard { id: string; stampCount: number; revision: number; 
 
 /** Staff-UI dashboard views (server-rendered HTML, staff-authenticated). */
 export interface StaffDashboardCard { id: string; customerRef: string | null; /** Visible tenant-unique card code (migration 021); null only for pre-backfill rows in tests. */ cardCode: string | null; stampCount: number; rewardId: string | null; rewardStatus: 'issued' | 'redeemed' | null; updatedAt: string | null; }
+/**
+ * Rich staff search/stamp card: the dashboard row plus the card's OWN rule
+ * threshold (stampsRequired) — exactly what the "Karte finden" fragment
+ * renders and what the shared staff resolver (UUID / code / raw token)
+ * returns. Used by findByCardCode, findCardById and resolveStampTarget.
+ */
+export type StaffSearchCard = StaffDashboardCard & { stampsRequired: number };
 export interface StaffDashboardEvent { id: string; cardId: string; customerRef: string | null; quantity: number; createdAt: string | null; }
 export interface StaffDashboardData {
   tenant: { id: string; legalName: string | null; planCode: string; customerLimit: number; usedCards: number } | null;
@@ -329,26 +336,51 @@ export class CardRepository {
   }); }
 
   /**
-   * Staff "Karte per Code finden": resolve ONE active card of the caller's
-   * tenant by its visible card code (migration 021). Same tenant-scoped RLS
-   * transaction as every other repository read — the caller's app.tenant_id
-   * is set from THEIR authenticated tenant, so a code can never resolve a
-   * card of another tenant (a foreign code simply returns null). The card's
-   * OWN rule (rule_id) provides the correct progress threshold even when the
-   * tenant's currently active rule differs (same semantics as the stats
-   * queries). Returns exactly what the search fragment renders: code, id,
-   * customer ref, balance, threshold and the latest reward state — never a
-   * token, never a session/membership/tenant row.
+   * Rich staff search-card lookup shared by the code path (findByCardCode) and
+   * the id path (findCardById): ONE tenant-scoped RLS transaction resolves an
+   * active, non-deleted card of the caller's tenant by the given column and
+   * decorates it with the card's OWN rule threshold (r.stamps_required, so the
+   * progress band stays correct even when the tenant's currently active rule
+   * differs) and the latest reward state. `byClause` is a private allowlist of
+   * two literal fragments ('c.card_code=$2' / 'c.id=$2') — never caller input —
+   * and `param` is always bound as a parameter, so there is no SQL injection
+   * surface. A foreign/deleted/missing card simply returns null (identical
+   * "Karte nicht gefunden" answer — no cross-tenant oracle, no format leak).
+   * Returns exactly what the search fragment renders: code, id, customer ref,
+   * balance, threshold and the latest reward state — never a token, never a
+   * session/membership/tenant row.
    */
-  async findByCardCode(tenantId:string, code:string):Promise<(StaffDashboardCard & {stampsRequired:number})|null> {
+  private searchStaffCardBy(tenantId: string, byClause: 'c.card_code=$2' | 'c.id=$2', param: string): Promise<StaffSearchCard | null> {
     return this.transaction(tenantId, async db => {
       const c=(await db.query<{id:string;cardCode:string;stampCount:number;stampsRequired:number;updatedAt:string|null;customerRef:string|null}>(
-        'select c.id, c.card_code as "cardCode", c.stamp_count as "stampCount", r.stamps_required as "stampsRequired", c.updated_at as "updatedAt", cu.external_ref as "customerRef" from cards c join customers cu on cu.id=c.customer_id and cu.tenant_id=c.tenant_id join stamp_rules r on r.id=c.rule_id where c.tenant_id=$1 and c.card_code=$2 and c.status=$3 and c.deleted_at is null',
-        [tenantId, code, 'active'])).rows[0] ?? null;
+        'select c.id, c.card_code as "cardCode", c.stamp_count as "stampCount", r.stamps_required as "stampsRequired", c.updated_at as "updatedAt", cu.external_ref as "customerRef" from cards c join customers cu on cu.id=c.customer_id and cu.tenant_id=c.tenant_id join stamp_rules r on r.id=c.rule_id where c.tenant_id=$1 and '+byClause+' and c.status=$3 and c.deleted_at is null',
+        [tenantId, param, 'active'])).rows[0] ?? null;
       if(!c) return null;
       const reward=(await db.query<{id:string;status:'issued'|'redeemed'}>('select id, status from rewards where tenant_id=$1 and card_id=$2 order by issued_at desc limit 1',[tenantId,c.id])).rows[0] ?? null;
       return {...c, rewardId:reward?.id??null, rewardStatus:reward?.status??null};
     });
+  }
+
+  /**
+   * Staff "Karte per Code finden": resolve ONE active card of the caller's
+   * tenant by its visible card code (migration 021). Same tenant-scoped RLS
+   * transaction as every other repository read — the caller's app.tenant_id
+   * is set from THEIR authenticated tenant, so a code can never resolve a
+   * card of another tenant (a foreign code simply returns null).
+   */
+  async findByCardCode(tenantId:string, code:string):Promise<StaffSearchCard|null> {
+    return this.searchStaffCardBy(tenantId, 'c.card_code=$2', code);
+  }
+
+  /**
+   * Resolve ONE active card of the caller's tenant by its exact id — the rich
+   * staff search shape, so the shared staff resolver (UUID / code / token)
+   * returns the same card regardless of which identifier was entered. A UUID
+   * from another tenant or a deleted/inactive card resolves to null (the
+   * caller answers the identical "Karte nicht gefunden").
+   */
+  async findCardById(tenantId:string, id:string):Promise<StaffSearchCard|null> {
+    return this.searchStaffCardBy(tenantId, 'c.id=$2', id);
   }
 
   /**
