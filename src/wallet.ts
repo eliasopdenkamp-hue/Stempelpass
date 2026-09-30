@@ -20,6 +20,15 @@ export interface LoyaltyObject {
   state: 'ACTIVE' | 'INACTIVE';
   loyaltyPoints: { balance: { int: number } };
   textModulesData?: Array<{ header: string; body: string }>;
+  /**
+   * Card-FRONT account line (owner wish, backlog #4): Google Wallet renders
+   * `accountId` (+ `accountIdLabel`) as the member-number row on the card
+   * front, while textModulesData only shows in the pass details. Only set for
+   * cards that carry a visible card code.
+   */
+  accountId?: string;
+  /** Label rendered next to accountId on the card front ("Kartennummer"). */
+  accountIdLabel?: string;
 }
 export interface WalletAdapter { issue(card: WalletCardView, branding: Branding, context?: { stampRequired?: number; rewardTitle?: string }): Promise<WalletArtifact>; refresh(card: WalletCardView, changedFields: string[], context?: { branding?: Branding; stampRequired?: number; rewardTitle?: string }): Promise<WalletArtifact>; revoke(card: WalletCardView): Promise<void>; }
 /** Refresh context mirrors the issue() context plus the branding needed for the text module. */
@@ -199,10 +208,18 @@ export class GoogleWalletAdapter implements WalletAdapter {
     // module is emitted only when the code is present (the migration 021
     // backfill guarantees it in production; pre-backfill rows stay gray).
     const code = card.cardCode?.trim();
+    // Card-FRONT member-number line (owner wish, backlog #4): accountId +
+    // accountIdLabel render on the card front itself (not only in details
+    // like the text module above). Same display value K-XXXXXX; NEVER emitted
+    // for cards without a code — an empty/undefined accountId would render a
+    // broken member-number row at Google.
+    const accountFront: Pick<LoyaltyObject, 'accountId' | 'accountIdLabel'> | Record<string, never> = code
+      ? { accountId: formatCardCode(code), accountIdLabel: 'Kartennummer' }
+      : {};
     if (code) modules.push({ header: 'Kartennummer', body: formatCardCode(code) });
     const cardText = branding.cardText?.trim();
     if (cardText) modules.push({ header: title, body: cardText });
-    return { id: `${this.issuerId}.${card.id}`, classId, state: 'ACTIVE', loyaltyPoints: { balance: { int: card.stampCount } }, textModulesData: modules };
+    return { id: `${this.issuerId}.${card.id}`, classId, state: 'ACTIVE', loyaltyPoints: { balance: { int: card.stampCount } }, textModulesData: modules, ...accountFront };
   }
   async issue(card: WalletCardView, branding: Branding, context?: { stampRequired?: number; rewardTitle?: string }): Promise<WalletArtifact> {
     const classModel = this.classModelFor(branding);
@@ -235,9 +252,20 @@ export class GoogleWalletAdapter implements WalletAdapter {
     const branding: Branding = context?.branding ?? { cardTitle: 'StempelPass', cardText: '', primaryColor: '', secondaryColor: '', version: 1 };
     const model = this.objectModel(this.classModelFor(branding).id, card, branding, { stampRequired: context?.stampRequired, rewardTitle: context?.rewardTitle });
     const { token } = await this.credentials.getAccessToken(WALLET_OBJECT_SCOPE);
+    // LoyaltyObject PATCH carries the balance + text modules AND the card-front
+    // account line (accountId/accountIdLabel) so the front number stays in sync
+    // with the object. reviewStatus is deliberately NOT set here — it belongs to
+    // the CLASS PATCH only (PR #37); the LoyaltyObject has no such field and the
+    // refresh must never flip an approved object into review. Cards without a
+    // code simply omit accountId entirely.
+    const patchBody: Record<string, unknown> = { loyaltyPoints: model.loyaltyPoints, textModulesData: model.textModulesData };
+    if (model.accountId) {
+      patchBody.accountId = model.accountId;
+      patchBody.accountIdLabel = model.accountIdLabel;
+    }
     const response = await this.fetchFn(
       `https://walletobjects.googleapis.com/walletobjects/v1/loyaltyObject/${encodeURIComponent(`${this.issuerId}.${card.id}`)}`,
-      { method: 'PATCH', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ loyaltyPoints: model.loyaltyPoints, textModulesData: model.textModulesData }) },
+      { method: 'PATCH', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(patchBody) },
     );
     if (!response.ok && response.status !== 404) throw new Error(`GOOGLE_WALLET_REFRESH_FAILED_${response.status}`);
     const message = response.status === 404
