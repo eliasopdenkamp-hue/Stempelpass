@@ -409,15 +409,15 @@ function createFakePool(state: FakeDbState): DbPool {
           state.lockWaiters.splice(0).forEach(wake => wake());
           return { rows: [] as T[] };
         }
-        if (norm.startsWith('select version from schema_migrations where version=$1')) {
+        if (norm.startsWith('select version from public.schema_migrations where version=$1')) {
           const version = String(params[0]);
           return { rows: (state.versions.has(version) ? [{ version }] : []) as T[] };
         }
-        if (norm.startsWith('insert into schema_migrations(version) values($1) on conflict (version) do nothing')) {
+        if (norm.startsWith('insert into public.schema_migrations(version) values($1) on conflict (version) do nothing')) {
           state.versions.add(String(params[0]));
           return { rows: [] as T[] };
         }
-        if (norm.startsWith('create table if not exists schema_migrations') || norm === 'begin') {
+        if (norm.startsWith('create table if not exists public.schema_migrations') || norm === 'begin' || norm === 'set local search_path to public, pg_catalog') {
           return { rows: [] as T[] };
         }
         // Anything else is a migration body (read verbatim from the file).
@@ -456,16 +456,24 @@ test('runMigrations: F3 fix — advisory lock is taken before the version check,
     expect(lockQueries.length).toBe(2);
     for (const q of lockQueries) expect(q.params).toEqual([MIGRATION_LOCK_KEY]);
 
-    // Order inside each migration transaction: begin → lock → check → DDL → insert → commit.
+    // Order per migration transaction: begin → pin public-first search_path →
+    // lock → check → DDL → insert → commit.
     const order = state.queries.map(q => q.sql.trim().replace(/\s+/g, ' ').toLowerCase());
-    expect(order[0]).toMatch(/^create table if not exists schema_migrations/);
-    expect(order.slice(1, 3)).toEqual(['begin', 'select pg_advisory_xact_lock($1)']);
-    expect(order[3]).toMatch(/^select version from schema_migrations where version=\$1/);
-    expect(order[4]).toBe('create table alpha ();');
-    expect(order[5]).toContain('on conflict (version) do nothing');
-    expect(order[6]).toBe('commit');
-    expect(order[7]).toBe('begin');
-    expect(order[8]).toBe('select pg_advisory_xact_lock($1)');
+    expect(order[0]).toMatch(/^create table if not exists public\.schema_migrations/);
+    expect(order[1]).toBe('begin');
+    expect(order[2]).toBe('set local search_path to public, pg_catalog');
+    expect(order[3]).toBe('select pg_advisory_xact_lock($1)');
+    expect(order[4]).toMatch(/^select version from public\.schema_migrations where version=\$1/);
+    expect(order[5]).toBe('create table alpha ();');
+    expect(order[6]).toContain('on conflict (version) do nothing');
+    expect(order[7]).toBe('commit');
+    expect(order[8]).toBe('begin');
+    expect(order[9]).toBe('set local search_path to public, pg_catalog');
+    expect(order[10]).toBe('select pg_advisory_xact_lock($1)');
+    expect(order[11]).toMatch(/^select version from public\.schema_migrations where version=\$1/);
+    expect(order[12]).toBe('create table beta ();');
+    expect(order[13]).toContain('on conflict (version) do nothing');
+    expect(order[14]).toBe('commit');
 
     // Both versions recorded exactly once, both bodies executed exactly once.
     expect([...state.versions].sort()).toEqual(['001_init.sql', '002_next.sql']);
@@ -485,9 +493,48 @@ test('runMigrations: idempotent re-run applies nothing and records nothing', asy
 
     expect(state.executed['create table alpha ();']).toBe(1);
     expect([...state.versions]).toEqual(['001_init.sql']);
-    const inserts = state.queries.filter(q => q.sql.toLowerCase().includes('insert into schema_migrations'));
+    const inserts = state.queries.filter(q => q.sql.toLowerCase().includes('insert into public.schema_migrations'));
     expect(inserts.length).toBe(1); // only the first run inserted
     expect(state.releaseCount).toBe(2);
+  });
+});
+
+test('runMigrations: every schema_migrations statement is public-qualified and each transaction pins public-first search_path (pg_catalog least-privilege regression)', async () => {
+  // Regression pin for the production incident: reserved connections are pinned
+  // to `search_path = pg_catalog, public` (initializeReservedConnection), so any
+  // UNQUALIFIED reference — the version-table CREATE and, because migration
+  // bodies use unqualified DDL too, the bodies themselves — would resolve into
+  // pg_catalog and fail with `permission denied for schema pg_catalog` under the
+  // least-privilege runtime role. The runner must (a) qualify every
+  // schema_migrations statement with `public.` and (b) scope a public-first
+  // search_path to each migration transaction via SET LOCAL.
+  await withMigrationDir({
+    '001_init.sql': 'create table alpha ();',
+    '002_next.sql': 'create table beta ();',
+  }, async dir => {
+    const state = freshState();
+    await runMigrations(createFakePool(state), dir);
+
+    // (a) No bare schema_migrations reference survives in any emitted statement:
+    // the version table always targets public regardless of the pinned path.
+    for (const q of state.queries) {
+      if (q.sql.toLowerCase().includes('schema_migrations')) {
+        expect(q.sql.toLowerCase()).toContain('public.schema_migrations');
+      }
+    }
+
+    // (b) Every migration transaction begins by switching to a public-first
+    // search_path (SET LOCAL), and the advisory lock/version check/insert all
+    // run after that pin — so unqualified DDL inside migration bodies cannot
+    // land in pg_catalog either.
+    const norm = state.queries.map(q => q.sql.trim().replace(/\s+/g, ' ').toLowerCase());
+    const begins = norm.flatMap((sql, i) => (sql === 'begin' ? [i] : []));
+    expect(begins.length).toBe(2);
+    for (const i of begins) {
+      expect(norm[i + 1]).toBe('set local search_path to public, pg_catalog');
+      expect(norm[i + 2]).toBe('select pg_advisory_xact_lock($1)');
+      expect(norm[i + 3]).toMatch(/^select version from public\.schema_migrations where version=\$1/);
+    }
   });
 });
 
@@ -509,7 +556,7 @@ test('runMigrations: two concurrent cold starts apply each migration exactly onc
     expect(state.executed['create table gamma ();']).toBe(1);
     expect([...state.versions].sort()).toEqual(['001_init.sql', '002_next.sql', '003_last.sql']);
     // One version insert per file total (both runs share the versions table).
-    const inserts = state.queries.filter(q => q.sql.toLowerCase().includes('insert into schema_migrations'));
+    const inserts = state.queries.filter(q => q.sql.toLowerCase().includes('insert into public.schema_migrations'));
     expect(inserts.length).toBe(3);
     expect(state.lockHeld).toBe(false);
     expect(state.releaseCount).toBe(2);

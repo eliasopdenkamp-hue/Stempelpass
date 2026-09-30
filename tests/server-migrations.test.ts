@@ -266,15 +266,16 @@ function fakeApplyingPool(): { pool: DbPool; applied: string[] } {
     connect: async () => ({
       query: async <T = unknown>(sql: string, params: unknown[] = []): Promise<{ rows: T[] }> => {
         const norm = sql.trim().replace(/\s+/g, ' ').toLowerCase();
-        if (norm.startsWith('select version from schema_migrations where version=$1')) {
+        if (norm.startsWith('select version from public.schema_migrations where version=$1')) {
           return { rows: (versions.has(String(params[0])) ? [{ version: params[0] }] : []) as T[] };
         }
-        if (norm.startsWith('insert into schema_migrations(version) values($1) on conflict (version) do nothing')) {
+        if (norm.startsWith('insert into public.schema_migrations(version) values($1) on conflict (version) do nothing')) {
           versions.add(String(params[0]));
           return { rows: [] as T[] };
         }
         if (norm === 'begin' || norm === 'commit' || norm === 'rollback'
-          || norm.startsWith('create table if not exists schema_migrations')
+          || norm.startsWith('create table if not exists public.schema_migrations')
+          || norm === 'set local search_path to public, pg_catalog'
           || norm === 'select pg_advisory_xact_lock($1)') {
           return { rows: [] as T[] };
         }
