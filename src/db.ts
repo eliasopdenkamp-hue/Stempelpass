@@ -36,7 +36,12 @@ export const MIGRATION_LOCK_KEY = 742_001;
 export async function runMigrations(pool: DbPool, dir = join(dirname(fileURLToPath(import.meta.url)), '../migrations')): Promise<void> {
   const files = (await readdir(dir)).filter(f => /^\d+_.+\.sql$/.test(f)).sort();
   await pool.connect().then(async db => { try {
-    await db.query('create table if not exists schema_migrations (version text primary key, applied_at timestamptz not null default now())');
+    // Schema-qualified: reserved connections are pinned to `pg_catalog, public`
+    // (initializeReservedConnection), so an unqualified CREATE would target
+    // pg_catalog first and the least-privilege runtime role has no CREATE rights
+    // there (`permission denied for schema pg_catalog`). The version table must
+    // always live in public.
+    await db.query('create table if not exists public.schema_migrations (version text primary key, applied_at timestamptz not null default now())');
     for (const file of files) {
       const sql = await readFile(join(dir, file), 'utf8');
       // F3: parallel cold starts used to race on check-then-apply — both saw
@@ -52,14 +57,24 @@ export async function runMigrations(pool: DbPool, dir = join(dirname(fileURLToPa
       // on COMMIT/ROLLBACK, so a lock can never leak onto a pooled connection.
       await db.query('begin');
       try {
+        // Migration bodies in this repo use unqualified DDL (e.g. `create table
+        // cards`). On the runner's pinned pg_catalog-first search_path that DDL
+        // would also hit pg_catalog and fail the same way as the version-table
+        // CREATE did. Pin a public-first path scoped to THIS transaction (SET
+        // LOCAL, exactly like the validate-retention/validate-wallet-revoke
+        // harnesses), so bodies resolve like psql defaults (`"$user", public`)
+        // and the setting auto-resets on COMMIT/ROLLBACK — no state leaks onto
+        // the pooled connection. pg_catalog is still searched implicitly for
+        // function/type resolution (pg_advisory_xact_lock).
+        await db.query('set local search_path to public, pg_catalog');
         await db.query('select pg_advisory_xact_lock($1)', [MIGRATION_LOCK_KEY]);
-        const done = await db.query<{version:string}>('select version from schema_migrations where version=$1', [file]);
+        const done = await db.query<{version:string}>('select version from public.schema_migrations where version=$1', [file]);
         if (!done.rows.length) {
           await db.query(sql);
           // Idempotent registration: the PK can never abort the migration
           // transaction, even if a competing runner recorded the same version
           // between the check and the insert.
-          await db.query('insert into schema_migrations(version) values($1) on conflict (version) do nothing', [file]);
+          await db.query('insert into public.schema_migrations(version) values($1) on conflict (version) do nothing', [file]);
         }
         await db.query('commit');
       } catch (e) { try { await db.query('rollback'); } catch { /* preserve the migration error */ } throw e; }
