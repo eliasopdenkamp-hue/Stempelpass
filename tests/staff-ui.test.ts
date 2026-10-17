@@ -362,6 +362,42 @@ test('dashboard renders the card code column (K-XXXXXX) and the code-search box'
     expect(html).not.toContain('K-</code>');
   });
 });
+test('dashboard serves the mobile card stack + touch-friendly stamp form, desktop table unchanged', async () => {
+  const OTHER_CARD = '99999999-9999-4999-8999-999999999999';
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    ...dashboardHandlers({
+      cards: [
+        { id: CARD, customerRef: 'Kunde-42', stampCount: 3, cardCode: '7F3D2A', updatedAt: '2026-08-26T10:00:00.000Z' },
+        { id: OTHER_CARD, customerRef: 'Kunde-7', stampCount: 4, cardCode: 'ZZZZZZ', updatedAt: '2026-08-27T10:00:00.000Z' },
+      ],
+    }),
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}`, { headers: { cookie: `__Host-sp_session=${SESSION_TOKEN}` } }));
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // Desktop table still rendered (unchanged layout) …
+    expect(html).toContain('<table class="cards-table">');
+    expect(html).toContain('<th>Code</th>');
+    // … alongside the mobile-only card stack (hidden on desktop via CSS).
+    expect(html).toContain('<div class="cards-mobile">');
+    expect(html.match(/class="card-tile"/g)).toHaveLength(2);
+    expect(html).toContain('<code class="tile-code">K-7F3D2A</code>');
+    expect(html).toContain('<code class="tile-code">K-ZZZZZZ</code>');
+    // Per-card touch stamp buttons keep the [data-action] contract.
+    expect(html).toContain(`data-action="stamp" data-url="/staff/${TENANT}/stamp" data-card="${CARD}" data-quantity="1"`);
+    // Responsive CSS: table hidden / stack shown ≤640px, ≥44px touch targets,
+    // 16px inputs (no iOS focus zoom), stamp form wrapper for the column layout.
+    expect(html).toContain('@media(max-width:640px)');
+    expect(html).toContain('.cards-table{display:none}');
+    expect(html).toContain('.cards-mobile{display:block');
+    expect(html).toContain('min-height:44px');
+    expect(html).toContain('font-size:16px');
+    expect(html).toContain('.sp-stamp-footer{display:contents}');
+    expect(html).toContain('class="sp-stamp"');
+  });
+});
 test('GET /staff/:tenantId/search-code finds the card by code (prefix optional), scoped to the caller tenant', async () => {
   const searchHandlers = [
     { match: contains('from cards c join customers'), rows: [{ id: CARD, cardCode: '7F3D2A', stampCount: 4, stampsRequired: 6, updatedAt: '2026-09-25T10:00:00.000Z', customerRef: 'Kunde-42' }] },

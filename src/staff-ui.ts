@@ -57,7 +57,62 @@ code{font-size:.8rem;background:#f1f5f9;padding:.1rem .35rem;border-radius:.3rem
 .kpi{flex:1 1 7.5rem;min-width:7.5rem;background:#f1f5f9;border-radius:.75rem;padding:.55rem .8rem}
 .kpi .v{font-size:1.3rem;font-weight:700;color:#172033;line-height:1.2}
 .kpi .l{font-size:.72rem;color:#64748b;text-transform:uppercase;letter-spacing:.03em;margin-top:.15rem}
-@media(max-width:640px){body{padding:1rem}.card{padding:1.2rem;border-radius:1rem}}
+.qr-card .row{align-items:flex-start}
+.qr-card .row>div{flex:1;min-width:14rem}
+/* Mobile-only card stack: hidden on desktop, replaces the cards table ≤640px. */
+.cards-mobile{display:none}
+/* Stamp form: the quantity + submit are wrapped so the mobile layout can stack
+ * them under the input; on desktop display:contents keeps the ORIGINAL single
+ * flex row (input → quantity → button) with identical spacing. */
+.sp-stamp-footer{display:contents}
+.sp-stamp-qty{width:5.5rem}
+.link-btn{color:#155e75;font-weight:600}
+@media(max-width:640px){
+  body{padding:.9rem}
+  .card{padding:1.1rem;border-radius:1rem}
+  input,select,textarea{font-size:16px}
+  button{min-height:44px;font-size:1rem;padding:.75rem 1rem}
+  button.ghost{min-height:44px;font-size:.9rem;padding:.5rem .9rem}
+  th,td{padding:.5rem .3rem}
+  code,.hint{overflow-wrap:anywhere}
+  /* #sp-app as a column lets the stamp action move to the top with CSS order
+   * (DOM order stays identical → desktop layout untouched). */
+  #sp-app{display:flex;flex-direction:column}
+  #sp-errbox,#sp-flash{order:-6}
+  #sp-newcard{order:-5}
+  .sp-head{order:-4}
+  .sp-meta{order:-3}
+  .sp-stamp{order:-2}
+  /* Stamp-Aktion: groß, gestapelt, daumenfreundlich — der Haupt-Workflow an
+   * der Kasse. */
+  .stamp-form{flex-direction:column;align-items:stretch;gap:.6rem}
+  .stamp-form input[name="cardId"]{min-height:48px;padding:.8rem .9rem}
+  .sp-stamp-footer{display:flex;gap:.5rem;align-items:center}
+  .sp-stamp-footer .sp-stamp-qty{width:5rem;flex:none;min-height:48px}
+  .sp-stamp-footer .sp-stamp-btn{flex:1;min-height:48px}
+  /* Kartenliste: Tabelle ausblenden, Karten-Stack einblenden. */
+  .cards-table{display:none}
+  .cards-mobile{display:block;margin-top:.5rem}
+  .cards-mobile .card-tile{border:1px solid #e2e8f0;border-radius:.9rem;padding:.8rem .85rem;margin-bottom:.8rem;background:#fff}
+  .cards-mobile .tile-top{display:flex;align-items:center;justify-content:space-between;gap:.5rem;flex-wrap:wrap}
+  .cards-mobile .tile-code{font-size:1.1rem;font-weight:700;background:#f1f5f9;padding:.25rem .6rem;border-radius:.45rem;color:#172033}
+  .cards-mobile .tile-meta{font-size:.85rem;color:#64748b;margin-top:.3rem}
+  .cards-mobile .tile-progress{display:flex;align-items:center;gap:.6rem;margin:.5rem 0}
+  .cards-mobile .tile-count{font-size:.95rem;font-weight:600;color:#172033;white-space:nowrap}
+  .cards-mobile .tile-progress progress{flex:1;height:.9rem}
+  .cards-mobile .tile-actions{display:flex;flex-direction:column;gap:.5rem}
+  .cards-mobile .tile-actions button,.search-result .row button{width:100%;min-height:48px;margin:0;font-size:1rem;padding:.7rem .9rem;border-radius:.7rem;font-weight:700}
+  button.stamp-btn{background:#0f766e;border:1px solid #0f766e;color:#fff}
+  button.redeem-btn{background:#fff;color:#155e75;border:1px solid #155e75}
+  #sp-code-search input{min-height:44px}
+  .search-result .row{flex-direction:column;align-items:stretch}
+  /* „Neue Karte"-QR-Panel: untereinander statt nebeneinander. */
+  .qr-card .row{flex-direction:column;align-items:center;text-align:center}
+  .qr-card .row>div{min-width:0;width:100%;text-align:left}
+  .qr-card img{width:160px;height:160px}
+  /* Alle Links in der Karte als Touch-Targets. */
+  .card a{display:inline-block;min-height:44px;padding:.55rem 0;box-sizing:border-box}
+}
 `.trim();
 
 /** Colors are additionally sanitized before interpolation into CSS. */
@@ -364,9 +419,9 @@ export function codeSearchResultHtml(card: StaffSearchCard, tenantId: string, ca
     : card.rewardStatus === 'redeemed' ? '<span class="badge redeemed">Prämie eingelöst</span>' : '';
   const actions: string[] = [];
   if (canStamp) {
-    actions.push(`<button type="button" class="ghost" data-action="stamp" data-url="/staff/${esc(tenantId)}/stamp" data-card="${esc(card.id)}" data-quantity="1">+1 Stempel</button>`);
+    actions.push(`<button type="button" class="ghost stamp-btn" data-action="stamp" data-url="/staff/${esc(tenantId)}/stamp" data-card="${esc(card.id)}" data-quantity="1">+1 Stempel</button>`);
     if (card.rewardStatus === 'issued' && card.rewardId) {
-      actions.push(`<button type="button" class="ghost" data-action="redeem" data-url="/staff/${esc(tenantId)}/redeem" data-reward="${esc(card.rewardId)}">Prämie einlösen</button>`);
+      actions.push(`<button type="button" class="ghost redeem-btn" data-action="redeem" data-url="/staff/${esc(tenantId)}/redeem" data-reward="${esc(card.rewardId)}">Prämie einlösen</button>`);
     }
   }
   return `<div class="search-result" id="sp-search-result">
@@ -609,7 +664,7 @@ export function dashboardPage(v: DashboardView, flash?: { kind: 'ok' | 'error'; 
    * — never a stamping right (stamping needs an authenticated staff session).
    */
   const newCardHtml = v.newCard
-    ? `<div class="qr-card" id="sp-newcard"><div class="row" style="align-items:flex-start"><img src="${esc(qrSvgDataUri(v.newCard.url))}" alt="QR-Code der neuen Karte" width="176" height="176"><div style="flex:1;min-width:14rem"><h2 style="margin:.1rem 0 .4rem">Neue Karte angelegt</h2><p class="meta"><strong>Webkarten-Link:</strong> <code>${esc(v.newCard.url)}</code></p><p class="meta"><strong>Karten-Token:</strong> <code>${esc(v.newCard.token)}</code></p><p class="hint">Kunde: QR scannen → Webkarte öffnen → Zu Google Wallet hinzufügen.</p></div></div></div>`
+    ? `<div class="qr-card" id="sp-newcard"><div class="row"><img src="${esc(qrSvgDataUri(v.newCard.url))}" alt="QR-Code der neuen Karte" width="176" height="176"><div><h2 style="margin:.1rem 0 .4rem">Neue Karte angelegt</h2><p class="meta"><strong>Webkarten-Link:</strong> <code>${esc(v.newCard.url)}</code></p><p class="meta"><strong>Karten-Token:</strong> <code>${esc(v.newCard.token)}</code></p><p class="hint">Kunde: QR scannen → Webkarte öffnen → Zu Google Wallet hinzufügen.</p></div></div></div>`
     : '';
   const rewardHtml = v.rewardTitle
     ? `<p><strong>Prämie:</strong> ${esc(v.rewardTitle)}${v.rewardDescription ? ` — ${esc(v.rewardDescription)}` : ''} (${esc(v.ruleName ?? 'Regel')}: ${esc(v.stampsRequired ?? '?')} Stempel)</p>`
@@ -643,23 +698,54 @@ export function dashboardPage(v: DashboardView, flash?: { kind: 'ok' | 'error'; 
           : c.rewardStatus === 'redeemed' ? '<span class="badge redeemed">Prämie eingelöst</span>' : '';
         const actions: string[] = [];
         if (v.canStamp) {
-          actions.push(`<button type="button" class="ghost" data-action="stamp" data-url="/staff/${esc(v.tenantId)}/stamp" data-card="${esc(c.id)}" data-quantity="1">+1 Stempel</button>`);
+          actions.push(`<button type="button" class="ghost stamp-btn" data-action="stamp" data-url="/staff/${esc(v.tenantId)}/stamp" data-card="${esc(c.id)}" data-quantity="1">+1 Stempel</button>`);
           if (c.rewardStatus === 'issued' && c.rewardId) {
-            actions.push(`<button type="button" class="ghost" data-action="redeem" data-url="/staff/${esc(v.tenantId)}/redeem" data-reward="${esc(c.rewardId)}">Prämie einlösen</button>`);
+            actions.push(`<button type="button" class="ghost redeem-btn" data-action="redeem" data-url="/staff/${esc(v.tenantId)}/redeem" data-reward="${esc(c.rewardId)}">Prämie einlösen</button>`);
           }
         }
         return `<tr><td><code>${esc(c.id.slice(0, 8))}</code> <span class="meta">${esc(c.customerRef ?? '—')}</span></td><td>${c.cardCode ? `<code>${esc(formatCardCode(c.cardCode))}</code>` : '<span class="meta">—</span>'}</td><td>${esc(c.stampCount)} / ${esc(v.stampsRequired ?? '?')}</td><td><progress max="100" value="${progress}" style="width:5rem;accent-color:${esc(primary)}"></progress></td><td>${statusBadge || '<span class="meta">—</span>'}</td><td class="row">${actions.join('')}</td></tr>`;
       }).join('')
     : '<tr><td colspan="6"><span class="meta">Noch keine Karten.</span></td></tr>';
+  /** Mobile card stack (hidden on desktop via .cards-mobile): one compact tile
+   *  per card — prominent code, stamp count, status badge and big touch
+   *  buttons. Uses the exact same [data-action] contract as the table rows,
+   *  so the delegated document listeners work unchanged. */
+  const cardTiles = v.cards.length
+    ? v.cards.map(c => {
+        const progress = Math.min(100, Math.round((c.stampCount / Math.max(1, Number(v.stampsRequired ?? 1))) * 100));
+        const statusBadge = c.rewardStatus === 'issued'
+          ? '<span class="badge issued">Prämie einlösbar</span>'
+          : c.rewardStatus === 'redeemed' ? '<span class="badge redeemed">Prämie eingelöst</span>' : '';
+        const tileActions: string[] = [];
+        if (v.canStamp) {
+          tileActions.push(`<button type="button" class="ghost stamp-btn" data-action="stamp" data-url="/staff/${esc(v.tenantId)}/stamp" data-card="${esc(c.id)}" data-quantity="1">+1 Stempel</button>`);
+          if (c.rewardStatus === 'issued' && c.rewardId) {
+            tileActions.push(`<button type="button" class="ghost redeem-btn" data-action="redeem" data-url="/staff/${esc(v.tenantId)}/redeem" data-reward="${esc(c.rewardId)}">Prämie einlösen</button>`);
+          }
+        }
+        const tileActionHtml = tileActions.length ? `<div class="tile-actions">${tileActions.join('')}</div>` : '';
+        const customer = c.customerRef ? `<span class="meta">${esc(c.customerRef)}</span>` : '<span class="meta">—</span>';
+        return `<div class="card-tile">
+<div class="tile-top">${c.cardCode ? `<code class="tile-code">${esc(formatCardCode(c.cardCode))}</code>` : '<span class="meta">—</span>'}${statusBadge || ''}</div>
+<div class="tile-meta">${esc(c.id.slice(0, 8))}${c.customerRef ? ` · ${customer}` : ''}</div>
+<div class="tile-progress"><span class="tile-count">${esc(c.stampCount)} / ${esc(v.stampsRequired ?? '?')}</span><progress max="100" value="${progress}" style="flex:1;accent-color:${esc(primary)}"></progress></div>
+${tileActionHtml}</div>`;
+      }).join('')
+    : '<p class="meta">Noch keine Karten.</p>';
   const eventRows = v.events.length
     ? v.events.map(e => `<tr><td><code>${esc(e.cardId.slice(0, 8))}</code></td><td>${esc(e.customerRef ?? '—')}</td><td>+${esc(e.quantity)}</td><td>${esc(fmtTs(e.createdAt))}</td></tr>`).join('')
     : '<tr><td colspan="4"><span class="meta">Noch keine Stempel-Ereignisse.</span></td></tr>';
   const stampForm = v.canStamp
-    ? `<form data-staff-form action="/staff/${esc(v.tenantId)}/stamp" method="post" class="row" style="gap:.5rem;margin-top:.5rem">
-        <input name="cardId" placeholder="Karten-ID, Kartencode (K-XXXXXX) oder Kunden-Token eingeben" required style="flex:1;margin:0">
-        <input name="quantity" type="number" min="1" max="10" value="1" style="width:5.5rem;margin:0">
-        <button type="submit" class="secondary" style="margin:0">Stempel vergeben</button>
-      </form><p class="hint">Karten-ID, Kartencode (K-XXXXXX) oder Kunden-Token eingeben — die passende Karte wird direkt gestempelt.</p>`
+    ? `<div class="sp-stamp">
+<form data-staff-form action="/staff/${esc(v.tenantId)}/stamp" method="post" class="row stamp-form" style="gap:.5rem;margin-top:.5rem">
+<input name="cardId" placeholder="Karten-ID, Kartencode (K-XXXXXX) oder Kunden-Token eingeben" required style="flex:1;margin:0" autocomplete="off">
+<div class="sp-stamp-footer">
+<input name="quantity" type="number" min="1" max="10" value="1" class="sp-stamp-qty" style="margin:0">
+<button type="submit" class="secondary sp-stamp-btn" style="margin:0">Stempel vergeben</button>
+</div>
+</form>
+<p class="hint">Karten-ID, Kartencode (K-XXXXXX) oder Kunden-Token eingeben — die passende Karte wird direkt gestempelt.</p>
+</div>`
     : '<p class="meta">Diese Rolle kann keine Stempel vergeben oder Prämien einlösen.</p>';
   const codeSearchHtml = `<h2>Karte per Code finden</h2>
 <form id="sp-code-search" data-search-url="/staff/${esc(v.tenantId)}/search-code" autocomplete="off">
@@ -677,15 +763,16 @@ export function dashboardPage(v: DashboardView, flash?: { kind: 'ok' | 'error'; 
     `<main class="card" id="sp-app" style="border-top-color:${esc(primary)}">
 ${flashHtml}<p id="sp-errbox" class="flash error" style="display:none" role="alert"></p>
 ${newCardHtml}
-<div class="row"><h1 style="margin:0">${esc(tenantName)}</h1><span class="spacer"></span><button type="button" class="ghost" data-action="logout" data-url="/staff/${esc(v.tenantId)}/logout">Abmelden</button></div>${v.cardText ? `<p class="meta">${esc(v.cardText)}</p>` : ""}
-<p class="meta">Tarif: ${esc(PLAN_LABEL[v.planCode] ?? v.planCode)} · ${esc(v.usedCards)} von ${esc(v.customerLimit)} Kunden belegt · Rolle: ${esc(v.role)}</p>
+<div class="row sp-head"><h1 style="margin:0">${esc(tenantName)}</h1><span class="spacer"></span><button type="button" class="ghost" data-action="logout" data-url="/staff/${esc(v.tenantId)}/logout">Abmelden</button></div>${v.cardText ? `<p class="meta sp-meta">${esc(v.cardText)}</p>` : ""}
+<p class="meta sp-meta">Tarif: ${esc(PLAN_LABEL[v.planCode] ?? v.planCode)} · ${esc(v.usedCards)} von ${esc(v.customerLimit)} Kunden belegt · Rolle: ${esc(v.role)}</p>
 ${brandingCanEdit}
 <h2>Stempelregel &amp; Prämie</h2>${rewardHtml}
 ${statsHtml}
 <h2>Links für die Demo</h2>${joinHtml}<p class="hint">Kunden-Webkarte: <code>/card/${esc(v.tenantId)}/{Karten-Token}</code> — der Karten-Token wird bei der Kartenerstellung einmalig ausgegeben und ist nur dem Kunden/Personal bekannt. Jede Karte trägt außerdem den sichtbaren Kartencode (K-XXXXXX) auf der Webkarte und im Google-Wallet-Pass.</p>
-<div class="row" style="flex-wrap:nowrap"><h2 style="flex:1">Karten</h2>${createCardButton}</div>
+<div class="row sp-karten" style="flex-wrap:nowrap"><h2 style="flex:1">Karten</h2>${createCardButton}</div>
 ${codeSearchHtml}
-<table><thead><tr><th>Karte / Kunde</th><th>Code</th><th>Stempel</th><th>Fortschritt</th><th>Prämie</th><th>Aktion</th></tr></thead><tbody>${cardRows}</tbody></table>${stampForm}
+<table class="cards-table"><thead><tr><th>Karte / Kunde</th><th>Code</th><th>Stempel</th><th>Fortschritt</th><th>Prämie</th><th>Aktion</th></tr></thead><tbody>${cardRows}</tbody></table>
+<div class="cards-mobile">${cardTiles}</div>${stampForm}
 <h2>Letzte Stempel-Ereignisse</h2>
 <table><thead><tr><th>Karte</th><th>Kunde</th><th>Stempel</th><th>Zeitpunkt</th></tr></thead><tbody>${eventRows}</tbody></table>
 </main>`,
