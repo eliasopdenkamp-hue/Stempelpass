@@ -38,6 +38,7 @@ const EXPECTED = [
   '019_password_reset_tokens.sql',
   '020_reset_user_password_function.sql',
   '021_card_code.sql',
+  '022_audit_log_select_grant.sql',
 ];
 
 test('migration files: exact expected set, runner-compatible names, stable order', async () => {
