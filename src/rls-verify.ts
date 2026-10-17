@@ -123,7 +123,14 @@ export const REQUIRED_GRANTS: Readonly<Record<string, readonly ('SELECT' | 'INSE
   cards: ['SELECT', 'INSERT', 'UPDATE'],
   stamp_events: ['SELECT', 'INSERT'],
   rewards: ['SELECT', 'INSERT', 'UPDATE'],
-  audit_log: ['INSERT'],
+  // 2026-10-17 incident: audit_log needs SELECT in addition to INSERT because
+  // the reset-confirm handler's idempotence-guarded audit INSERT runs
+  // `where not exists (select 1 from audit_log …)` — the SUBQUERY reads the
+  // same table the INSERT writes. Migration 009 granted INSERT only; the
+  // missing SELECT made POST /api/auth/reset/confirm 500 (INTERNAL_ERROR)
+  // with a valid token/password. Migration 022 grants SELECT; RLS (009)
+  // still scopes visibility.
+  audit_log: ['INSERT', 'SELECT'],
   tenant_entry_points: ['SELECT', 'INSERT', 'UPDATE'],
   communication_preferences: ['SELECT', 'INSERT', 'UPDATE'],
   communication_consent_events: ['SELECT', 'INSERT', 'UPDATE'],

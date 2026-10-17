@@ -245,6 +245,15 @@ describe('classifyRlsReport', () => {
       expect(REQUIRED_GRANTS[table].includes('INSERT'), `REQUIRED_GRANTS[${table}] must include INSERT`).toBe(true);
     }
   });
+  test('audit_log requires SELECT in the expectation matrix (2026-10-17 reset-confirm incident)', () => {
+    // The reset-confirm handler's audit INSERT is guarded by `where not
+    // exists (select 1 from audit_log …)`, so the runtime role must be able
+    // to READ audit_log as well as write it. Migration 022 grants SELECT;
+    // pin the matrix or a future regression ships silently again (the check
+    // then fails rls-verify with audit_log:SELECT instead of a prod 500).
+    expect(REQUIRED_GRANTS.audit_log).toContain('SELECT');
+    expect(REQUIRED_GRANTS.audit_log).toContain('INSERT');
+  });
 
   test('missing resolver EXECUTE grant fails and is named without hiding table grants', () => {
     const functionGrantRows = REQUIRED_FUNCTION_GRANTS
