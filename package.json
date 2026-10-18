@@ -16,6 +16,8 @@
     "db:retention": "bun run src/retention.ts",
     "db:retention-validate": "bun run scripts/validate-retention.ts",
     "db:wallet-revoke-validate": "bun run scripts/validate-wallet-revoke.ts",
+    "embed-zxing": "bun run scripts/embed-zxing.ts",
+    "verify-bundle": "bun run scripts/verify-bundle.ts",
     "rls-verify": "bun run src/rls-verify.ts",
     "production-preflight": "bun run src/production-preflight.ts"
   },

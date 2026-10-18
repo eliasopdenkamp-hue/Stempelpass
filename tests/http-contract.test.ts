@@ -2,6 +2,7 @@ import { test, expect } from 'bun:test';
 import { CardRepository, type DbPool, type TxClient } from '../src/repository';
 import { cardResolveLimiter, hashPassword, hashSessionToken, loginAccountLimiter, loginIpLimiter, randomToken } from '../src/security';
 import { walletAdapter } from '../src/wallet';
+import { zxingSource, zxingSourceStats } from '../src/vendor-assets.js';
 
 /**
  * HTTP-level contract tests against the REAL fetchHandler.
@@ -1524,7 +1525,13 @@ test('GET /vendor/zxing.min.js serves the client-side decoder (no auth, no DB)',
   const res = await fetchHandler(new Request('http://test.local/vendor/zxing.min.js'));
   expect(res.status).toBe(200);
   expect(res.headers.get('content-type')).toContain('application/javascript');
+  expect(res.headers.get('cache-control')).toContain('max-age=3600');
   const body = await res.text();
   expect(body.length).toBeGreaterThan(100_000);
   expect(body).toContain('ZXing');
+  // The served body must be EXACTLY the embedded payload (build-time embedded
+  // base64 decoded in src/vendor-assets.ts) — byte-identical to what the
+  // browser gets, pinned against the generated constant.
+  expect(body).toBe(zxingSource());
+  expect(Buffer.byteLength(body, 'utf8')).toBe(zxingSourceStats().bytes);
 });
