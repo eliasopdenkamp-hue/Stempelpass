@@ -125,8 +125,11 @@ test('024 grid resolver: minimal-privilege RLS-safe card display lookup', async 
   const body = m024.match(/as \$\$\n?([\s\S]*?)\n?\$\$/)?.[1] ?? '';
   expect(body).not.toMatch(/\bexecute\b/i);
   expect(body).not.toMatch(/format\(/i);
-  // No PUBLIC execution; explicit grant only to the app role, conditional.
+  // No PUBLIC execution; explicit conditional grants to both known app roles
+  // (production runtime role stempelpass_runtime + generic app_role).
   expect(m024).toMatch(/revoke all on function public\.card_grid_display\(uuid\) from public/);
+  expect(m024).toMatch(/grant execute on function public\.card_grid_display\(uuid\) to stempelpass_runtime/);
+  expect(m024).toMatch(/if exists \(select 1 from pg_roles where rolname = 'stempelpass_runtime'\)/);
   expect(m024).toMatch(/grant execute on function public\.card_grid_display\(uuid\) to app_role/);
   expect(m024).toMatch(/if exists \(select 1 from pg_roles where rolname = 'app_role'\)/);
 });

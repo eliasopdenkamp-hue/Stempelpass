@@ -21,9 +21,12 @@
 --   * Fully qualified `public.*` references: no search_path lookup, no
 --     hijackable schema in the resolution path.
 --   * No dynamic SQL: a plain static SELECT.
---   * REVOKE ... FROM PUBLIC + explicit conditional GRANT only to the app
---     role (the role may not exist when this migration runs in a fresh
---     environment; the grant is re-runnable via the documented one-liner).
+--   * REVOKE ... FROM PUBLIC + explicit conditional GRANT to both known app
+--     roles (the production app role is stempelpass_runtime; generically we
+--     check both stempelpass_runtime and app_role). A role may not exist when
+--     this migration runs in a fresh environment; each grant is applied only
+--     when the role exists and is re-runnable via the documented one-liners
+--     below.
 create or replace function public.card_grid_display(p_card_id uuid)
 returns table (
   revision integer,
@@ -62,12 +65,18 @@ as $$
 $$;
 -- No PUBLIC access: only explicitly granted roles may use the escape hatch.
 revoke all on function public.card_grid_display(uuid) from public;
--- The production app role may not exist yet in this environment (RLS_AUTH_P1
--- Teil C documents the blocker). The grant is applied when the role exists;
--- for environments that create the app role AFTER this migration, run once:
+-- The app roles may not exist yet in a fresh environment (RLS_AUTH_P1 Teil C
+-- documents the blocker). The production app role is stempelpass_runtime;
+-- generically we check both known app roles. Each grant is applied only when
+-- the role exists; for environments that create the role AFTER this
+-- migration, run once per role:
+--   grant execute on function public.card_grid_display(uuid) to stempelpass_runtime;
 --   grant execute on function public.card_grid_display(uuid) to app_role;
 do $$
 begin
+  if exists (select 1 from pg_roles where rolname = 'stempelpass_runtime') then
+    execute 'grant execute on function public.card_grid_display(uuid) to stempelpass_runtime';
+  end if;
   if exists (select 1 from pg_roles where rolname = 'app_role') then
     execute 'grant execute on function public.card_grid_display(uuid) to app_role';
   end if;
