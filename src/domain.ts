@@ -9,8 +9,8 @@ export interface Tenant { id: string; slug: string; planCode: PlanCode; customer
 export interface Branding { cardTitle: string; cardText: string; primaryColor: string; secondaryColor: string; iconAssetId?: string; logoAssetId?: string; /** Hosted https URL used as the Google Wallet class programLogo (tenant_branding.logo_url). */ logoUrl?: string; version: number; }
 export interface StampRule { id: string; tenantId: string; name: string; stampsRequired: number; rewardTitle: string; rewardDescription: string; active: boolean; version: number; }
 export interface Card { id: string; tenantId: string; customerId: string; publicTokenHash: string; status: 'active'|'archived'; stampCount: number; revision: number; ruleId: string; /** Tenant-unique visible card code (migration 021; NOT NULL in the DB). */ cardCode: string; }
-/** Minimal card view for public/wallet output: never carries customerId or publicTokenHash. The cardCode is included (when the card has one) because it is customer-visible by design (webcard/wallet display) — it is identification only, never a permission. */
-export type WalletCardView = Pick<Card, 'id' | 'stampCount'> & { cardCode?: string };
+/** Minimal card view for public/wallet output: never carries customerId or publicTokenHash. The cardCode is included (when the card has one) because it is customer-visible by design (webcard/wallet display) — it is identification only, never a permission. revision is optional: when present it becomes the cache-busting `?ts=` of the Wallet stamp-raster image URL (wallet-grid.ts); without it the pass is built without the raster image. */
+export type WalletCardView = Pick<Card, 'id' | 'stampCount'> & { cardCode?: string; revision?: number };
 export interface Reward { id: string; tenantId: string; cardId: string; ruleId: string; status: 'issued'|'redeemed'; }
 export interface WalletArtifact { provider: Provider; status: 'not_configured'|'issued'; message: string; artifact?: string; }
 

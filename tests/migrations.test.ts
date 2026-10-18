@@ -40,6 +40,7 @@ const EXPECTED = [
   '021_card_code.sql',
   '022_audit_log_select_grant.sql',
   '023_rewards_stamp_event_indices.sql',
+  '024_card_grid_resolver.sql',
 ];
 
 test('migration files: exact expected set, runner-compatible names, stable order', async () => {
@@ -103,13 +104,47 @@ test('008 resolver function: minimal-privilege RLS-safe public-key lookup', asyn
 test('008 resolver reads only tenant_entry_points', async () => {
   const m008 = await readFile(join(MIGRATIONS_DIR, '008_entry_point_resolver.sql'), 'utf8');
   // The only table the resolver reads is tenant_entry_points (from 006).
-  const fromMatches = [...m008.matchAll(/\bfrom\s+([a-z_][a-z0-9_.]*)/gi)].map(m => m[1]);
+  const fromMatches = [...m008.matchAll(/\b(?:from|join)\s+([a-z_][a-z0-9_.]*)/gi)].map(m => m[1]);
   expect(fromMatches.some(ref => ref.includes('tenant_entry_points'))).toBe(true);
   // No other application table is read or written by the resolver.
   const tables = ['tenants', 'users', 'sessions', 'cards', 'rewards', 'stamp_rules', 'customers', 'audit_log', 'tenant_branding', 'stamp_events', 'tenant_memberships', 'communication_preferences', 'communication_consent_events', 'communication_message_logs'];
   for (const t of tables) {
     expect(m008).not.toMatch(new RegExp(`\\b${t}\\b`));
   }
+});
+test('024 grid resolver: minimal-privilege RLS-safe card display lookup', async () => {
+  const m024 = await readFile(join(MIGRATIONS_DIR, '024_card_grid_resolver.sql'), 'utf8');
+  expect(m024).toMatch(/create or replace function public\.card_grid_display\(p_card_id uuid\)/);
+  expect(m024).toMatch(/security definer/);
+  expect(m024).toMatch(/set search_path = pg_catalog/);
+  // Only aggregate display data: counts, colors, reward flag, revision.
+  expect(m024).toMatch(/returns table \(/);
+  expect(m024).toMatch(/stamp_count >= r\.stamps_required/);
+  expect(m024).toMatch(/status = 'issued'/);
+  // No dynamic SQL inside the function body.
+  const body = m024.match(/as \$\$\n?([\s\S]*?)\n?\$\$/)?.[1] ?? '';
+  expect(body).not.toMatch(/\bexecute\b/i);
+  expect(body).not.toMatch(/format\(/i);
+  // No PUBLIC execution; explicit conditional grants to both known app roles
+  // (production runtime role stempelpass_runtime + generic app_role).
+  expect(m024).toMatch(/revoke all on function public\.card_grid_display\(uuid\) from public/);
+  expect(m024).toMatch(/grant execute on function public\.card_grid_display\(uuid\) to stempelpass_runtime/);
+  expect(m024).toMatch(/if exists \(select 1 from pg_roles where rolname = 'stempelpass_runtime'\)/);
+  expect(m024).toMatch(/grant execute on function public\.card_grid_display\(uuid\) to app_role/);
+  expect(m024).toMatch(/if exists \(select 1 from pg_roles where rolname = 'app_role'\)/);
+});
+test('024 grid resolver reads only display tables and never PII', async () => {
+  const m024 = await readFile(join(MIGRATIONS_DIR, '024_card_grid_resolver.sql'), 'utf8');
+  const fromMatches = [...m024.matchAll(/\b(?:from|join)\s+([a-z_][a-z0-9_.]*)/gi)].map(m => m[1]);
+  for (const ref of ['public.cards', 'public.stamp_rules', 'public.tenant_branding', 'public.rewards']) {
+    expect(fromMatches.some(f => f.includes(ref.split('.')[1]))).toBe(true);
+  }
+  // The resolver must never expose PII: no token, customer, tenant, code, email.
+  expect(m024).not.toMatch(/public_token_hash/);
+  expect(m024).not.toMatch(/card_code/);
+  expect(m024).not.toMatch(/external_ref/);
+  expect(m024).not.toMatch(/legal_name/);
+  expect(m024).not.toMatch(/privacy_email/);
 });
 
 test('009 enables RLS on sessions with the user-scoped app.user_id policy and no FORCE', async () => {

@@ -2,6 +2,7 @@ import type { Branding, Provider, WalletArtifact, WalletCardView } from './domai
 import { createSign } from 'node:crypto';
 import { formatCardCode } from './card-code.js';
 import { resolveGcpCredentials, gcpCredentialMode, base64url, WALLET_OBJECT_SCOPE, type GcpCredentialProvider } from './gcp-credentials.js';
+import { walletGridImageUrl, walletImageBaseUrl } from './wallet-grid.js';
 
 export interface LoyaltyClass {
   id: string;
@@ -37,6 +38,18 @@ export interface LoyaltyObject {
    * only. Same display value K-XXXXXX; NEVER emitted for cards without a code.
    */
   barcode?: { type: 'CODE_128'; value: string; alternateText?: string };
+  /**
+   * Visible stamp-raster image (Owner-Entscheid 2026-10-18). The Loyalty API
+   * has no native progress element (LoyaltyPoints = bare balance number), so
+   * the grid is rendered server-side as a PNG and embedded as the object-level
+   * image module — Google's docs: "Image module data. The maximum number of
+   * these fields displayed is 1 from object level and 1 for class object
+   * level" with `mainImage` = "A 100% width image." (verified against the v1
+   * discovery document 2026-10-18). Emitted ONLY when WALLET_IMAGE_BASE_URL is
+   * configured AND the card carries a revision (the URL's cache-busting ts);
+   * otherwise the pass keeps the exact pre-18.10 shape (graceful no-op).
+   */
+  imageModulesData?: Array<{ id?: string; mainImage: { sourceUri: { uri: string }; contentDescription?: string } }>;
 }
 export interface WalletAdapter { issue(card: WalletCardView, branding: Branding, context?: { stampRequired?: number; rewardTitle?: string }): Promise<WalletArtifact>; refresh(card: WalletCardView, changedFields: string[], context?: { branding?: Branding; stampRequired?: number; rewardTitle?: string }): Promise<WalletArtifact>; revoke(card: WalletCardView): Promise<void>; }
 /** Refresh context mirrors the issue() context plus the branding needed for the text module. */
@@ -233,7 +246,19 @@ export class GoogleWalletAdapter implements WalletAdapter {
       : {};
     const cardText = branding.cardText?.trim();
     if (cardText) modules.push({ header: title, body: cardText });
-    return { id: `${this.issuerId}.${card.id}`, classId, state: 'ACTIVE', loyaltyPoints: { balance: { int: card.stampCount } }, textModulesData: modules, ...accountFront, ...barcodeFront };
+    // Visible stamp-raster (Owner-Entscheid 2026-10-18): a generated PNG in the
+    // object's image module. Emitted ONLY when WALLET_IMAGE_BASE_URL is set
+    // AND the card carries a revision; the URL's ts is the monotonically
+    // increasing card revision, so a stamp/redeem (DB first, then PATCH) always
+    // swaps in a fresh URL and Google's immutable cache stays correct.
+    const gridBaseUrl = walletImageBaseUrl();
+    const gridImage: LoyaltyObject['imageModulesData'] = gridBaseUrl && card.revision !== undefined
+      ? [{ id: 'stempel-raster', mainImage: { sourceUri: { uri: walletGridImageUrl(gridBaseUrl, card.id, card.revision) }, contentDescription: `${card.stampCount}/${context?.stampRequired ?? '?'} Stempel` } }]
+      : undefined;
+    return {
+      id: `${this.issuerId}.${card.id}`, classId, state: 'ACTIVE', loyaltyPoints: { balance: { int: card.stampCount } }, textModulesData: modules, ...accountFront, ...barcodeFront,
+      ...(gridImage ? { imageModulesData: gridImage } : {}),
+    };
   }
   async issue(card: WalletCardView, branding: Branding, context?: { stampRequired?: number; rewardTitle?: string }): Promise<WalletArtifact> {
     const classModel = this.classModelFor(branding);
@@ -271,8 +296,11 @@ export class GoogleWalletAdapter implements WalletAdapter {
     // with the object. reviewStatus is deliberately NOT set here — it belongs to
     // the CLASS PATCH only (PR #37); the LoyaltyObject has no such field and the
     // refresh must never flip an approved object into review. Cards without a
-    // code simply omit accountId entirely.
+    // code simply omit accountId entirely. imageModulesData is replaced as a
+    // WHOLE (new ts URL after each stamp/redeem) — never appended, so a refresh
+    // can not duplicate the raster module.
     const patchBody: Record<string, unknown> = { loyaltyPoints: model.loyaltyPoints, textModulesData: model.textModulesData };
+    if (model.imageModulesData) patchBody.imageModulesData = model.imageModulesData;
     if (model.accountId) {
       patchBody.accountId = model.accountId;
       patchBody.accountIdLabel = model.accountIdLabel;

@@ -1442,10 +1442,10 @@ test('DELETE tenant by an admin is rejected with FORBIDDEN (owner only)', async 
 // the card + rule/branding context).
 // ---------------------------------------------------------------------------
 test('stamp route best-effort-syncs the Google Wallet balance with the fresh stamp count', async () => {
-  const refreshed: Array<{ card: { id: string; stampCount: number }; context: Record<string, unknown> }> = [];
+  const refreshed: Array<{ card: { id: string; stampCount: number; revision: number }; context: Record<string, unknown> }> = [];
   const adapter = {
     async issue() { return { provider: 'google' as const, status: 'issued' as const, message: 'ok', artifact: 'a.b.c' }; },
-    async refresh(card: { id: string; stampCount: number }, _fields: string[], context?: unknown) {
+    async refresh(card: { id: string; stampCount: number; revision: number }, _fields: string[], context?: unknown) {
       refreshed.push({ card, context: (context ?? {}) as Record<string, unknown> });
       return { provider: 'google' as const, status: 'issued' as const, message: 'ok' };
     },
@@ -1476,7 +1476,7 @@ test('stamp route best-effort-syncs the Google Wallet balance with the fresh sta
     expect(body.data).toEqual(EXPECTED_STAMP_DATA);
     // Wallet sync: exactly one refresh with the NEW stamp count and the rule/branding context.
     expect(refreshed).toHaveLength(1);
-    expect(refreshed[0].card).toEqual({ id: 'card-1', stampCount: 4 });
+    expect(refreshed[0].card).toEqual({ id: 'card-1', stampCount: 4, revision: 3 });
     expect(refreshed[0].context.stampRequired).toBe(5);
     expect(refreshed[0].context.rewardTitle).toBe('Prämie');
     expect((refreshed[0].context.branding as { cardTitle: string }).cardTitle).toBe('StempelPass Demo');
@@ -1484,10 +1484,10 @@ test('stamp route best-effort-syncs the Google Wallet balance with the fresh sta
 });
 
 test('redeem route best-effort-syncs the wallet to the reset balance (0 stamps) and never fails the redeem', async () => {
-  const refreshed: Array<{ card: { id: string; stampCount: number } }> = [];
+  const refreshed: Array<{ card: { id: string; stampCount: number; revision: number } }> = [];
   const adapter = {
     async issue() { return { provider: 'google' as const, status: 'issued' as const, message: 'ok', artifact: 'a.b.c' }; },
-    async refresh(card: { id: string; stampCount: number }, _fields: string[], _context?: unknown) {
+    async refresh(card: { id: string; stampCount: number; revision: number }, _fields: string[], _context?: unknown) {
       refreshed.push({ card });
       return { provider: 'google' as const, status: 'issued' as const, message: 'ok' };
     },
@@ -1514,7 +1514,7 @@ test('redeem route best-effort-syncs the wallet to the reset balance (0 stamps) 
     expect(body.data).toEqual({ rewardId: 'reward-1', status: 'redeemed' });
     // Wallet sync: exactly one refresh with the RESET balance (0).
     expect(refreshed).toHaveLength(1);
-    expect(refreshed[0].card).toEqual({ id: 'card-1', stampCount: 0 });
+    expect(refreshed[0].card).toEqual({ id: 'card-1', stampCount: 0, revision: 3 });
   } finally { restore(); }
 });
 
@@ -1726,5 +1726,37 @@ test('PUT pilot rejects a non-https logoUrl with 400 INVALID_PILOT_CONFIGURATION
     expect(ok.status).toBe(200);
     const empty = await fetchHandler(new Request(url, { method: 'PUT', headers: authedHeaders(), body: JSON.stringify({ ...baseBody, logoUrl: '' }) }));
     expect(empty.status).toBe(200);
+  });
+});
+// ---------------------------------------------------------------------------
+// Wallet stamp-raster route (Owner-Entscheid 2026-10-18): GET /wallet/grid/:uuid.png
+// ---------------------------------------------------------------------------
+const GRID_UUID = '11111111-2222-3333-4444-555555555555';
+test('wallet grid route: 200 image/png with immutable cache headers', async () => {
+  const pool = new FakePool([
+    { match: contains('card_grid_display'), rows: [{ revision: 3, stampCount: 4, stampsRequired: 10, primaryColor: '#155e75', secondaryColor: null, rewardIssued: false }] },
+  ]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://grid.test/wallet/grid/${GRID_UUID}.png?ts=3`));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('image/png');
+    expect(res.headers.get('cache-control')).toBe('public, max-age=31536000, immutable');
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+    const body = Buffer.from(await res.arrayBuffer());
+    expect(body.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))).toBe(true);
+  });
+});
+test('wallet grid route: unknown card answers 404 CARD_NOT_FOUND', async () => {
+  await runWith(new FakePool([]), async () => {
+    const res = await fetchHandler(new Request(`http://grid.test/wallet/grid/${GRID_UUID}.png?ts=3`));
+    expect(res.status).toBe(404);
+    const body = (await res.json()) as { data: { error: string } };
+    expect(body.data.error).toBe('CARD_NOT_FOUND');
+  });
+});
+test('wallet grid route: malformed card id answers 404 without touching the DB', async () => {
+  await runWith(new FakePool([]), async () => {
+    const res = await fetchHandler(new Request('http://grid.test/wallet/grid/not-a-card-uuid.png'));
+    expect(res.status).toBe(404);
   });
 });
