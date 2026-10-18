@@ -165,7 +165,7 @@ export class CardRepository {
    */
   async configurePilot(tenantId:string, actorUserId:string, input:{planCode:'up_to_500'|'up_to_1000';cardTitle:string;cardText:string;primaryColor:string;secondaryColor:string;iconAssetId?:string;logoAssetId?:string;logoUrl?:string;stampsRequired:number;rewardTitle:string;rewardDescription:string}) {
     const limit = input.planCode === 'up_to_500' ? 500 : input.planCode === 'up_to_1000' ? 1000 : 0;
-    if (!limit || !/^#[0-9a-f]{6}$/i.test(input.primaryColor) || !/^#[0-9a-f]{6}$/i.test(input.secondaryColor) || !Number.isInteger(input.stampsRequired) || input.stampsRequired < 1 || input.stampsRequired > 100 || !input.cardTitle.trim() || !input.rewardTitle.trim()) throw new Error('INVALID_PILOT_CONFIGURATION');
+    if (!limit || !/^#[0-9a-f]{6}$/i.test(input.primaryColor) || !/^#[0-9a-f]{6}$/i.test(input.secondaryColor) || !Number.isInteger(input.stampsRequired) || input.stampsRequired < 1 || input.stampsRequired > 100 || !input.cardTitle.trim() || !input.rewardTitle.trim() || (input.logoUrl !== undefined && input.logoUrl.trim() !== '' && !/^https:\/\/[^\s]+$/i.test(input.logoUrl.trim()))) throw new Error('INVALID_PILOT_CONFIGURATION');
     return this.transaction(tenantId, async db => {
       const current=await db.query<{customer_limit:number}>('select customer_limit from tenants where id=$1 and status=$2 for update',[tenantId,'active']); if(!current.rows[0]) throw new Error('TENANT_NOT_FOUND');
       const used=await db.query<{count:string}>('select count(distinct customer_id) from cards where tenant_id=$1 and status=$2',[tenantId,'active']); if(Number(used.rows[0]?.count||0)>limit) throw new Error('PLAN_LIMIT_BELOW_USAGE');

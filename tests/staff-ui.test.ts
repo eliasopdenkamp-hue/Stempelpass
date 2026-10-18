@@ -1,6 +1,6 @@
 import { test, expect } from 'bun:test';
 import { CardRepository, type DbPool, type TxClient } from '../src/repository';
-import { hashSessionToken, randomToken, stampLimiter } from '../src/security';
+import { hashSessionToken, randomToken, redeemLimiter, stampLimiter } from '../src/security';
 import { walletAdapter } from '../src/wallet';
 import { createCipheriv, createHash, randomBytes } from 'node:crypto';
 
@@ -714,10 +714,38 @@ test('POST staff stamp without a card id is rejected with CARD_FIELDS_REQUIRED',
   });
 });
 
+test('POST staff stamp quantity matches the API route: integers pass through, non-integer numeric and non-numeric values become 1', async () => {
+  stampLimiter.clear();
+  const pool = new FakePool(stampFlowHandlers());
+  await runWith(pool, async () => {
+    const lastStampedQuantity = () => {
+      const inserts = pool.queries.filter(q => q.sql.startsWith('insert into stamp_events'));
+      const last = inserts[inserts.length - 1];
+      return last?.params[3];
+    };
+    const stamp = (quantity: string) => fetchHandler(new Request(`http://test.local/staff/${TENANT}/stamp`, {
+      method: 'POST',
+      headers: authedHeaders(),
+      body: new URLSearchParams({ cardId: CARD, quantity }),
+    }));
+    // Integer passes through unchanged.
+    const intRes = await stamp('3');
+    expect(intRes.status).toBe(200);
+    expect(lastStampedQuantity()).toBe(3);
+    // Non-integer numeric ("3.5") and non-numeric ("abc") both fall back to 1 —
+    // the shared Number.isInteger gate (same as the tenant API stamps route).
+    for (const bad of ['3.5', 'abc']) {
+      const res = await stamp(bad);
+      expect(res.status).toBe(200);
+      expect(lastStampedQuantity()).toBe(1);
+    }
+  });
+});
 // ---------------------------------------------------------------------------
 // (5) POST /staff/:tenantId/redeem
 // ---------------------------------------------------------------------------
 test('POST staff redeem issues the redemption and rotates the session', async () => {
+  redeemLimiter.clear();
   const pool = new FakePool([
     ...sessionHandlers(validSession),
     { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed', card_id: CARD }] },
@@ -749,6 +777,7 @@ test('POST staff redeem issues the redemption and rotates the session', async ()
 });
 
 test('POST staff redeem of an already-redeemed reward answers a friendly 409 without rotation', async () => {
+  redeemLimiter.clear();
   const pool = new FakePool([
     ...sessionHandlers(validSession),
     { match: contains('update rewards set status'), rows: [] },
@@ -820,6 +849,7 @@ test('POST staff stamp: urlencoded form body still stamps when req.formData()/re
 });
 
 test('POST staff redeem: urlencoded form body redeems, double redemption stays 409 when req.formData()/req.text() are broken (Vercel regression)', async () => {
+  redeemLimiter.clear();
   const successPool = new FakePool([
     ...sessionHandlers(validSession),
     { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed', card_id: CARD }] },
@@ -936,6 +966,7 @@ test('POST staff stamp with the UI JSON payload (raw card token) resolves via to
 });
 
 test('POST staff redeem with the UI JSON payload issues the redemption and rotates the session', async () => {
+  redeemLimiter.clear();
   const pool = new FakePool([
     ...sessionHandlers(validSession),
     { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed', card_id: CARD }] },
@@ -963,6 +994,7 @@ test('POST staff redeem with the UI JSON payload issues the redemption and rotat
 });
 
 test('POST staff redeem with the UI JSON payload: second redemption stays 409 REWARD_ALREADY_REDEEMED', async () => {
+  redeemLimiter.clear();
   const pool = new FakePool([
     ...sessionHandlers(validSession),
     { match: contains('update rewards set status'), rows: [] },
@@ -1037,6 +1069,7 @@ test('production chain: legacy urlencoded req (object body, no rawBody) → adap
 });
 
 test('production chain: legacy urlencoded redeem req (object body, no rawBody) → adapter → fetchHandler redeems 200, second 409', async () => {
+  redeemLimiter.clear();
   const successPool = new FakePool([
     ...sessionHandlers(validSession),
     { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed' }] },
@@ -1492,6 +1525,7 @@ test('POST staff stamp resolves a card TOKEN and syncs the wallet for the resolv
 });
 
 test('POST staff redeem best-effort-syncs the wallet to the RESET balance (0 stamps)', async () => {
+  redeemLimiter.clear();
   const refreshed: Array<{ card: { id: string; stampCount: number } }> = [];
   const adapter = walletSyncAdapter(refreshed as never);
   const factory = (() => adapter) as unknown as typeof walletAdapter;

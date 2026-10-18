@@ -1,6 +1,6 @@
 import { test, expect } from 'bun:test';
 import { CardRepository, type DbPool, type TxClient } from '../src/repository';
-import { cardResolveLimiter, hashPassword, hashSessionToken, loginAccountLimiter, loginIpLimiter, randomToken } from '../src/security';
+import { cardCreateLimiter, cardResolveLimiter, hashPassword, hashSessionToken, loginAccountLimiter, loginIpLimiter, randomToken, redeemLimiter, stampLimiter } from '../src/security';
 import { walletAdapter } from '../src/wallet';
 import { zxingSource, zxingSourceStats } from '../src/vendor-assets.js';
 
@@ -1534,4 +1534,197 @@ test('GET /vendor/zxing.min.js serves the client-side decoder (no auth, no DB)',
   // browser gets, pinned against the generated constant.
   expect(body).toBe(zxingSource());
   expect(Buffer.byteLength(body, 'utf8')).toBe(zxingSourceStats().bytes);
+});
+// ---------------------------------------------------------------------------
+// (16) Pre-launch security audit (2026-10-18): redeem/card-create rate limits,
+//      INVALID_JSON handling, quantity semantics and the logoUrl https guard.
+//      Each test clears its limiter first and exercises a dedicated actor
+//      where needed, so the shared TENANT:USER_ID budgets of the tests above
+//      stay untouched.
+// ---------------------------------------------------------------------------
+const USER_2 = '44444444-4444-4444-8444-444444444445';
+const USER_3 = '44444444-4444-4444-8444-444444444446';
+const SESSION_2 = randomToken();
+const SESSION_3 = randomToken();
+const HASH_2 = hashSessionToken(SESSION_2);
+const HASH_3 = hashSessionToken(SESSION_3);
+/** Session handlers resolving three actors (fixture USER, USER_2, USER_3) so
+ *  per-actor+tenant rate-limit keys can be exercised in isolation. */
+function multiActorSessionHandlers(): FakeHandler[] {
+  return [
+    {
+      match: contains('resolve_session_user'),
+      rows: (_sql, params) => params[0] === SESSION_HASH ? [{ user_id: USER_ID }]
+        : params[0] === HASH_2 ? [{ user_id: USER_2 }]
+        : params[0] === HASH_3 ? [{ user_id: USER_3 }] : [],
+    },
+    {
+      match: contains('from sessions'),
+      rows: (_sql, params) => {
+        if (params[0] === SESSION_HASH) return [sessionRow()];
+        if (params[0] === HASH_2) {
+          // Same actor on a second tenant (tenant isolation probe).
+          return params[2] === OTHER_TENANT
+            ? [sessionRow({ id: 'sess-2', user_id: USER_2, tenant_id: OTHER_TENANT })]
+            : [sessionRow({ id: 'sess-2', user_id: USER_2 })];
+        }
+        if (params[0] === HASH_3) return [sessionRow({ id: 'sess-3', user_id: USER_3 })];
+        return [];
+      },
+    },
+    { match: contains('update sessions set revoked_at=now() where token_hash'), rows: [] },
+    { match: contains('insert into sessions'), rows: [] },
+  ];
+}
+function headersFor(token: string): Headers {
+  return new Headers({
+    cookie: `__Host-sp_session=${token}`,
+    'x-csrf-token': CSRF_VALUE,
+    'content-type': 'application/json',
+  });
+}
+const REDEEM_HANDLERS = [
+  { match: contains('update rewards set status'), rows: [{ id: 'reward-1', status: 'redeemed', card_id: 'card-1' }] },
+  { match: contains('update cards set stamp_count=0'), rows: [{ id: 'card-1', stampCount: 0, revision: 3 }] },
+];
+const CARD_CREATE_HANDLERS = [
+  { match: contains('from tenants'), rows: [{ customer_limit: 500 }] },
+  { match: contains('from customers'), rows: [{ id: CUSTOMER }] },
+  { match: contains('count(distinct customer_id)'), rows: [{ count: '0' }] },
+  { match: contains('from stamp_rules'), rows: [{ id: RULE }] },
+  { match: contains('insert into cards'), rows: [{ id: 'card-1', ruleId: RULE, stampCount: 0, revision: 1 }] },
+];
+test('redeem is limited to 10/minute per actor+tenant: the 11th redeem in the same minute is 429 RATE_LIMITED and other keys stay isolated', async () => {
+  redeemLimiter.clear();
+  const pool = new FakePool([...multiActorSessionHandlers(), ...REDEEM_HANDLERS]);
+  await runWith(pool, async () => {
+    const url = (t: string) => `http://test.local/api/tenants/${t}/rewards/reward-1/redeem`;
+    // First 10 redeems under the same actor+tenant budget succeed.
+    for (let i = 0; i < 10; i++) {
+      const res = await fetchHandler(new Request(url(TENANT), { method: 'POST', headers: headersFor(SESSION_TOKEN) }));
+      expect(res.status).toBe(200);
+    }
+    // The 11th redeem in the same fixed 60s window is rejected up front.
+    const blocked = await fetchHandler(new Request(url(TENANT), { method: 'POST', headers: headersFor(SESSION_TOKEN) }));
+    expect(blocked.status).toBe(429);
+    expect(((await blocked.json()) as { data: { error: string } }).data.error).toBe('RATE_LIMITED');
+    // Rejection happens before any database work: no additional redeem write.
+    const writes = pool.queries.filter(q => q.sql.includes('update rewards set status'));
+    expect(writes).toHaveLength(10);
+    // Different actor, same tenant → independent budget.
+    const otherActor = await fetchHandler(new Request(url(TENANT), { method: 'POST', headers: headersFor(SESSION_2) }));
+    expect(otherActor.status).toBe(200);
+    // Same actor, different tenant → independent budget.
+    const otherTenant = await fetchHandler(new Request(url(OTHER_TENANT), { method: 'POST', headers: headersFor(SESSION_2) }));
+    expect(otherTenant.status).toBe(200);
+  });
+});
+test('card creation is limited to 30/minute per actor+tenant: the 31st create in the same minute is 429 RATE_LIMITED', async () => {
+  cardCreateLimiter.clear();
+  const pool = new FakePool([...multiActorSessionHandlers(), ...CARD_CREATE_HANDLERS]);
+  await runWith(pool, async () => {
+    const url = `http://test.local/api/tenants/${TENANT}/cards`;
+    const body = JSON.stringify({ customerId: CUSTOMER, ruleId: RULE });
+    for (let i = 0; i < 30; i++) {
+      const res = await fetchHandler(new Request(url, { method: 'POST', headers: headersFor(SESSION_TOKEN), body }));
+      expect(res.status).toBe(201);
+    }
+    const blocked = await fetchHandler(new Request(url, { method: 'POST', headers: headersFor(SESSION_TOKEN), body }));
+    expect(blocked.status).toBe(429);
+    expect(((await blocked.json()) as { data: { error: string } }).data.error).toBe('RATE_LIMITED');
+    // No card row was written for the rejected create.
+    const inserts = pool.queries.filter(q => q.sql.startsWith('insert into cards'));
+    expect(inserts).toHaveLength(30);
+    // A different actor keeps an independent budget.
+    const probe = await fetchHandler(new Request(url, { method: 'POST', headers: headersFor(SESSION_2), body }));
+    expect(probe.status).toBe(201);
+  });
+});
+test('a malformed JSON body on a JSON POST route answers 400 INVALID_JSON (never a 500) and writes nothing', async () => {
+  cardCreateLimiter.clear();
+  const pool = new FakePool([...sessionHandlers(validSession)]);
+  await runWith(pool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}/cards`, {
+      method: 'POST',
+      headers: authedHeaders(),
+      body: '{"customerId":"22222222-2222-4222-8222-222222222222","ruleId":"33333333-3333-4333-8333-333333333333","oops"',
+    }));
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { data: { error: string } };
+    expect(body.data.error).toBe('INVALID_JSON');
+    // The parser detail is never echoed and no card row is written.
+    expect(JSON.stringify(body)).not.toContain('oops');
+    expect(pool.queries.some(q => q.sql.startsWith('insert into cards'))).toBe(false);
+  });
+  // Same contract on the pilot route (owner role, so the parse happens).
+  const ownerPool = new FakePool([...sessionHandlers(() => [sessionRow({ role: 'owner' })])]);
+  await runWith(ownerPool, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}/pilot`, {
+      method: 'PUT', headers: authedHeaders(), body: '{not json',
+    }));
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { data: { error: string } }).data.error).toBe('INVALID_JSON');
+  });
+});
+test('API stamp quantity matches the staff semantics: integers pass through, non-integer numeric and non-numeric values become 1', async () => {
+  stampLimiter.clear();
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('from stamp_events'), rows: [] }, // no replay
+    { match: contains('from cards where'), rows: [{ id: 'card-1', stampCount: 3, revision: 2, ruleId: RULE }] },
+    { match: contains('insert into stamp_events'), rows: [] },
+    { match: contains('update cards set stamp_count'), rows: [{ id: 'card-1', stampCount: 4, revision: 3 }] },
+    { match: contains('from stamp_rules'), rows: [{ id: RULE, stamps_required: 1 }] },
+    { match: contains('insert into rewards'), rows: [{ id: 'reward-1', status: 'issued' }] },
+  ]);
+  await runWith(pool, async () => {
+    const url = `http://test.local/api/tenants/${TENANT}/cards/card-1/stamps`;
+    const lastStampedQuantity = () => {
+      const inserts = pool.queries.filter(q => q.sql.startsWith('insert into stamp_events'));
+      const last = inserts[inserts.length - 1];
+      return last?.params[3];
+    };
+    // Integer passes through unchanged.
+    const intRes = await fetchHandler(new Request(url, { method: 'POST', headers: authedHeaders(), body: JSON.stringify({ quantity: 3 }) }));
+    expect(intRes.status).toBe(200);
+    expect(lastStampedQuantity()).toBe(3);
+    // Non-integer numeric ("3.5") and non-numeric ("abc") both fall back to 1 —
+    // the Number.isInteger gate, exactly like the staff path.
+    for (const bad of ['3.5', 'abc']) {
+      const res = await fetchHandler(new Request(url, { method: 'POST', headers: authedHeaders(), body: JSON.stringify({ quantity: bad }) }));
+      expect(res.status).toBe(200);
+      expect(lastStampedQuantity()).toBe(1);
+    }
+  });
+});
+test('PUT pilot rejects a non-https logoUrl with 400 INVALID_PILOT_CONFIGURATION and accepts empty/https values', async () => {
+  const baseBody = {
+    planCode: 'up_to_500', cardTitle: 'Café Herz', cardText: 'Sammle Stempel',
+    primaryColor: '#155e75', secondaryColor: '#f8fafc', stampsRequired: 8,
+    rewardTitle: 'Gratis Kaffee', rewardDescription: '',
+  };
+  const ownerSession = () => [sessionRow({ role: 'owner' })];
+  const pool = new FakePool([
+    ...sessionHandlers(ownerSession),
+    { match: contains('from tenants'), rows: [{ customer_limit: 500 }] },
+    { match: contains('count(distinct customer_id)'), rows: [{ count: '0' }] },
+    { match: contains('update tenants set plan_code'), rows: [] },
+    { match: contains('insert into tenant_branding'), rows: [] },
+    { match: contains('insert into stamp_rules'), rows: [{ id: RULE }] },
+    { match: contains('insert into tenant_entry_points'), rows: [{ public_key: 'a'.repeat(32), join_path: `/join/${'a'.repeat(32)}` }] },
+    { match: contains('insert into audit_log'), rows: [] },
+  ]);
+  await runWith(pool, async () => {
+    const url = `http://test.local/api/tenants/${TENANT}/pilot`;
+    // http:// (non-TLS) is rejected before any write.
+    const bad = await fetchHandler(new Request(url, { method: 'PUT', headers: authedHeaders(), body: JSON.stringify({ ...baseBody, logoUrl: 'http://example.com/logo.png' }) }));
+    expect(bad.status).toBe(400);
+    expect(((await bad.json()) as { data: { error: string } }).data.error).toBe('INVALID_PILOT_CONFIGURATION');
+    expect(pool.queries.some(q => q.sql.includes('insert into tenant_branding'))).toBe(false);
+    // https:// and the empty string are accepted.
+    const ok = await fetchHandler(new Request(url, { method: 'PUT', headers: authedHeaders(), body: JSON.stringify({ ...baseBody, logoUrl: 'https://cdn.example.com/logo.png' }) }));
+    expect(ok.status).toBe(200);
+    const empty = await fetchHandler(new Request(url, { method: 'PUT', headers: authedHeaders(), body: JSON.stringify({ ...baseBody, logoUrl: '' }) }));
+    expect(empty.status).toBe(200);
+  });
 });

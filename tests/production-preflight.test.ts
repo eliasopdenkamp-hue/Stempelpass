@@ -330,7 +330,7 @@ describe('communicationCheck (hash secret required only when SMTP active)', () =
 // migrationCheck
 // ---------------------------------------------------------------------------
 
-describe('migrationCheck (filesystem only, exact 001–022 set)', () => {
+describe('migrationCheck (filesystem only, exact 001–023 set)', () => {
   test('real migrations directory: complete contiguous set', async () => {
     const check = await migrationCheck(join(ROOT, 'migrations'));
     expect(check.ok).toBe(true);
