@@ -1450,10 +1450,10 @@ test('POST staff branding with a stale/wrong CSRF is rejected before any write a
 // injected through the withTestDependencies walletFactory seam (same pattern
 // as the API-route refresh tests in tests/http-contract.test.ts §7b).
 // ---------------------------------------------------------------------------
-function walletSyncAdapter(refreshed: Array<{ card: { id: string; stampCount: number }; context: Record<string, unknown> }>, options: { failRefresh?: boolean } = {}) {
+function walletSyncAdapter(refreshed: Array<{ card: { id: string; stampCount: number; revision: number }; context: Record<string, unknown> }>, options: { failRefresh?: boolean } = {}) {
   return {
     async issue() { return { provider: 'google' as const, status: 'issued' as const, message: 'ok', artifact: 'a.b.c' }; },
-    async refresh(card: { id: string; stampCount: number }, _fields: string[], context?: unknown) {
+    async refresh(card: { id: string; stampCount: number; revision: number }, _fields: string[], context?: unknown) {
       if (options.failRefresh) throw new Error('GOOGLE_WALLET_REFRESH_FAILED_500');
       refreshed.push({ card, context: (context ?? {}) as Record<string, unknown> });
       return { provider: 'google' as const, status: 'issued' as const, message: 'ok' };
@@ -1468,7 +1468,7 @@ function runWithWallet(pool: DbPool, factory: typeof walletAdapter, fn: () => Pr
 
 test('POST staff stamp best-effort-syncs the Google Wallet balance with the STAMPED card id and the new count', async () => {
   stampLimiter.clear();
-  const refreshed: Array<{ card: { id: string; stampCount: number }; context: Record<string, unknown> }> = [];
+  const refreshed: Array<{ card: { id: string; stampCount: number; revision: number }; context: Record<string, unknown> }> = [];
   const adapter = walletSyncAdapter(refreshed);
   const factory = (() => adapter) as unknown as typeof walletAdapter;
   const pool = new FakePool(stampFlowHandlers());
@@ -1484,7 +1484,7 @@ test('POST staff stamp best-effort-syncs the Google Wallet balance with the STAM
     // derived from the card id the stamp write RETURNED (same card that was
     // stamped via resolveCardId → repository.stamp), with the NEW balance.
     expect(refreshed).toHaveLength(1);
-    expect(refreshed[0].card).toEqual({ id: CARD, stampCount: 4 });
+    expect(refreshed[0].card).toEqual({ id: CARD, stampCount: 4, revision: 3 });
     // Refresh context comes from cardWalletContext: rule + branding.
     expect(refreshed[0].context.stampRequired).toBe(5);
     expect(refreshed[0].context.rewardTitle).toBe('Kaffee');
@@ -1494,7 +1494,7 @@ test('POST staff stamp best-effort-syncs the Google Wallet balance with the STAM
 
 test('POST staff stamp resolves a card TOKEN and syncs the wallet for the resolved card (same id as the DB write)', async () => {
   stampLimiter.clear();
-  const refreshed: Array<{ card: { id: string; stampCount: number } }> = [];
+  const refreshed: Array<{ card: { id: string; stampCount: number; revision: number } }> = [];
   const adapter = walletSyncAdapter(refreshed as never);
   const factory = (() => adapter) as unknown as typeof walletAdapter;
   const pool = new FakePool([
@@ -1520,13 +1520,13 @@ test('POST staff stamp resolves a card TOKEN and syncs the wallet for the resolv
     // different card (PR #27 deploy report showed a mismatched card: DB 0 vs
     // Wallet 2 — this pins that the staff refresh hits the stamped card).
     expect(refreshed).toHaveLength(1);
-    expect(refreshed[0].card).toEqual({ id: CARD, stampCount: 4 });
+    expect(refreshed[0].card).toEqual({ id: CARD, stampCount: 4, revision: 3 });
   });
 });
 
 test('POST staff redeem best-effort-syncs the wallet to the RESET balance (0 stamps)', async () => {
   redeemLimiter.clear();
-  const refreshed: Array<{ card: { id: string; stampCount: number } }> = [];
+  const refreshed: Array<{ card: { id: string; stampCount: number; revision: number } }> = [];
   const adapter = walletSyncAdapter(refreshed as never);
   const factory = (() => adapter) as unknown as typeof walletAdapter;
   const pool = new FakePool([
@@ -1549,13 +1549,13 @@ test('POST staff redeem best-effort-syncs the wallet to the RESET balance (0 sta
     expect(await res.text()).toContain('Prämie erfolgreich eingelöst.');
     // Exactly one refresh with the reset balance and the reward's card id.
     expect(refreshed).toHaveLength(1);
-    expect(refreshed[0].card).toEqual({ id: CARD, stampCount: 0 });
+    expect(refreshed[0].card).toEqual({ id: CARD, stampCount: 0, revision: 0 });
   });
 });
 
 test('POST staff create-card best-effort-syncs the new card ({issuerId}.{newCardId}, balance 0)', async () => {
   process.env.SESSION_SECRET = TEST_SESSION_SECRET;
-  const refreshed: Array<{ card: { id: string; stampCount: number } }> = [];
+  const refreshed: Array<{ card: { id: string; stampCount: number; revision: number } }> = [];
   const adapter = walletSyncAdapter(refreshed as never);
   const factory = (() => adapter) as unknown as typeof walletAdapter;
   const pool = new FakePool(createCardFlowHandlers());
@@ -1572,7 +1572,7 @@ test('POST staff create-card best-effort-syncs the new card ({issuerId}.{newCard
     // Against a never-saved object the real adapter's refresh() is a graceful
     // 404 no-op; the call itself must still happen for every staff write path.
     expect(refreshed).toHaveLength(1);
-    expect(refreshed[0].card).toEqual({ id: NEW_CARD, stampCount: 0 });
+    expect(refreshed[0].card).toEqual({ id: NEW_CARD, stampCount: 0, revision: 1 });
   }).finally(() => { delete process.env.SESSION_SECRET; });
 });
 
