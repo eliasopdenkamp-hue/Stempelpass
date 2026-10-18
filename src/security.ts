@@ -182,6 +182,31 @@ export const loginAccountLimiter = new RateLimiter(5, 15 * 60_000, 50_000);
 export const cardResolveLimiter = new RateLimiter(60, 60_000, 50_000);
 export const stampLimiter = new RateLimiter(30, 60_000, 50_000);
 /**
+ * Redeem limiter (pre-deployment audit 2026-10-18, RISK #1). Reward
+ * redemption is a staff mutation (session + CSRF, second redeem on the same
+ * reward 409s — DB state bounds the damage), but the audit's check-list item
+ * "Stempel-/Prämien-Endpoints" requires the premium path to be rate limited
+ * exactly like the stamp path. Same key scheme as stampLimiter —
+ * `{tenantId}:{userId}` — so the budget is per actor+tenant and raw
+ * identifiers never become limiter keys. Lower budget than stamping
+ * (10/min): redemption is the rarer, more sensitive operation (it resets the
+ * card counter and starts a new collection round). Per-instance only (see
+ * RATE_LIMITING.md), like every limiter on the request path.
+ */
+export const redeemLimiter = new RateLimiter(10, 60_000, 50_000);
+/**
+ * Card-creation limiter (same audit; the card-register endpoints were the
+ * remaining unlimited mutating paths reachable by a plain staff session).
+ * POST /api/tenants/:id/cards and POST /staff/:id/cards both create a
+ * customer + card in one shot; the plan capacity check (CUSTOMER_LIMIT_REACHED
+ * at 500/1000) bounds the TOTAL, but a burst of creations between capacity
+ * checks would burn the tenant's customer quota, so a per-actor+tenant budget
+ * (30/min, same shape as stampLimiter/redeemLimiter) dampens it. Admin-only
+ * management routes (setStaff, deletes, pilot/branding) stay unlimited by
+ * design: they need owner/admin credentials and are naturally low-frequency.
+ */
+export const cardCreateLimiter = new RateLimiter(30, 60_000, 50_000);
+/**
  * Staff code-search limiter (GET /staff/:tenantId/search-code). The search is
  * authenticated (staff session, tenant-scoped RLS) — a per-actor+tenant budget
  * caps lookups without ever exposing a raw input to a limiter key: the key is
