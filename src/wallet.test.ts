@@ -518,3 +518,55 @@ test('ensureGoogleWalletClass syncs the class from env credentials and is a sile
   await ensureGoogleWalletClass(branded, { fetchFn: mockGoogleFetch(calls) });
   expect(calls.some(c => c.url.includes('/loyaltyClass/') && (c.init?.method ?? 'GET') === 'PATCH')).toBe(true);
 }));
+// ---------------------------------------------------------------------------
+// imageModulesData (Owner-Entscheid 2026-10-18): visible stamp-raster grid.
+// ---------------------------------------------------------------------------
+async function withGridEnv(url: string | undefined, fn: () => Promise<void>): Promise<void> {
+  const old = process.env.WALLET_IMAGE_BASE_URL;
+  try {
+    url === undefined ? delete process.env.WALLET_IMAGE_BASE_URL : process.env.WALLET_IMAGE_BASE_URL = url;
+    await fn();
+  } finally {
+    old === undefined ? delete process.env.WALLET_IMAGE_BASE_URL : process.env.WALLET_IMAGE_BASE_URL = old;
+  }
+}
+test('issue emits imageModulesData when WALLET_IMAGE_BASE_URL + card revision are present', async () => withCleanEnv(async () => withGridEnv('https://api.example.com', async () => {
+  const key = await Bun.$`openssl genrsa 2048 2>/dev/null`.text();
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const result = await classicAdapter(calls, key).issue(card, branding, { stampRequired: 10, rewardTitle: 'Gratis' });
+  expect(result.status).toBe('issued');
+  const payload = JSON.parse(Buffer.from(result.artifact!.split('.')[1], 'base64url').toString('utf8'));
+  expect(payload.payload.loyaltyObjects[0].imageModulesData).toEqual([{
+    id: 'stempel-raster',
+    mainImage: { sourceUri: { uri: 'https://api.example.com/wallet/grid/card-1.png?ts=2' }, contentDescription: '3/10 Stempel' },
+  }]);
+})));
+test('refresh PATCH replaces imageModulesData as a whole; absent without config', async () => {
+  await withCleanEnv(async () => {
+    const key = await Bun.$`openssl genrsa 2048 2>/dev/null`.text();
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const adapter = classicAdapter(calls, key);
+    await withGridEnv('https://api.example.com', async () => {
+      await adapter.refresh(card, ['loyaltyPoints', 'textModulesData', 'imageModulesData'], { branding, stampRequired: 10, rewardTitle: 'Gratis' });
+      const patch = calls.find(c => c.url === WALLET_PATCH_URL && c.init?.method === 'PATCH');
+      expect(patch).toBeDefined();
+      const body = JSON.parse(String(patch!.init.body)) as Record<string, unknown>;
+      expect(body.imageModulesData).toEqual([{
+        id: 'stempel-raster',
+        mainImage: { sourceUri: { uri: 'https://api.example.com/wallet/grid/card-1.png?ts=2' }, contentDescription: '3/10 Stempel' },
+      }]);
+    });
+    // Without the env var the PATCH body keeps the pre-18.10 shape (no image module).
+    const calls2: Array<{ url: string; init: RequestInit }> = [];
+    await classicAdapter(calls2, key).refresh(card, ['loyaltyPoints', 'textModulesData', 'imageModulesData'], { branding, stampRequired: 10, rewardTitle: 'Gratis' });
+    const patch2 = calls2.find(c => c.url === WALLET_PATCH_URL && c.init?.method === 'PATCH');
+    expect(JSON.parse(String(patch2!.init.body))).not.toHaveProperty('imageModulesData');
+  });
+});
+test('issue without WALLET_IMAGE_BASE_URL keeps the exact pre-18.10 object shape', async () => withCleanEnv(async () => withGridEnv(undefined, async () => {
+  const key = await Bun.$`openssl genrsa 2048 2>/dev/null`.text();
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const result = await classicAdapter(calls, key).issue(card, branding, { stampRequired: 10, rewardTitle: 'Gratis' });
+  const payload = JSON.parse(Buffer.from(result.artifact!.split('.')[1], 'base64url').toString('utf8'));
+  expect(payload.payload.loyaltyObjects[0].imageModulesData).toBeUndefined();
+})));

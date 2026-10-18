@@ -35,11 +35,11 @@ export interface PublicCardSource { card: Pick<Card, 'id' | 'stampCount' | 'revi
 export function toPublicCardResponse(result: PublicCardSource, tenantId: string): PublicCardResponse {
   return { cardId: result.card.id, tenantId, stampCount: result.card.stampCount, revision: result.card.revision, branding: safeBranding(result.branding), rule: result.rule, reward: result.reward, controllerName: result.controllerName ?? null, privacyContact: result.privacyContact ?? null };
 }
-export function toWalletCardView(card: Pick<Card, 'id' | 'stampCount'> & { cardCode?: string }): WalletCardView {
+export function toWalletCardView(card: Pick<Card, 'id' | 'stampCount'> & { cardCode?: string; revision?: number }): WalletCardView {
   // The code is emitted ONLY when the card actually has one: pre-backfill rows
   // (or fixtures without a code) keep the exact pre-021 object shape — the
   // wallet payload for an uncoded card must not change.
-  return { id: card.id, stampCount: card.stampCount, ...(card.cardCode ? { cardCode: card.cardCode } : {}) };
+  return { id: card.id, stampCount: card.stampCount, ...(card.cardCode ? { cardCode: card.cardCode } : {}), ...(card.revision !== undefined ? { revision: card.revision } : {}) };
 }
 
 /**

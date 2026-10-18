@@ -300,8 +300,8 @@ test('dbMigrate: applies all pending migrations via the pool and exits 0', async
   const { pool, applied } = fakeApplyingPool();
   const code = await dbMigrate({ DATABASE_URL: 'postgres://user:pass@example.invalid/db' }, () => pool);
   expect(code).toBe(0);
-  // The real migrations directory holds exactly 001–023; all applied once.
-  expect(applied.length).toBe(23);
+  // The real migrations directory holds exactly 001–024; all applied once.
+  expect(applied.length).toBe(24);
   // Audit tracking 2026-10-18: migration 023 ships the two query indices on
   // the hottest tenant-scoped tables and nothing else (no GRANTs, no table
   // changes, no policies) — the bodies must reach the pool verbatim.
@@ -310,6 +310,12 @@ test('dbMigrate: applies all pending migrations via the pool and exits 0', async
   expect(m023!).toContain('rewards_tenant_card_idx');
   expect(m023!).toContain('stamp_events_tenant_created_idx');
   expect(m023!).toContain('create index if not exists');
+  // Migration 024: the SECURITY DEFINER grid resolver must reach the pool.
+  const m024 = applied.find(sql => sql.includes('card_grid_display'));
+  expect(m024).toBeDefined();
+  expect(m024!).toContain('security definer');
+  expect(m024!).toContain('set search_path = pg_catalog');
+  expect(m024!).toContain('revoke all on function public.card_grid_display');
 });
 
 test('runMigrationsOnPool: rejects when the pool fails (caller maps to exit 1)', async () => {

@@ -66,6 +66,19 @@ Set these in the Vercel project/environment (never commit values):
 `MFA_ENCRYPTION_KEY` is optional until MFA is enabled; when enabled it must be a
 32-byte base64 or 64-character hex secret.
 
+## Wallet stamp-raster image (Owner-Entscheid 2026-10-18)
+- `WALLET_IMAGE_BASE_URL`: OPTIONAL absolute https base URL of this API backend
+  (no trailing slash). When set, every issued/refreshed Wallet pass embeds the
+  visible stamp grid as an `imageModulesData` image module pointing at
+  `{WALLET_IMAGE_BASE_URL}/wallet/grid/{cardUuid}.png?ts={revision}` — Google
+  fetches it without a session, so the route is public but rate-limited and
+  returns only aggregate display data (never PII). When unset, the pass keeps
+  the exact pre-18.10 shape (graceful no-op). Migration 024
+  (`card_grid_display`) must be applied before the route can resolve cards.
+- The image itself is rendered by `src/wallet-grid.ts` (dependency-free PNG
+  encoder); the URL switches on every stamp/redeem via the card revision, so
+  the `Cache-Control: public, max-age=31536000, immutable` header is safe.
+
 ## Google Wallet on Vercel (keyless, recommended)
 
 The preferred path needs **no service-account JSON key**. It uses Vercel OIDC

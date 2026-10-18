@@ -58,6 +58,18 @@ export interface StaffDashboardCard { id: string; customerRef: string | null; /*
  * returns. Used by findByCardCode, findCardById and resolveStampTarget.
  */
 export type StaffSearchCard = StaffDashboardCard & { stampsRequired: number };
+/** Auth-free display data for the Wallet stamp-raster PNG (migration 024
+ *  resolver public.card_grid_display). Strictly aggregate: counts, colors,
+ *  reward-ready flag and the monotonically increasing card revision (used as
+ *  the image URL's cache-buster). Never customer/tenant/token/card-code. */
+export interface GridContext {
+  revision: number;
+  stampCount: number;
+  stampsRequired: number;
+  primaryColor: string | null;
+  secondaryColor: string | null;
+  rewardIssued: boolean;
+}
 export interface StaffDashboardEvent { id: string; cardId: string; customerRef: string | null; quantity: number; createdAt: string | null; }
 export interface StaffDashboardData {
   tenant: { id: string; legalName: string | null; planCode: string; customerLimit: number; usedCards: number } | null;
@@ -260,6 +272,30 @@ export class CardRepository {
    * never a full tenant row.
    */
   async cardWalletContext(tenantId:string,cardId:string):Promise<{branding:Branding|null;rule:{stampsRequired:number;rewardTitle:string}|null;cardCode:string|null}>{return this.transaction(tenantId,async db=>{const c=(await db.query<{ruleId:string;cardCode:string|null}>('select rule_id as "ruleId", card_code as "cardCode" from cards where tenant_id=$1 and id=$2 and deleted_at is null',[tenantId,cardId])).rows[0];if(!c)return {branding:null,rule:null,cardCode:null};const brandingRow=(await db.query<{cardTitle:string;cardText:string;primaryColor:string;secondaryColor:string;logoUrl:string|null;version:number}>('select card_title as "cardTitle",card_text as "cardText",primary_color as "primaryColor",secondary_color as "secondaryColor",logo_url as "logoUrl",version from tenant_branding where tenant_id=$1',[tenantId])).rows[0]??null;const branding:Branding|null=brandingRow?{cardTitle:brandingRow.cardTitle,cardText:brandingRow.cardText,primaryColor:brandingRow.primaryColor,secondaryColor:brandingRow.secondaryColor,logoUrl:brandingRow.logoUrl??undefined,version:brandingRow.version}:null;const rule=(await db.query<{stampsRequired:number;rewardTitle:string}>('select stamps_required as "stampsRequired",reward_title as "rewardTitle" from stamp_rules where id=$1 and tenant_id=$2',[c.ruleId,tenantId])).rows[0]??null;return {branding,rule,cardCode:c.cardCode??null};});}
+  /**
+   * Auth-free display data for GET /wallet/grid/:cardUuid.png (Owner-Entscheid
+   * 2026-10-18). Runs through the SECURITY DEFINER resolver
+   * public.card_grid_display (migration 024) because the unauthenticated
+   * Google-image fetch has no tenant context and RLS gates direct reads on
+   * app.tenant_id. Returns ONLY aggregate display values (counts, colors,
+   * reward-ready, revision) — never customer/tenant/token/card-code data.
+   * Explicit own transaction on a pooled connection (begin/select/commit),
+   * mirroring auth(): no app.tenant_id is set — the resolver does not need it.
+   */
+  async gridContext(cardId: string): Promise<GridContext | null> {
+    const db = await this.pool.connect();
+    try {
+      await db.query('begin');
+      const rows = await db.query<GridContext>('select revision, stamp_count as "stampCount", stamps_required as "stampsRequired", primary_color as "primaryColor", secondary_color as "secondaryColor", reward_issued as "rewardIssued" from public.card_grid_display($1::uuid)', [cardId]);
+      await db.query('commit');
+      return rows.rows[0] ?? null;
+    } catch (error) {
+      try { await db.query('rollback'); } catch { /* preserve the original error */ }
+      throw error;
+    } finally {
+      db.release();
+    }
+  }
   /** Revoke all of a user's sessions (login bootstrap). Runs under app.user_id RLS context. */
   async revokeSessions(userId:string,exceptHash?:string){return this.userTransaction(userId,async db=>{await db.query('update sessions set revoked_at=now() where user_id=$1 and revoked_at is null and ($2 is null or token_hash<>$2)',[userId,exceptHash??null]);})}
   /** Revoke one session by token hash (logout/rotation). Runs under app.user_id RLS context. */

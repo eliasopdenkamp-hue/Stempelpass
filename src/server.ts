@@ -11,6 +11,7 @@ import { qrSvgDataUri } from './qr.js';
 import { vendorZxingResponse } from './vendor-assets.js';
 import { DEFAULT_PRIMARY_CARD_COLOR, DEFAULT_SECONDARY_CARD_COLOR, joinPageHtml, safeBranding, toPublicCardResponse, toWalletCardView } from './public-card.js';
 import { publicHealthResponse } from './health.js';
+import { renderStampGridPng } from './wallet-grid.js';
 import { codeSearchEmptyHtml, codeSearchResultHtml, loginPage, resetPasswordPage, resetRequestPage, resetTokenInvalidPage, tenantChooserPage, noTenantPage, dashboardPage, staffErrorPage, type DashboardView } from './staff-ui.js';
 import { SmtpEmailAdapter, passwordResetEmailHtml, passwordResetEmailText } from './email.js';
 import { requireVerifiedMfaBootstrap } from './mfa-bootstrap.js';
@@ -154,7 +155,7 @@ async function rotate(a:{userId:string;token:string;mfaVerified:boolean}){if(!po
  * all errors are logged and suppressed. Logs carry only the error code
  * (mirroring revoke()), never card ids or other identifiers.
  */
-async function syncWalletBalance(tenantId:string,card:{id:string;stampCount:number},oidcToken:string|null):Promise<void>{
+async function syncWalletBalance(tenantId:string,card:{id:string;stampCount:number;revision?:number},oidcToken:string|null):Promise<void>{
   if(!repository)return;
   try{
     const ctx=await repository.cardWalletContext(tenantId,card.id);
@@ -162,8 +163,10 @@ async function syncWalletBalance(tenantId:string,card:{id:string;stampCount:numb
     // The card code travels into the Wallet refresh through the deterministic
     // loyaltyObject path (cardWalletContext reads card_code); existing saved
     // passes pick it up via this same refresh/sync path (PR #30) — no new
-    // mechanism, no new artifact column.
-    const result=await adapter.refresh(toWalletCardView({id:card.id,stampCount:card.stampCount,cardCode:ctx.cardCode??''}),['loyaltyPoints','textModulesData'],{
+    // mechanism, no new artifact column. The revision (bumped on every
+    // stamp/redeem) becomes the stamp-raster image URL's cache-busting ts —
+    // the image module is replaced with a fresh URL on every state change.
+    const result=await adapter.refresh(toWalletCardView({id:card.id,stampCount:card.stampCount,revision:card.revision??0,cardCode:ctx.cardCode??''}),['loyaltyPoints','textModulesData'],{
       branding:safeBranding(ctx.branding)??{cardTitle:'StempelPass',cardText:'',primaryColor:DEFAULT_PRIMARY_CARD_COLOR,secondaryColor:DEFAULT_SECONDARY_CARD_COLOR,version:1},
       stampRequired:ctx.rule?.stampsRequired??undefined,
       rewardTitle:ctx.rule?.rewardTitle??undefined,
@@ -482,7 +485,7 @@ async function handleStaffCreateCard(req:Request,tenantId:string,id:string):Prom
     // (0 for a brand-new card). The refresh here keeps the staff create path
     // uniform with stamp/redeem; against a never-saved object it is a graceful
     // 404 no-op inside refresh().
-    await syncWalletBalance(tenantId,{id:created.id,stampCount:created.stampCount??0},req.headers.get('x-vercel-oidc-token'));
+    await syncWalletBalance(tenantId,{id:created.id,stampCount:created.stampCount??0,revision:created.revision},req.headers.get('x-vercel-oidc-token'));
     const dash2=await repository.staffDashboard(tenantId);
     const stats=await repository.staffStats(tenantId);
     const origin=new URL(req.url).origin;
@@ -772,6 +775,24 @@ if(parts[0]==='api'&&!configured)throw new Error('CONFIGURATION_REQUIRED');
         if(parts[6]==='wallet'&&parts[7]==='google'&&parts[8]==='redirect'){const adapter=walletFactory('google',{oidcToken:req.headers.get('x-vercel-oidc-token')??undefined});const branding: Branding=safeBranding(result.branding) ?? {cardTitle:'StempelPass',cardText:'',primaryColor:DEFAULT_PRIMARY_CARD_COLOR,secondaryColor:DEFAULT_SECONDARY_CARD_COLOR,version:1};const rule: StampRule|null=result.rule;const value=await adapter.issue(toWalletCardView(result.card),branding,{stampRequired:rule?.stampsRequired,rewardTitle:rule?.rewardTitle});if(value.status!=='issued'||!value.artifact)throw new Error('WALLET_NOT_CONFIGURED');return new Response(null,{status:302,headers:{Location:`https://pay.google.com/gp/v/save/${encodeURIComponent(value.artifact)}`}});}
         if(parts[6]==='wallet'&&parts[7]==='google'){const artifact=walletAdapter('google',{oidcToken:req.headers.get('x-vercel-oidc-token')??undefined});const branding: Branding=safeBranding(result.branding) ?? {cardTitle:'StempelPass',cardText:'',primaryColor:DEFAULT_PRIMARY_CARD_COLOR,secondaryColor:DEFAULT_SECONDARY_CARD_COLOR,version:1};const rule: StampRule|null=result.rule;const value=await artifact.issue(toWalletCardView(result.card),branding,{stampRequired:rule?.stampsRequired,rewardTitle:rule?.rewardTitle});return json(value,200,id);}
         return json(toPublicCardResponse(result,parts[3]),200,id);}
+    // Public stamp-raster PNG for the Google Wallet pass image module
+    // (Owner-Entscheid 2026-10-18). NO auth: Google fetches the image with no
+    // session and no cookies — the payload is display-only aggregate data
+    // (stamp counts, rule threshold, tenant colors, reward-ready), never PII.
+    // The UUID-only lookup runs through the migration-024 SECURITY DEFINER
+    // resolver because RLS gates direct card reads on app.tenant_id which an
+    // unauthenticated fetch cannot set. Rate-limited like the other public
+    // card routes. The `?ts=` cache-buster is part of the URL (card revision,
+    // monotonic across stamps AND redeems), so the PNG is immutable per URL.
+    if(parts[0]==='wallet'&&parts[1]==='grid'&&parts.length===3&&parts[2]?.endsWith('.png')&&req.method==='GET'){
+      if(!repository||!cardResolveLimiter.allow(clientIpKey(req)))throw new Error(!repository?'DATABASE_REQUIRED':'RATE_LIMITED');
+      const cardId=parts[2].slice(0,-'.png'.length);
+      if(!UUID_RE.test(cardId))throw new Error('CARD_NOT_FOUND');
+      const grid=await repository.gridContext(cardId);
+      if(!grid)throw new Error('CARD_NOT_FOUND');
+      const png=renderStampGridPng({stampCount:grid.stampCount,stampsRequired:grid.stampsRequired,primaryColor:grid.primaryColor??undefined,secondaryColor:grid.secondaryColor??undefined,rewardReady:grid.rewardIssued});
+      return new Response(new Uint8Array(png),{status:200,headers:{'Content-Type':'image/png','Cache-Control':'public, max-age=31536000, immutable','X-Content-Type-Options':'nosniff'}});
+    }
     if(parts[0]==='card'&&parts.length===3&&req.method==='GET'){if(!repository||!cardResolveLimiter.allow(clientIpKey(req)))throw new Error(!repository?'DATABASE_REQUIRED':'RATE_LIMITED');const result=await repository.publicCard(parts[1],hashToken(parts[2]));if(!result)throw new Error('CARD_NOT_FOUND');const b: Branding=safeBranding(result.branding) ?? {cardTitle:'StempelPass',cardText:'',primaryColor:DEFAULT_PRIMARY_CARD_COLOR,secondaryColor:DEFAULT_SECONDARY_CARD_COLOR,version:1};const r: StampRule=result.rule ?? {id:'',tenantId:parts[1],name:'',stampsRequired:1,rewardTitle:'Prämie',rewardDescription:'',active:true,version:1};const esc=(v:unknown)=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]!));const progress=Math.min(100,Math.round((result.card.stampCount/Math.max(1,Number(r.stampsRequired||1)))*100));// Visible card code: same K-XXXXXX as the Google Wallet pass. The webcard is
     // already authenticated by the one-time card token in the URL; the code is a
     // second identifier for the SAME card and exposes nothing the token holder
