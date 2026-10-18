@@ -17,8 +17,16 @@
  * photo fallback UX.
  */
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
 import { normalizeScannedTarget, scanFieldHtml, scanModalHtml, staffScanScript } from '../src/staff-scan.js';
-import { zxingSourceStats } from '../src/vendor-assets.js';
+import { zxingSource, zxingSourceStats } from '../src/vendor-assets.js';
+import { ZXING_UMD_BYTES, ZXING_UMD_SHA256 } from '../src/vendor/zxing-umd.js';
+
+/** Read the (generated) vendor-assets.ts source for the no-runtime-fs pin. */
+const vendorAssetsSource = (): string =>
+  readFileSync(join(import.meta.dir, '..', 'src', 'vendor-assets.ts'), 'utf8');
 
 /** Evaluate the EXACT embedded function copy shipped in the page script. */
 function embeddedNormalize(): (raw: unknown) => string {
@@ -109,9 +117,29 @@ describe('scan modal + scan field markup', () => {
 });
 
 describe('vendor asset (client-side decoder, served via GET /vendor/zxing.min.js)', () => {
-  test('UMD bundle loaded, non-empty, exposes the ZXing global', () => {
+  test('embedded payload decodes to the exact UMD bytes and exposes the ZXing global', () => {
     const stats = zxingSourceStats();
+    // Exact byte count of the ORIGINAL minified UMD (pinned in the generated
+    // src/vendor/zxing-umd.ts) — not just a loose "> 100 KB" bound.
+    expect(stats.bytes).toBe(ZXING_UMD_BYTES);
     expect(stats.bytes).toBeGreaterThan(100_000);
     expect(stats.hasGlobal).toBe(true);
+  });
+
+  test('decoded payload matches the pinned SHA-256 (no hand-edit drift)', () => {
+    const decoded = Buffer.from(zxingSource(), 'utf8');
+    expect(createHash('sha256').update(decoded).digest('hex')).toBe(ZXING_UMD_SHA256);
+  });
+
+  test('vendor-assets.ts has NO runtime fs/node_modules access (PR #44 root cause pinned)', () => {
+    const source = vendorAssetsSource();
+    // The prose comment deliberately describes the PR #44 failure (it names
+    // readFileSync/require.resolve), so the pin targets the actual import
+    // vectors of a runtime-fs regression: node:fs and node:module. The
+    // BUILT-bundle anti-pattern check (verify-bundle, RUNTIME_FS_PATTERN
+    // anchored on .resolve('@zxing/…) covers the call itself.
+    expect(source).not.toContain('node:fs');
+    expect(source).not.toContain('node:module');
+    expect(source).not.toContain("from 'node:");
   });
 });
