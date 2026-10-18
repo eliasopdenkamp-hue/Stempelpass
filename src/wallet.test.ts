@@ -235,6 +235,10 @@ test('refresh PATCHes the loyaltyObject with the new balance and text module (mo
   // every refresh so the front number stays in sync (owner wish, backlog #4).
   expect(body.accountId).toBe('K-7F3D2A');
   expect(body.accountIdLabel).toBe('Kartennummer');
+  // Staff camera scan (2026-10-18): the CODE_128 barcode rides along with every
+  // refresh so the pass stays scannable at the register (explicit `barcode`
+  // field — Google renders a barcode ONLY from it, not from accountId).
+  expect(body.barcode).toEqual({ type: 'CODE_128', value: 'K-7F3D2A', alternateText: 'K-7F3D2A' });
   // Branding flows through to the object: progress module + cardText module;
   // the visible card code appears as its own Kartennummer module.
   expect(body.textModulesData).toEqual([
@@ -340,6 +344,9 @@ test('issue() embeds branding in the object model: tenant class id + progress an
   // part of the save-to-wallet object, not only the details text module.
   expect(obj.accountId).toBe('K-7F3D2A');
   expect(obj.accountIdLabel).toBe('Kartennummer');
+  // Staff camera scan: the save-to-wallet object also carries the scannable
+  // CODE_128 barcode of the same visible code (decision note 2026-10-17).
+  expect(obj.barcode).toEqual({ type: 'CODE_128', value: 'K-7F3D2A', alternateText: 'K-7F3D2A' });
   expect(obj.textModulesData).toEqual([
     { header: 'Café Herz', body: '3/10 Stempel · Gratis Kaffee' },
     { header: 'Kartennummer', body: 'K-7F3D2A' },
@@ -364,6 +371,7 @@ test('issue and refresh payloads omit accountId/accountIdLabel when the card has
   expect(obj.classId).toBe('123.tenant-1');
   expect(obj.accountId).toBeUndefined();
   expect(obj.accountIdLabel).toBeUndefined();
+  expect(obj.barcode).toBeUndefined();
   expect(obj.textModulesData).toEqual([
     { header: 'Café', body: '3/10 Stempel · Gratis' },
     { header: 'Café', body: 'Treuekarte' },

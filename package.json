@@ -25,6 +25,7 @@
   },
   "dependencies": {
     "@types/nodemailer": "^8.0.1",
+    "@zxing/library": "^0.23.0",
     "nodemailer": "^9.0.4",
     "postgres": "^3.4.9"
   }
