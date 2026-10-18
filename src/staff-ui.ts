@@ -14,6 +14,7 @@ import type { StaffDashboardCard, StaffDashboardEvent, StaffSearchCard, StaffSta
 import { DEFAULT_PRIMARY_CARD_COLOR, DEFAULT_SECONDARY_CARD_COLOR, safeCardColor } from './public-card.js';
 import { qrSvgDataUri } from './qr.js';
 import { formatCardCode } from './card-code.js';
+import { scanFieldHtml, scanModalHtml, staffScanScript } from './staff-scan.js';
 
 /** HTML-escape a dynamic value (same character set as the public webcard). */
 export function esc(v: unknown): string {
@@ -67,6 +68,21 @@ code{font-size:.8rem;background:#f1f5f9;padding:.1rem .35rem;border-radius:.3rem
 .sp-stamp-footer{display:contents}
 .sp-stamp-qty{width:5.5rem}
 .link-btn{color:#155e75;font-weight:600}
+/* Kamera-Scan (Staff): Feld-Wrapper (Input + Kamera-Button) und Overlay-Modal.
+ * Alles clientseitig — die Kamerabilder verlassen das Gerät nie. */
+.sp-scan-field{display:flex;gap:.5rem;align-items:center;flex:1;min-width:0}
+.sp-scan-field input{flex:1;min-width:0}
+button.sp-scan-btn{flex:none;width:3rem;min-width:3rem;height:3rem;padding:0;font-size:1.3rem;margin:0;min-height:44px;display:inline-flex;align-items:center;justify-content:center}
+.scan-modal{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#0f172a99;z-index:50;padding:1rem}
+.scan-modal[hidden]{display:none}
+.scan-modal-box{width:100%;max-width:26rem;background:#fff;border-radius:1.1rem;padding:1rem;box-shadow:0 20px 60px #0005}
+.scan-modal-head{display:flex;align-items:center;justify-content:space-between;gap:.5rem;margin-bottom:.6rem}
+.scan-modal-head strong{font-size:1.05rem;color:#172033}
+.scan-modal video{width:100%;aspect-ratio:1/1;object-fit:cover;background:#000;border-radius:.8rem;display:block}
+.scan-status{margin:.5rem 0;text-align:center;font-size:.9rem;color:#334155}
+.scan-modal-actions{display:flex;justify-content:center;margin:.25rem 0}
+label.scan-file-label{display:inline-flex;align-items:center;min-height:44px;padding:0 1.1rem;background:#fff;color:#155e75;border:1px solid #155e75;border-radius:.7rem;font-weight:600;cursor:pointer;font-size:.95rem}
+.scan-modal-actions input[type=file]{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
 @media(max-width:640px){
   body{padding:.9rem}
   .card{padding:1.1rem;border-radius:1rem}
@@ -112,6 +128,10 @@ code{font-size:.8rem;background:#f1f5f9;padding:.1rem .35rem;border-radius:.3rem
   .qr-card img{width:160px;height:160px}
   /* Alle Links in der Karte als Touch-Targets. */
   .card a{display:inline-block;min-height:44px;padding:.55rem 0;box-sizing:border-box}
+  /* Kamera-Scan (Staff, 2026-10-18): ≥44px Kamera-Button neben Stempel- und
+   * Suchfeld, festes Overlay mit Live-Sucher und Foto-Fallback. Alles wird
+   * clientseitig verarbeitet — keine Bild-Uploads. */
+  .sp-scan-btn{min-height:48px;width:3.1rem;min-width:3.1rem;font-size:1.35rem;padding:0}
 }
 `.trim();
 
@@ -738,24 +758,24 @@ ${tileActionHtml}</div>`;
   const stampForm = v.canStamp
     ? `<div class="sp-stamp">
 <form data-staff-form action="/staff/${esc(v.tenantId)}/stamp" method="post" class="row stamp-form" style="gap:.5rem;margin-top:.5rem">
-<input name="cardId" placeholder="Karten-ID, Kartencode (K-XXXXXX) oder Kunden-Token eingeben" required style="flex:1;margin:0" autocomplete="off">
+${scanFieldHtml('<input name="cardId" placeholder="Karten-ID, Kartencode (K-XXXXXX) oder Kunden-Token eingeben" required style="flex:1;min-width:0;margin:0" autocomplete="off">')}
 <div class="sp-stamp-footer">
 <input name="quantity" type="number" min="1" max="10" value="1" class="sp-stamp-qty" style="margin:0">
 <button type="submit" class="secondary sp-stamp-btn" style="margin:0">Stempel vergeben</button>
 </div>
 </form>
-<p class="hint">Karten-ID, Kartencode (K-XXXXXX) oder Kunden-Token eingeben — die passende Karte wird direkt gestempelt.</p>
+<p class="hint">Karten-ID, Kartencode (K-XXXXXX) oder Kunden-Token eingeben oder per Kamera scannen — die passende Karte wird direkt gestempelt.</p>
 </div>`
     : '<p class="meta">Diese Rolle kann keine Stempel vergeben oder Prämien einlösen.</p>';
   const codeSearchHtml = `<h2>Karte per Code finden</h2>
 <form id="sp-code-search" data-search-url="/staff/${esc(v.tenantId)}/search-code" autocomplete="off">
-<div class="row" style="gap:.5rem">
-<input id="sp-code-input" name="code" placeholder="Kartencode (K-XXXXXX), Karten-ID oder Kunden-Token" required style="flex:1;margin:0">
+<div class="row" style="gap:.5rem;align-items:center">
+${scanFieldHtml('<input id="sp-code-input" name="code" placeholder="Kartencode (K-XXXXXX), Karten-ID oder Kunden-Token" required style="flex:1;min-width:0;margin:0">')}
 <button type="submit" class="secondary" style="margin:0">Karte finden</button>
 </div>
 </form>
 <div id="sp-code-result"></div>
-<p class="hint">Kartencode (K-XXXXXX), Karten-ID oder Kunden-Token eingeben — die passende Karte erscheint direkt mit Stempel-Button.</p>`;
+<p class="hint">Kartencode (K-XXXXXX), Karten-ID oder Kunden-Token eingeben oder per Kamera scannen — die passende Karte erscheint direkt mit Stempel-Button.</p>`;
   const createCardButton = v.canStamp
     ? `<button type="button" class="secondary" data-action="create-card" data-url="/staff/${esc(v.tenantId)}/cards" style="margin:1.75rem 0 .5rem">Neue Karte anlegen</button>`
     : '';
@@ -777,5 +797,9 @@ ${codeSearchHtml}
 <table><thead><tr><th>Karte</th><th>Kunde</th><th>Stempel</th><th>Zeitpunkt</th></tr></thead><tbody>${eventRows}</tbody></table>
 </main>`,
     `<meta name="sp-csrf" content="${esc(v.csrf)}">`,
-    STAFF_SCRIPT);
+    // Scan modal (sibling of #sp-app → survives dashboard swaps, listeners
+    // bound once) + the camera scan script AFTER STAFF_SCRIPT (end of body —
+    // never <head>, live-verified 2026-09-23 position bug). Scan-only UI; all
+    // decoding happens on the device.
+    `${STAFF_SCRIPT}${scanModalHtml()}${staffScanScript()}`);
 }

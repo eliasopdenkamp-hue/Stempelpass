@@ -29,6 +29,14 @@ export interface LoyaltyObject {
   accountId?: string;
   /** Label rendered next to accountId on the card front ("Kartennummer"). */
   accountIdLabel?: string;
+  /**
+   * Scannable Code-128 barcode of the card code (staff camera scan at the
+   * register, decision note 2026-10-17). Explicit field — Google renders a
+   * barcode ONLY from `barcode`; without it the pass shows the accountId as a
+   * plain member-number line and there is nothing to scan. Identification
+   * only. Same display value K-XXXXXX; NEVER emitted for cards without a code.
+   */
+  barcode?: { type: 'CODE_128'; value: string; alternateText?: string };
 }
 export interface WalletAdapter { issue(card: WalletCardView, branding: Branding, context?: { stampRequired?: number; rewardTitle?: string }): Promise<WalletArtifact>; refresh(card: WalletCardView, changedFields: string[], context?: { branding?: Branding; stampRequired?: number; rewardTitle?: string }): Promise<WalletArtifact>; revoke(card: WalletCardView): Promise<void>; }
 /** Refresh context mirrors the issue() context plus the branding needed for the text module. */
@@ -217,9 +225,15 @@ export class GoogleWalletAdapter implements WalletAdapter {
       ? { accountId: formatCardCode(code), accountIdLabel: 'Kartennummer' }
       : {};
     if (code) modules.push({ header: 'Kartennummer', body: formatCardCode(code) });
+    // Scannable CODE_128 barcode of the same code (staff camera scan). Google
+    // renders a barcode ONLY from this explicit field; without it the pass has
+    // nothing to scan at the register. Identification only, like accountId.
+    const barcodeFront: Pick<LoyaltyObject, 'barcode'> | Record<string, never> = code
+      ? { barcode: { type: 'CODE_128', value: formatCardCode(code), alternateText: formatCardCode(code) } }
+      : {};
     const cardText = branding.cardText?.trim();
     if (cardText) modules.push({ header: title, body: cardText });
-    return { id: `${this.issuerId}.${card.id}`, classId, state: 'ACTIVE', loyaltyPoints: { balance: { int: card.stampCount } }, textModulesData: modules, ...accountFront };
+    return { id: `${this.issuerId}.${card.id}`, classId, state: 'ACTIVE', loyaltyPoints: { balance: { int: card.stampCount } }, textModulesData: modules, ...accountFront, ...barcodeFront };
   }
   async issue(card: WalletCardView, branding: Branding, context?: { stampRequired?: number; rewardTitle?: string }): Promise<WalletArtifact> {
     const classModel = this.classModelFor(branding);
@@ -263,6 +277,7 @@ export class GoogleWalletAdapter implements WalletAdapter {
       patchBody.accountId = model.accountId;
       patchBody.accountIdLabel = model.accountIdLabel;
     }
+    if (model.barcode) patchBody.barcode = model.barcode;
     const response = await this.fetchFn(
       `https://walletobjects.googleapis.com/walletobjects/v1/loyaltyObject/${encodeURIComponent(`${this.issuerId}.${card.id}`)}`,
       { method: 'PATCH', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(patchBody) },

@@ -165,6 +165,13 @@ function expectDashboardHtml(html: string) {
   expect(html).toContain(`name="sp-csrf" content="`);
   expect(html).toContain(`data-action="logout"`);
   expect(html).toContain('/staff/11111111-1111-4111-8111-111111111111/stamp');
+  // Kamera-Scan (2026-10-18): ≥44px camera button beside the inputs, the
+  // overlay modal, the inline scan script and the client-side decoder asset
+  // URL are all part of the dashboard page (no uploads, all on-device).
+  expect(html).toContain('sp-scan-btn');
+  expect(html).toContain('sp-scan-modal');
+  expect(html).toContain('/vendor/zxing.min.js');
+  expect(html).toContain('per Kamera scannen');
   // Statistics section (all roles see it, aggregates only).
   expect(html).toContain('<h2>Statistik</h2>');
   expect(html).toContain('Stempelaktivität als Verkaufsindikator.');

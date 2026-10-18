@@ -323,6 +323,11 @@ test('public card HTML shows the visible card code (K-XXXXXX) next to the balanc
     // rendered only to the token holder; the webcard never carries raw tokens,
     // customer ids or tenant/customer internals.
     expect(html).toContain('<strong>Kartennummer:</strong> <code>K-7F3D2A</code>');
+    // Staff camera scan: the webcard renders the same code as a QR (SVG data
+    // URI from the same qr.ts vendor as the join page) so customers can show
+    // something scannable even when the Wallet barcode is not visible.
+    expect(html).toContain('alt="QR-Code der Kartennummer"');
+    expect(html).toContain('src="data:image/svg+xml');
     expect(html).not.toContain('7F3D2A-without-prefix');
     expect(html).not.toContain('customerId');
     expect(html).not.toContain('publicTokenHash');
@@ -1510,4 +1515,16 @@ test('redeem route best-effort-syncs the wallet to the reset balance (0 stamps) 
     expect(refreshed).toHaveLength(1);
     expect(refreshed[0].card).toEqual({ id: 'card-1', stampCount: 0 });
   } finally { restore(); }
+});
+
+// ---------------------------------------------------------------------------
+// (7) Client-side decoder asset for the staff camera scan (2026-10-18).
+// ---------------------------------------------------------------------------
+test('GET /vendor/zxing.min.js serves the client-side decoder (no auth, no DB)', async () => {
+  const res = await fetchHandler(new Request('http://test.local/vendor/zxing.min.js'));
+  expect(res.status).toBe(200);
+  expect(res.headers.get('content-type')).toContain('application/javascript');
+  const body = await res.text();
+  expect(body.length).toBeGreaterThan(100_000);
+  expect(body).toContain('ZXing');
 });
