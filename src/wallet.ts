@@ -49,7 +49,7 @@ export interface LoyaltyObject {
    * configured AND the card carries a revision (the URL's cache-busting ts);
    * otherwise the pass keeps the exact pre-18.10 shape (graceful no-op).
    */
-  imageModulesData?: Array<{ id?: string; mainImage: { sourceUri: { uri: string }; contentDescription?: string } }>;
+  imageModulesData?: Array<{ id?: string; mainImage: { sourceUri: { uri: string }; contentDescription?: { defaultValue: { language: string; value: string } } } }>;
 }
 export interface WalletAdapter { issue(card: WalletCardView, branding: Branding, context?: { stampRequired?: number; rewardTitle?: string }): Promise<WalletArtifact>; refresh(card: WalletCardView, changedFields: string[], context?: { branding?: Branding; stampRequired?: number; rewardTitle?: string }): Promise<WalletArtifact>; revoke(card: WalletCardView): Promise<void>; }
 /** Refresh context mirrors the issue() context plus the branding needed for the text module. */
@@ -253,7 +253,7 @@ export class GoogleWalletAdapter implements WalletAdapter {
     // swaps in a fresh URL and Google's immutable cache stays correct.
     const gridBaseUrl = walletImageBaseUrl();
     const gridImage: LoyaltyObject['imageModulesData'] = gridBaseUrl && card.revision !== undefined
-      ? [{ id: 'stempel-raster', mainImage: { sourceUri: { uri: walletGridImageUrl(gridBaseUrl, card.id, card.revision) }, contentDescription: `${card.stampCount}/${context?.stampRequired ?? '?'} Stempel` } }]
+      ? [{ id: 'stempel-raster', mainImage: { sourceUri: { uri: walletGridImageUrl(gridBaseUrl, card.id, card.revision) }, contentDescription: { defaultValue: { language: 'de', value: `${card.stampCount}/${context?.stampRequired ?? '?'} Stempel` } } } }]
       : undefined;
     return {
       id: `${this.issuerId}.${card.id}`, classId, state: 'ACTIVE', loyaltyPoints: { balance: { int: card.stampCount } }, textModulesData: modules, ...accountFront, ...barcodeFront,
