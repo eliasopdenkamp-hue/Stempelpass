@@ -19,7 +19,15 @@ export interface LoyaltyObject {
   id: string;
   classId: string;
   state: 'ACTIVE' | 'INACTIVE';
-  loyaltyPoints: { balance: { int: number } };
+  /**
+   * Native points line shown on the card front (Owner-Entscheid 2026-10-19):
+   * `label` is a PLAIN STRING per the walletobjects v1 discovery document
+   * (LocalizedString lives in `localizedLabel`) — do NOT wrap label in
+   * { defaultValue: … }, Google rejects an object at a string field with 400
+   * INVALID_ARGUMENT (the exact mirror of the PR #48 contentDescription
+   * lesson). balance.int stays the stamp counter.
+   */
+  loyaltyPoints: { label: string; balance: { int: number } };
   textModulesData?: Array<{ header: string; body: string }>;
   /**
    * Card-FRONT account line (owner wish, backlog #4): Google Wallet renders
@@ -220,8 +228,16 @@ export class GoogleWalletAdapter implements WalletAdapter {
   }
   private objectModel(classId: string, card: WalletCardView, branding: Branding, context?: { stampRequired?: number; rewardTitle?: string }): LoyaltyObject {
     const title = branding.cardTitle?.trim() || 'StempelPass';
+    // Stamp progress (Owner-Entscheid 2026-10-19): the FIRST text module is the
+    // headline progress line "X/N Stempel" (stampCount vs stampRequired), the
+    // second names the reward — split from the previous single
+    // "X/N Stempel · <Prämien-Titel>" body so the progress sits at the top of
+    // the pass details. header/body are PLAIN STRINGS per the walletobjects v1
+    // discovery document (localizedHeader/localizedBody are the LocalizedString
+    // variants) — never wrap them in { defaultValue: … }.
     const modules: Array<{ header: string; body: string }> = [
-      { header: title, body: `${card.stampCount}/${context?.stampRequired ?? '?'} Stempel · ${context?.rewardTitle ?? 'Prämie'}` },
+      { header: title, body: `${card.stampCount}/${context?.stampRequired ?? '?'} Stempel` },
+      { header: title, body: `Prämie: ${context?.rewardTitle ?? 'Prämie'}` },
     ];
     // Visible card code (owner wish 2026-09-24): the pass shows the same
     // K-XXXXXX code as the webcard, so the register can read it off the phone.
@@ -256,7 +272,12 @@ export class GoogleWalletAdapter implements WalletAdapter {
       ? [{ id: 'stempel-raster', mainImage: { sourceUri: { uri: walletGridImageUrl(gridBaseUrl, card.id, card.revision) }, contentDescription: { defaultValue: { language: 'de', value: `${card.stampCount}/${context?.stampRequired ?? '?'} Stempel` } } } }]
       : undefined;
     return {
-      id: `${this.issuerId}.${card.id}`, classId, state: 'ACTIVE', loyaltyPoints: { balance: { int: card.stampCount } }, textModulesData: modules, ...accountFront, ...barcodeFront,
+      id: `${this.issuerId}.${card.id}`, classId, state: 'ACTIVE',
+      // Native points row on the card front (Owner-Entscheid 2026-10-19): the
+      // reliable counter "Stempel: X" — the grid PNG below is the visual bonus,
+      // NOT the primary source of truth. label is a plain string (discovery).
+      loyaltyPoints: { label: 'Stempel', balance: { int: card.stampCount } },
+      textModulesData: modules, ...accountFront, ...barcodeFront,
       ...(gridImage ? { imageModulesData: gridImage } : {}),
     };
   }
