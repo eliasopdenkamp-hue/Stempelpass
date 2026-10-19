@@ -538,7 +538,7 @@ test('issue emits imageModulesData when WALLET_IMAGE_BASE_URL + card revision ar
   const payload = JSON.parse(Buffer.from(result.artifact!.split('.')[1], 'base64url').toString('utf8'));
   expect(payload.payload.loyaltyObjects[0].imageModulesData).toEqual([{
     id: 'stempel-raster',
-    mainImage: { sourceUri: { uri: 'https://api.example.com/wallet/grid/card-1.png?ts=2' }, contentDescription: '3/10 Stempel' },
+    mainImage: { sourceUri: { uri: 'https://api.example.com/wallet/grid/card-1.png?ts=2' }, contentDescription: { defaultValue: { language: 'de', value: '3/10 Stempel' } } },
   }]);
 })));
 test('refresh PATCH replaces imageModulesData as a whole; absent without config', async () => {
@@ -553,7 +553,7 @@ test('refresh PATCH replaces imageModulesData as a whole; absent without config'
       const body = JSON.parse(String(patch!.init.body)) as Record<string, unknown>;
       expect(body.imageModulesData).toEqual([{
         id: 'stempel-raster',
-        mainImage: { sourceUri: { uri: 'https://api.example.com/wallet/grid/card-1.png?ts=2' }, contentDescription: '3/10 Stempel' },
+        mainImage: { sourceUri: { uri: 'https://api.example.com/wallet/grid/card-1.png?ts=2' }, contentDescription: { defaultValue: { language: 'de', value: '3/10 Stempel' } } },
       }]);
     });
     // Without the env var the PATCH body keeps the pre-18.10 shape (no image module).
@@ -570,3 +570,79 @@ test('issue without WALLET_IMAGE_BASE_URL keeps the exact pre-18.10 object shape
   const payload = JSON.parse(Buffer.from(result.artifact!.split('.')[1], 'base64url').toString('utf8'));
   expect(payload.payload.loyaltyObjects[0].imageModulesData).toBeUndefined();
 })));
+
+
+// ---------------------------------------------------------------------------
+// REGRESSION (2026-10-19, prod wallet refresh 400 root cause, post-#47):
+// Google requires Image.contentDescription to be a LocalizedString object
+// { defaultValue: { language, value } } — PR #47 sent a plain string, so the
+// WHOLE loyaltyObject PATCH was rejected with 400 INVALID_ARGUMENT and the
+// balance + stamp grid never reached the pass. These tests pin the fixed
+// payload shape (both issue() and refresh() share objectModel).
+// ---------------------------------------------------------------------------
+const LOCALIZED_CD = { defaultValue: { language: 'de', value: '3/10 Stempel' } };
+test('REGRESSION: issue() and refresh() send contentDescription as LocalizedString (payload shape)', async () => withCleanEnv(async () => {
+  const key = await Bun.$`openssl genrsa 2048 2>/dev/null`.text();
+  await withGridEnv('https://api.example.com', async () => {
+    // issue(): the save-to-wallet JWT loyaltyObject must carry the object form.
+    const issueCalls: Array<{ url: string; init: RequestInit }> = [];
+    const issueResult = await classicAdapter(issueCalls, key).issue(card, branding, { stampRequired: 10, rewardTitle: 'Gratis' });
+    expect(issueResult.status).toBe('issued');
+    const payload = JSON.parse(Buffer.from(issueResult.artifact!.split('.')[1], 'base64url').toString('utf8'));
+    const issuedCd = payload.payload.loyaltyObjects[0].imageModulesData[0].mainImage.contentDescription;
+    expect(issuedCd).toEqual(LOCALIZED_CD);
+    expect(typeof issuedCd).toBe('object');
+    expect(typeof (issuedCd as { defaultValue: { value: string } }).defaultValue.value).toBe('string');
+    // refresh(): the PATCH body used by syncWalletBalance after every stamp.
+    const refreshCalls: Array<{ url: string; init: RequestInit }> = [];
+    const refreshResult = await classicAdapter(refreshCalls, key).refresh(card, ['loyaltyPoints', 'textModulesData', 'imageModulesData'], { branding, stampRequired: 10, rewardTitle: 'Gratis' });
+    expect(refreshResult.status).toBe('issued');
+    const patch = refreshCalls.find(c => c.url === WALLET_PATCH_URL && c.init?.method === 'PATCH');
+    expect(patch).toBeDefined();
+    const body = JSON.parse(String(patch!.init.body)) as Record<string, any>;
+    const patchCd = body.imageModulesData[0].mainImage.contentDescription;
+    expect(patchCd).toEqual(LOCALIZED_CD);
+    // The old plain-string value would NOT survive JSON round-trip as an object.
+    expect(JSON.stringify(patchCd)).not.toBe(JSON.stringify('3/10 Stempel'));
+  });
+}));
+test('REGRESSION: refresh with grid payload is accepted by a Google-contract mock that rejects plain-string contentDescription (replay A → 200)', async () => withCleanEnv(async () => {
+  const key = await Bun.$`openssl genrsa 2048 2>/dev/null`.text();
+  process.env.GOOGLE_ISSUER_ID = '123';
+  process.env.GOOGLE_SERVICE_ACCOUNT_JSON = JSON.stringify({ client_email: 'sa@example.invalid', private_key: key });
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  // Mirror of the 19.10. production replay: Google answers 400
+  // INVALID_ARGUMENT exactly when content_description is not a LocalizedString,
+  // exactly like the diagnose (PROD_DIAGNOSE_WALLET_GRID_2026-10-19.md §4 A).
+  const googleContractFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); calls.push({ url, init: init ?? {} });
+    if (url === 'https://oauth2.googleapis.com/token') {
+      return new Response(JSON.stringify({ access_token: 'oauth-token', expires_in: 3600, token_type: 'Bearer' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (url.includes('/loyaltyObject/')) {
+      const body = JSON.parse(String(init?.body)) as Record<string, any>;
+      const cd = body.imageModulesData?.[0]?.mainImage?.contentDescription;
+      if (typeof cd === 'string') {
+        return new Response(JSON.stringify({ error: { code: 400, message: `Invalid value at 'resource.image_modules_data[0].main_image.content_description' (type.googleapis.com/google.walletobjects.v1.LocalizedString), \"${cd}\"`, status: 'INVALID_ARGUMENT' } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ id: '123.card-1', state: 'ACTIVE' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    throw new Error(`unexpected URL in mock: ${url}`);
+  }) as unknown as typeof fetch;
+  await withGridEnv('https://api.example.com', async () => {
+    const result = await walletAdapter('google', { fetchFn: googleContractFetch }).refresh(card, ['loyaltyPoints', 'textModulesData', 'imageModulesData'], { branding, stampRequired: 10, rewardTitle: 'Gratis' });
+    expect(result.status).toBe('issued'); // no GOOGLE_WALLET_REFRESH_FAILED_400
+    expect(result.message).toContain('updated');
+  });
+  // Contract sanity: the pre-fix plain-string payload hits exactly that 400.
+  const plainReplay = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === 'https://oauth2.googleapis.com/token') return new Response(JSON.stringify({ access_token: 'x', expires_in: 3600 }), { status: 200 });
+    if (url.includes('/loyaltyObject/')) return new Response(JSON.stringify({ error: { code: 400, status: 'INVALID_ARGUMENT' } }), { status: 400 });
+    throw new Error(`unexpected URL in mock: ${url}`);
+  }) as unknown as typeof fetch;
+  const adapters = walletAdapter('google', { fetchFn: plainReplay });
+  // A refresh whose payload kept the old string type must fail with the same
+  // code the server logs as wallet_refresh_failed (GOOGLE_WALLET_REFRESH_FAILED_400).
+  await expect(adapters.refresh(card, ['loyaltyPoints', 'textModulesData', 'imageModulesData'], { branding, stampRequired: 10, rewardTitle: 'Gratis' })).rejects.toThrow('GOOGLE_WALLET_REFRESH_FAILED_400');
+}));
