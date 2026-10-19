@@ -230,7 +230,9 @@ test('refresh PATCHes the loyaltyObject with the new balance and text module (mo
   const auth = (patch!.init.headers as Record<string, string>).Authorization;
   expect(auth).toBe('Bearer oauth-token');
   const body = JSON.parse(String(patch!.init.body)) as Record<string, any>;
-  expect(body.loyaltyPoints).toEqual({ balance: { int: card.stampCount } });
+  // Native points line (Owner-Entscheid 2026-10-19): label "Stempel" (plain
+  // string, discovery-verified) rides along with the balance on every refresh.
+  expect(body.loyaltyPoints).toEqual({ label: 'Stempel', balance: { int: card.stampCount } });
   // Card-front member-number line: accountId + accountIdLabel ride along with
   // every refresh so the front number stays in sync (owner wish, backlog #4).
   expect(body.accountId).toBe('K-7F3D2A');
@@ -239,10 +241,12 @@ test('refresh PATCHes the loyaltyObject with the new balance and text module (mo
   // refresh so the pass stays scannable at the register (explicit `barcode`
   // field — Google renders a barcode ONLY from it, not from accountId).
   expect(body.barcode).toEqual({ type: 'CODE_128', value: 'K-7F3D2A', alternateText: 'K-7F3D2A' });
-  // Branding flows through to the object: progress module + cardText module;
+  // Branding flows through to the object: progress module FIRST ("X/N Stempel",
+  // Owner-Entscheid 2026-10-19), then the reward line, then the cardText module;
   // the visible card code appears as its own Kartennummer module.
   expect(body.textModulesData).toEqual([
-    { header: branding.cardTitle, body: '3/10 Stempel · Gratis' },
+    { header: branding.cardTitle, body: '3/10 Stempel' },
+    { header: branding.cardTitle, body: 'Prämie: Gratis' },
     { header: 'Kartennummer', body: 'K-7F3D2A' },
     { header: branding.cardTitle, body: branding.cardText },
   ]);
@@ -295,7 +299,8 @@ test('refresh PATCHes with fallback branding/rule when no context is supplied', 
   expect(result.status).toBe('issued');
   const body = JSON.parse(String(calls.find(c => c.url === WALLET_PATCH_URL)!.init.body)) as Record<string, any>;
   expect(body.textModulesData).toEqual([
-    { header: 'StempelPass', body: '3/? Stempel · Prämie' },
+    { header: 'StempelPass', body: '3/? Stempel' },
+    { header: 'StempelPass', body: 'Prämie: Prämie' },
     { header: 'Kartennummer', body: 'K-7F3D2A' },
   ]);
 }));
@@ -348,7 +353,8 @@ test('issue() embeds branding in the object model: tenant class id + progress an
   // CODE_128 barcode of the same visible code (decision note 2026-10-17).
   expect(obj.barcode).toEqual({ type: 'CODE_128', value: 'K-7F3D2A', alternateText: 'K-7F3D2A' });
   expect(obj.textModulesData).toEqual([
-    { header: 'Café Herz', body: '3/10 Stempel · Gratis Kaffee' },
+    { header: 'Café Herz', body: '3/10 Stempel' },
+    { header: 'Café Herz', body: 'Prämie: Gratis Kaffee' },
     { header: 'Kartennummer', body: 'K-7F3D2A' },
     { header: 'Café Herz', body: 'Sammle Stempel' },
   ]);
@@ -373,7 +379,8 @@ test('issue and refresh payloads omit accountId/accountIdLabel when the card has
   expect(obj.accountIdLabel).toBeUndefined();
   expect(obj.barcode).toBeUndefined();
   expect(obj.textModulesData).toEqual([
-    { header: 'Café', body: '3/10 Stempel · Gratis' },
+    { header: 'Café', body: '3/10 Stempel' },
+    { header: 'Café', body: 'Prämie: Gratis' },
     { header: 'Café', body: 'Treuekarte' },
   ]);
   // refresh: the loyaltyObject PATCH body carries NO accountId/accountIdLabel
@@ -386,7 +393,7 @@ test('issue and refresh payloads omit accountId/accountIdLabel when the card has
   expect(patch).toBeDefined();
   expect(patch!.init.method).toBe('PATCH');
   const body = JSON.parse(String(patch!.init.body)) as Record<string, any>;
-  expect(body).toEqual({ loyaltyPoints: { balance: { int: 3 } }, textModulesData: [{ header: 'Café', body: '3/10 Stempel · Gratis' }, { header: 'Café', body: 'Treuekarte' }] });
+  expect(body).toEqual({ loyaltyPoints: { label: 'Stempel', balance: { int: 3 } }, textModulesData: [{ header: 'Café', body: '3/10 Stempel' }, { header: 'Café', body: 'Prämie: Gratis' }, { header: 'Café', body: 'Treuekarte' }] });
 });
 
 /** Reusable scripted Google credentials fixture (no real network). */
@@ -645,4 +652,127 @@ test('REGRESSION: refresh with grid payload is accepted by a Google-contract moc
   // A refresh whose payload kept the old string type must fail with the same
   // code the server logs as wallet_refresh_failed (GOOGLE_WALLET_REFRESH_FAILED_400).
   await expect(adapters.refresh(card, ['loyaltyPoints', 'textModulesData', 'imageModulesData'], { branding, stampRequired: 10, rewardTitle: 'Gratis' })).rejects.toThrow('GOOGLE_WALLET_REFRESH_FAILED_400');
+}));
+
+// ---------------------------------------------------------------------------
+// REGRESSION (2026-10-19, Owner-Entscheid: stamp progress natively on the
+// pass — loyaltyPoints.label + first text module "X/N Stempel"):
+// The walletobjects v1 discovery document types LoyaltyPoints.label and
+// TextModuleData.header/body as PLAIN STRINGS (the LocalizedString variants
+// live in loyaltyPoints.localizedLabel and textModulesData localizedHeader/
+// localizedBody). A { defaultValue: { language, value } } OBJECT at any of
+// these string fields gets 400 INVALID_ARGUMENT from Google — the exact mirror
+// of PR #48 (plain string at the LocalizedString contentDescription). These
+// tests pin the string shape so a future "localization fix" cannot silently
+// re-break the whole PATCH (syncWalletBalance only logs wallet_refresh_failed;
+// the stamp still answers 200). Discovery evidence: fetched live 2026-10-19
+// from https://walletobjects.googleapis.com/$discovery/rest?version=v1
+// (schemas LoyaltyPoints.label, TextModuleData.header/.body).
+// ---------------------------------------------------------------------------
+test('REGRESSION: loyaltyPoints.label and textModule header/body are plain strings; progress line is the FIRST module (issue() + refresh())', async () => withCleanEnv(async () => {
+  const key = await Bun.$`openssl genrsa 2048 2>/dev/null`.text();
+  await withGridEnv(undefined, async () => {
+    // issue(): the save-to-wallet JWT loyaltyObject carries the native points
+    // line plus the split progress/reward modules.
+    const issueCalls: Array<{ url: string; init: RequestInit }> = [];
+    const issueResult = await classicAdapter(issueCalls, key).issue(card, branding, { stampRequired: 10, rewardTitle: 'Gratis' });
+    expect(issueResult.status).toBe('issued');
+    const payload = JSON.parse(Buffer.from(issueResult.artifact!.split('.')[1], 'base64url').toString('utf8'));
+    const obj = payload.payload.loyaltyObjects[0];
+    // label is a PLAIN STRING — never { defaultValue: … } (localizedLabel is
+    // the LocalizedString variant; discovery-verified). balance.int unchanged.
+    expect(obj.loyaltyPoints).toEqual({ label: 'Stempel', balance: { int: card.stampCount } });
+    expect(typeof obj.loyaltyPoints.label).toBe('string');
+    expect((obj.loyaltyPoints.label as string).length).toBeLessThanOrEqual(9); // Google's label length recommendation
+    // Progress line FIRST, undisputed: textModulesData[0].body === "X/N Stempel",
+    // textModulesData[1] === "Prämie: <Titel>" (split from the old combined body).
+    expect(obj.textModulesData).toEqual([
+      { header: branding.cardTitle, body: '3/10 Stempel' },
+      { header: branding.cardTitle, body: 'Prämie: Gratis' },
+      { header: 'Kartennummer', body: 'K-7F3D2A' },
+      { header: branding.cardTitle, body: branding.cardText },
+    ]);
+    for (const m of obj.textModulesData as Array<{ header: unknown; body: unknown }>) {
+      expect(typeof m.header).toBe('string');
+      expect(typeof m.body).toBe('string');
+    }
+    // A LocalizedString-wrapped label would FAIL the string shape check — the
+    // object form Google rejects at this string field.
+    expect(JSON.stringify(obj.loyaltyPoints.label)).not.toBe(JSON.stringify({ defaultValue: { language: 'de', value: 'Stempel' } }));
+    // refresh(): the PATCH body used by syncWalletBalance after every stamp.
+    const refreshCalls: Array<{ url: string; init: RequestInit }> = [];
+    const refreshResult = await classicAdapter(refreshCalls, key).refresh(card, ['loyaltyPoints', 'textModulesData'], { branding, stampRequired: 10, rewardTitle: 'Gratis' });
+    expect(refreshResult.status).toBe('issued');
+    const patch = refreshCalls.find(c => c.url === WALLET_PATCH_URL && c.init?.method === 'PATCH');
+    expect(patch).toBeDefined();
+    const body = JSON.parse(String(patch!.init.body)) as Record<string, any>;
+    expect(body.loyaltyPoints).toEqual({ label: 'Stempel', balance: { int: card.stampCount } });
+    expect(body.textModulesData[0]).toEqual({ header: branding.cardTitle, body: '3/10 Stempel' });
+    expect(body.textModulesData[1]).toEqual({ header: branding.cardTitle, body: 'Prämie: Gratis' });
+    for (const m of body.textModulesData as Array<{ header: unknown; body: unknown }>) {
+      expect(typeof m.header).toBe('string');
+      expect(typeof m.body).toBe('string');
+    }
+  });
+}));
+test('REGRESSION: Google-contract mock accepts the string shapes (200) and rejects a LocalizedString-wrapped label (400 INVALID_ARGUMENT) — refresh path', async () => withCleanEnv(async () => {
+  const key = await Bun.$`openssl genrsa 2048 2>/dev/null`.text();
+  process.env.GOOGLE_ISSUER_ID = '123';
+  process.env.GOOGLE_SERVICE_ACCOUNT_JSON = JSON.stringify({ client_email: 'sa@example.invalid', private_key: key });
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  // Mirror of the 19.10. production replay style: Google answers 400
+  // INVALID_ARGUMENT exactly when a string-typed field carries a non-string
+  // value — here loyaltyPoints.label / textModulesData[].header / .body must
+  // be plain strings (the reversed PR #48 type confusion: an object at a
+  // string field instead of a string at an object field).
+  const googleContractFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input); calls.push({ url, init: init ?? {} });
+    if (url === 'https://oauth2.googleapis.com/token') {
+      return new Response(JSON.stringify({ access_token: 'oauth-token', expires_in: 3600, token_type: 'Bearer' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (url.includes('/loyaltyObject/')) {
+      const body = JSON.parse(String(init?.body)) as Record<string, any>;
+      let badPath: string | null = null;
+      for (const [i, m] of (body.textModulesData ?? []).entries()) {
+        if (typeof m.header !== 'string') { badPath = `text_modules_data[${i}].header`; break; }
+        if (typeof m.body !== 'string') { badPath = `text_modules_data[${i}].body`; break; }
+      }
+      if (badPath === null && typeof body.loyaltyPoints?.label !== 'string') badPath = 'loyalty_points.label';
+      if (badPath !== null) {
+        return new Response(JSON.stringify({ error: { code: 400, message: `Invalid value at 'resource.${badPath}' (type.googleapis.com/google.walletobjects.v1.String): object`, status: 'INVALID_ARGUMENT' } }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ id: '123.card-1', state: 'ACTIVE' }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+    throw new Error(`unexpected URL in mock: ${url}`);
+  }) as unknown as typeof fetch;
+  // Correct payload (the adapter's real objectModel output, issue() AND
+  // refresh() share it) → 200, no silent GOOGLE_WALLET_REFRESH_FAILED_400.
+  const result = await walletAdapter('google', { fetchFn: googleContractFetch }).refresh(card, ['loyaltyPoints', 'textModulesData'], { branding, stampRequired: 10, rewardTitle: 'Gratis' });
+  expect(result.status).toBe('issued');
+  expect(result.message).toContain('updated');
+  // Contract sanity in both directions against the mock itself:
+  // (i) the exact body the adapter sent is the 200 above and carries the
+  //     native progress line;
+  const sent = calls.find(c => c.url.includes('/loyaltyObject/'));
+  expect(sent).toBeDefined();
+  const sentBody = JSON.parse(String(sent!.init.body)) as Record<string, any>;
+  expect(sentBody.loyaltyPoints).toEqual({ label: 'Stempel', balance: { int: 3 } });
+  expect(sentBody.textModulesData[0]).toEqual({ header: 'Café', body: '3/10 Stempel' });
+  // (ii) a LocalizedString-wrapped label (object at string field) is rejected
+  //      with the same 400 the server logs as wallet_refresh_failed.
+  const brokenReject = await googleContractFetch('https://walletobjects.googleapis.com/walletobjects/v1/loyaltyObject/123.card-1', { method: 'PATCH', body: JSON.stringify({ loyaltyPoints: { label: { defaultValue: { language: 'de', value: 'Stempel' } }, balance: { int: 3 } }, textModulesData: [{ header: 'Café', body: '3/10 Stempel' }] }) } as RequestInit);
+  expect(brokenReject.status).toBe(400);
+  const brokenJson = (await brokenReject.json()) as { error: { message: string; status: string } };
+  expect(brokenJson.error.status).toBe('INVALID_ARGUMENT');
+  expect(brokenJson.error.message).toContain('loyalty_points.label');
+  // (iii) an adapter whose PATCH receives that 400 surfaces the exact
+  //       server-logged code GOOGLE_WALLET_REFRESH_FAILED_400 instead of
+  //       claiming success (the syncWalletBalance swallow regression).
+  const failFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === 'https://oauth2.googleapis.com/token') return new Response(JSON.stringify({ access_token: 'x', expires_in: 3600 }), { status: 200 });
+    if (url.includes('/loyaltyObject/')) return new Response(JSON.stringify({ error: { code: 400, status: 'INVALID_ARGUMENT' } }), { status: 400 });
+    throw new Error(`unexpected URL in mock: ${url}`);
+  }) as unknown as typeof fetch;
+  await expect(walletAdapter('google', { fetchFn: failFetch }).refresh(card, ['loyaltyPoints', 'textModulesData'], { branding, stampRequired: 10, rewardTitle: 'Gratis' })).rejects.toThrow('GOOGLE_WALLET_REFRESH_FAILED_400');
 }));
