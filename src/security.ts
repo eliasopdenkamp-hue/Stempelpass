@@ -180,6 +180,25 @@ export async function verifyPasswordAgainstDummy(password: string): Promise<bool
 export const loginIpLimiter = new RateLimiter(20, 15 * 60_000, 50_000);
 export const loginAccountLimiter = new RateLimiter(5, 15 * 60_000, 50_000);
 export const cardResolveLimiter = new RateLimiter(60, 60_000, 50_000);
+/**
+ * Public stamp-raster image limiter (own bucket, NOT the shared
+ * cardResolveLimiter). GET /wallet/grid/:cardUuid.png is fetched by Google's
+ * image proxy and by pass clients, and the `?ts=` cache-buster lets a caller
+ * mint arbitrarily many distinct URLs. The budget is therefore bound to the
+ * client plus the card UUID only — never to the full URL — so varying `ts`
+ * cannot create fresh buckets. 120/min leaves headroom for the legitimate
+ * re-fetch after every stamp (a new `ts` per revision) while still capping the
+ * route as an image proxy. Per-instance only (see RATE_LIMITING.md).
+ */
+export const walletGridLimiter = new RateLimiter(120, 60_000, 50_000);
+/**
+ * Limiter key for the public stamp-raster PNG: hashed client IP plus SHA-256 of
+ * the card UUID. The `ts` query value is deliberately excluded — it is a cache
+ * key, not an identity — and raw UUIDs stay out of limiter keys and memory.
+ */
+export function walletGridKey(req: Request, cardId: string): string {
+  return `${clientIpKey(req)}:grid:${createHash('sha256').update(String(cardId ?? ''), 'utf8').digest('hex')}`;
+}
 export const stampLimiter = new RateLimiter(30, 60_000, 50_000);
 /**
  * Redeem limiter (pre-deployment audit 2026-10-18, RISK #1). Reward
