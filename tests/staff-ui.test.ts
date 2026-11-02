@@ -1590,8 +1590,41 @@ test('staff wallet refresh failure never fails the committed stamp (best-effort 
     // The committed stamp answers 200 even though the Wallet PATCH threw
     // GOOGLE_WALLET_REFRESH_FAILED_500 (logged, suppressed by syncWalletBalance).
     expect(res.status).toBe(200);
-    expect(await res.text()).toContain('hat jetzt 4 Stempel');
+    const html = await res.text();
+    expect(html).toContain('hat jetzt 4 Stempel');
     expect(res.headers.get('x-csrf-token')).toMatch(/^[0-9a-f]{64}$/);
+    // ...but staff is no longer told a plain success: the flash turns amber and
+    // carries the "pass may lag" hint (2026-10-19 sync incident).
+    expect(html).toContain('Pass wird evtl. verzögert aktualisiert.');
+    expect(html).toContain('class="flash warn"');
+  });
+});
+
+test('staff redeem reports a failed pass refresh in the flash instead of a silent success', async () => {
+  redeemLimiter.clear();
+  const adapter = walletSyncAdapter([], { failRefresh: true });
+  const factory = (() => adapter) as unknown as typeof walletAdapter;
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('update rewards set status'), rows: [{ id: REWARD, status: 'redeemed', card_id: CARD }] },
+    { match: contains('update cards set stamp_count=0'), rows: [] },
+    ...dashboardHandlers({
+      rewards: [{ id: REWARD, cardId: CARD, status: 'redeemed' }],
+      cards: [{ id: CARD, customerRef: 'Kunde-42', stampCount: 0, updatedAt: '2026-08-26T10:00:00.000Z' }],
+    }),
+  ]);
+  await runWithWallet(pool, factory, async () => {
+    const res = await fetchHandler(new Request(`http://test.local/staff/${TENANT}/redeem`, {
+      method: 'POST',
+      headers: authedHeaders(),
+      body: new URLSearchParams({ rewardId: REWARD }),
+    }));
+    // The redemption is committed and answers 200 — only the pass may lag.
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain('Prämie erfolgreich eingelöst.');
+    expect(html).toContain('Pass wird evtl. verzögert aktualisiert.');
+    expect(html).toContain('class="flash warn"');
   });
 });
 

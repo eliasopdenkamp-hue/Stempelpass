@@ -46,7 +46,7 @@ code{font-size:.8rem;background:#f1f5f9;padding:.1rem .35rem;border-radius:.3rem
 .badge{display:inline-block;font-size:.75rem;font-weight:700;padding:.15rem .5rem;border-radius:999px}
 .badge.issued{background:#dcfce7;color:#166534}.badge.redeemed{background:#e2e8f0;color:#475569}
 .flash{padding:.8rem 1rem;border-radius:.7rem;margin:0 0 1rem;font-weight:600}
-.flash.ok{background:#dcfce7;color:#166534}.flash.error{background:#fee2e2;color:#991b1b}
+.flash.ok{background:#dcfce7;color:#166534}.flash.error{background:#fee2e2;color:#991b1b}.flash.warn{background:#fef3c7;color:#92400e}
 .qr-card{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:.9rem;padding:1rem;margin:0 0 1.25rem}
 .qr-card img{border:1px solid #e2e8f0;border-radius:.75rem;background:#fff;padding:.4rem;box-sizing:content-box}
 .meta{color:#475569;font-size:.85rem}
@@ -649,7 +649,7 @@ function trendLabel(delta: number | null): string {
 
 /** GET /staff/:tenantId — dashboard. `csrf` must be the current session's
  *  stored CSRF hash (the exact value the client submits in x-csrf-token). */
-export function dashboardPage(v: DashboardView, flash?: { kind: 'ok' | 'error'; text: string }): string {
+export function dashboardPage(v: DashboardView, flash?: { kind: 'ok' | 'error' | 'warn'; text: string }): string {
   const primary = safeColor(v.primaryColor, DEFAULT_PRIMARY_CARD_COLOR);
   const title = v.cardTitle || 'StempelPass';
   const tenantName = v.legalName || v.cardTitle || 'Unternehmen';

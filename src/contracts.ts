@@ -10,14 +10,25 @@ import type { CreatedCard, RedeemResult, StampResult } from './repository.js';
  * timestamp fields into client payloads.
  */
 
+/**
+ * Outcome of the best-effort Google Wallet refresh that follows a COMMITTED
+ * stamp/redeem (2026-10-19 sync incident: the refresh error used to be only
+ * logged, so staff and API clients saw a plain success while the pass kept the
+ * old balance). `failed` never means the write failed — the DB write is
+ * committed either way — only that the customer's pass may lag behind.
+ */
+export type WalletSyncStatus = 'ok' | 'failed';
+
 /** POST .../cards/:cardId/stamps — normal and idempotency-replay share this shape. */
 export interface StampResponse {
   card: { id: string; stampCount: number; revision: number };
   reward?: { id: string; status: 'issued' | 'redeemed' };
   /** Echoed only when the client sent an idempotency key. */
   idempotencyKey?: string;
+  /** Whether the pass behind this card could be refreshed after the write. */
+  walletSync: WalletSyncStatus;
 }
-export function toStampResponse(result: StampResult): StampResponse { return result; }
+export function toStampResponse(result: StampResult, walletSync: WalletSyncStatus = 'ok'): StampResponse { return { ...result, walletSync }; }
 
 /**
  * POST .../cards — minimal projection of the created card plus the fresh raw
@@ -36,8 +47,8 @@ export interface CreateCardResponse {
 export function toCreateCardResponse(card: CreatedCard, cardToken: string): CreateCardResponse { return { card, cardToken }; }
 
 /** POST .../rewards/:rewardId/redeem — never a full rewards row. */
-export interface RedeemResponse { rewardId: string; status: 'issued' | 'redeemed'; }
-export function toRedeemResponse(result: RedeemResult): RedeemResponse { return { rewardId: result.rewardId, status: result.status }; }
+export interface RedeemResponse { rewardId: string; status: 'issued' | 'redeemed'; walletSync: WalletSyncStatus; }
+export function toRedeemResponse(result: RedeemResult, walletSync: WalletSyncStatus = 'ok'): RedeemResponse { return { rewardId: result.rewardId, status: result.status, walletSync }; }
 
 /** POST /api/auth/login */
 export interface LoginResponse { csrfToken: string; mfaRequired: boolean; }

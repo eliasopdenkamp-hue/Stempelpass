@@ -15,7 +15,7 @@ import { renderStampGridPng } from './wallet-grid.js';
 import { codeSearchEmptyHtml, codeSearchResultHtml, loginPage, resetPasswordPage, resetRequestPage, resetTokenInvalidPage, tenantChooserPage, noTenantPage, dashboardPage, staffErrorPage, type DashboardView } from './staff-ui.js';
 import { SmtpEmailAdapter, passwordResetEmailHtml, passwordResetEmailText } from './email.js';
 import { requireVerifiedMfaBootstrap } from './mfa-bootstrap.js';
-import { toCreateCardResponse, toDeleteResponse, toLoginResponse, toPilotResponse, toRedeemResponse, toResetConfirmResponse, toResetRequestResponse, toStaffResponse, toStampResponse } from './contracts.js';
+import { toCreateCardResponse, toDeleteResponse, toLoginResponse, toPilotResponse, toRedeemResponse, toResetConfirmResponse, toResetRequestResponse, toStaffResponse, toStampResponse, type WalletSyncStatus } from './contracts.js';
 import type { Branding, StampRule } from './domain.js';
 const config=configurationStatus(); let configured=config.ready;
 /**
@@ -154,9 +154,15 @@ async function rotate(a:{userId:string;token:string;mfaVerified:boolean}){if(!po
  * A failing sync must NEVER fail the already-committed stamp/redeem request:
  * all errors are logged and suppressed. Logs carry only the error code
  * (mirroring revoke()), never card ids or other identifiers.
+ *
+ * Since the 2026-10-19 sync incident (PATCH 400 swallowed → staff saw a normal
+ * success while the pass kept the old balance) the outcome is RETURNED so the
+ * caller can tell staff/API clients that the pass may lag: 'failed' is a
+ * reporting value only, never a rollback and never a 5xx — the DB write is
+ * committed before this runs and stays committed.
  */
-async function syncWalletBalance(tenantId:string,card:{id:string;stampCount:number;revision?:number},oidcToken:string|null):Promise<void>{
-  if(!repository)return;
+async function syncWalletBalance(tenantId:string,card:{id:string;stampCount:number;revision?:number},oidcToken:string|null):Promise<WalletSyncStatus>{
+  if(!repository)return 'ok';
   try{
     const ctx=await repository.cardWalletContext(tenantId,card.id);
     const adapter=walletFactory('google',{oidcToken:oidcToken??undefined});
@@ -171,8 +177,18 @@ async function syncWalletBalance(tenantId:string,card:{id:string;stampCount:numb
       stampRequired:ctx.rule?.stampsRequired??undefined,
       rewardTitle:ctx.rule?.rewardTitle??undefined,
     });
-    if(result.status==='not_configured')return;
-  }catch(error){console.error(`wallet_refresh_failed code=${error instanceof Error?error.message:'GOOGLE_WALLET_REFRESH_UNAVAILABLE'}`)}
+    // 'issued' = pass refreshed; 'not_configured' = Wallet disabled, nothing
+    // can lag. Any other status is not a confirmed refresh.
+    return result.status==='issued'||result.status==='not_configured'?'ok':'failed';
+  }catch(error){console.error(`wallet_refresh_failed code=${error instanceof Error?error.message:'GOOGLE_WALLET_REFRESH_UNAVAILABLE'}`);return 'failed'}
+}
+/**
+ * Staff-facing flash for a committed stamp/redeem: the success text stays, and
+ * a failed Wallet refresh appends a short, non-alarming note — staff must never
+ * believe the pass is current when it is not (2026-10-19 sync incident).
+ */
+function flashWithWalletSync(text:string,walletSync:WalletSyncStatus):{kind:'ok'|'warn';text:string}{
+  return walletSync==='failed'?{kind:'warn',text:`${text} Pass wird evtl. verzögert aktualisiert.`}:{kind:'ok',text};
 }
 /** Strict tenant/card UUID format guard (early 404, avoids bad DB casts). */
 const UUID_RE=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -424,13 +440,13 @@ async function handleStaffStamp(req:Request,tenantId:string,id:string):Promise<R
     // with the committed stamp result. The refreshed card id comes from the
     // stamp's UPDATE ... RETURNING — the exact card that was stamped. A Wallet
     // failure never fails the already-committed stamp (errors are suppressed
-    // inside syncWalletBalance).
-    await syncWalletBalance(tenantId,value.card,req.headers.get('x-vercel-oidc-token'));
+    // inside syncWalletBalance); the outcome is only REPORTED to staff below.
+    const walletSync=await syncWalletBalance(tenantId,value.card,req.headers.get('x-vercel-oidc-token'));
     const dash=await repository.staffDashboard(tenantId);
     const stats=await repository.staffStats(tenantId);
     const newCard=await dashboardNewCard(req,tenantId,actor.role);
     const flash=`Stempel vergeben: Karte ${cardId.slice(0,8)} hat jetzt ${value.card.stampCount} Stempel.`+(value.reward?' Die Prämie ist jetzt einlösbar.':'');
-    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,stats,rotated.header['x-csrf-token'],newCard),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
+    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,stats,rotated.header['x-csrf-token'],newCard),flashWithWalletSync(flash,walletSync)),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
   }catch(e){return staffMutationError(e,id);}
 }
 async function handleStaffRedeem(req:Request,tenantId:string,id:string):Promise<Response>{
@@ -446,13 +462,14 @@ async function handleStaffRedeem(req:Request,tenantId:string,id:string):Promise<
     const rotated=await rotate(actor);
     // Best-effort Google Wallet balance sync: refresh the loyaltyObject
     // {issuerId}.{cardId} to the RESET balance (0 stamps — new collection
-    // round). Same contract as the API redeem route; failures stay suppressed.
-    await syncWalletBalance(tenantId,value.card,req.headers.get('x-vercel-oidc-token'));
+    // round). Same contract as the API redeem route; failures stay suppressed
+    // and are only REPORTED to staff below.
+    const walletSync=await syncWalletBalance(tenantId,value.card,req.headers.get('x-vercel-oidc-token'));
     const dash=await repository.staffDashboard(tenantId);
     const stats=await repository.staffStats(tenantId);
     const newCard=await dashboardNewCard(req,tenantId,actor.role);
     const flash=value.status==='redeemed'?'Prämie erfolgreich eingelöst.':'Prämie eingelöst.';
-    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,stats,rotated.header['x-csrf-token'],newCard),{kind:'ok',text:flash}),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
+    return htmlResponse(dashboardPage(dashboardView(tenantId,actor.role,dash,stats,rotated.header['x-csrf-token'],newCard),flashWithWalletSync(flash,walletSync)),200,{'Set-Cookie':rotated.header['Set-Cookie'],'x-csrf-token':rotated.header['x-csrf-token']});
   }catch(e){return staffMutationError(e,id);}
 }
 /**
@@ -830,8 +847,8 @@ if(parts[3]==='capacity'&&req.method==='GET')return json(await repository!.capac
 if(parts[3]==='cards'&&parts.length===4&&req.method==='POST'){if(!cardCreateLimiter.allow(`${tenantId}:${actor.userId}`))throw new Error('RATE_LIMITED');const body=await parseJson(req) as {customerId?:string,ruleId?:string};if(!body.customerId||!body.ruleId)throw new Error('CARD_FIELDS_REQUIRED');const rawToken=randomToken();const idempotencyKey=req.headers.get('idempotency-key')?.trim()||undefined;const created=await repository!.createCard(tenantId,body.customerId,body.ruleId,hashToken(rawToken),idempotencyKey,rawToken);const {token, ...card}=created;return json(toCreateCardResponse(card,token ?? rawToken),201,id);}
 if(parts[3]==='cards'&&parts.length===5&&req.method==='DELETE'){if(actor.role!=='owner'&&actor.role!=='admin')throw new Error('FORBIDDEN');const value=await repository!.deleteCard(tenantId,parts[4]);return json(toDeleteResponse(value),200,id);}
 if(parts[3]==='customers'&&parts.length===5&&req.method==='DELETE'){if(actor.role!=='owner'&&actor.role!=='admin')throw new Error('FORBIDDEN');const value=await repository!.deleteCustomer(tenantId,parts[4]);return json(toDeleteResponse(value),200,id);}
-if(parts[3]==='cards'&&parts[5]==='stamps'&&req.method==='POST'){if(!canStamp(actor.role))throw new Error('FORBIDDEN');if(!stampLimiter.allow(`${tenantId}:${actor.userId}`))throw new Error('RATE_LIMITED');const body=await parseJson(req) as {quantity?:number};const quantityRaw=Number(body.quantity??1);const quantity=Number.isInteger(quantityRaw)?quantityRaw:1;const idempotencyKey=req.headers.get('idempotency-key')||null;const value=await repository!.stamp(tenantId,parts[4],quantity,actor.membershipId,idempotencyKey);const rotated=await rotate(actor);await syncWalletBalance(tenantId,value.card,req.headers.get('x-vercel-oidc-token'));return json(toStampResponse(value),200,id,rotated.header);}
-if(parts[3]==='rewards'&&parts[5]==='redeem'&&req.method==='POST'){if(!canStamp(actor.role))throw new Error('FORBIDDEN');if(!redeemLimiter.allow(`${tenantId}:${actor.userId}`))throw new Error('RATE_LIMITED');const value=await repository!.redeem(tenantId,parts[4]);await syncWalletBalance(tenantId,value.card,req.headers.get('x-vercel-oidc-token'));const rotated=await rotate(actor);return json(toRedeemResponse(value),200,id,rotated.header);}
+if(parts[3]==='cards'&&parts[5]==='stamps'&&req.method==='POST'){if(!canStamp(actor.role))throw new Error('FORBIDDEN');if(!stampLimiter.allow(`${tenantId}:${actor.userId}`))throw new Error('RATE_LIMITED');const body=await parseJson(req) as {quantity?:number};const quantityRaw=Number(body.quantity??1);const quantity=Number.isInteger(quantityRaw)?quantityRaw:1;const idempotencyKey=req.headers.get('idempotency-key')||null;const value=await repository!.stamp(tenantId,parts[4],quantity,actor.membershipId,idempotencyKey);const rotated=await rotate(actor);const walletSync=await syncWalletBalance(tenantId,value.card,req.headers.get('x-vercel-oidc-token'));return json(toStampResponse(value,walletSync),200,id,rotated.header);}
+if(parts[3]==='rewards'&&parts[5]==='redeem'&&req.method==='POST'){if(!canStamp(actor.role))throw new Error('FORBIDDEN');if(!redeemLimiter.allow(`${tenantId}:${actor.userId}`))throw new Error('RATE_LIMITED');const value=await repository!.redeem(tenantId,parts[4]);const walletSync=await syncWalletBalance(tenantId,value.card,req.headers.get('x-vercel-oidc-token'));const rotated=await rotate(actor);return json(toRedeemResponse(value,walletSync),200,id,rotated.header);}
 return json({error:'NOT_FOUND'},404,id);}catch(e){return error(e,id)}}
 
 /** Apply response CORS after route handling so normal and error responses share the same policy. */
