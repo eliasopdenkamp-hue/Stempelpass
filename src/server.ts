@@ -1,11 +1,11 @@
 import { assertTenant, canStamp, hashToken } from './domain.js';
-import { cardCreateLimiter, cardResolveLimiter, clientIpKey, csrfValid, hashPassword, joinResolveKey, loginAccountKey, loginAccountLimiter, loginFailureReason, loginIpLimiter, redeemLimiter, resetConfirmIpLimiter, resetConfirmTokenLimiter, resetRequestAccountLimiter, resetRequestIpLimiter, resetResolveKey, resetResolveLimiter, staffSearchLimiter, stampLimiter, verifyPassword, verifyPasswordAgainstDummy, randomToken, hashSessionToken } from './security.js';
+import { cardCreateLimiter, cardResolveLimiter, clientIpKey, csrfValid, hashPassword, joinResolveKey, loginAccountKey, loginAccountLimiter, loginFailureReason, loginIpLimiter, redeemLimiter, resetConfirmIpLimiter, resetConfirmTokenLimiter, resetRequestAccountLimiter, resetRequestIpLimiter, resetResolveKey, resetResolveLimiter, staffSearchLimiter, stampLimiter, walletGridKey, walletGridLimiter, verifyPassword, verifyPasswordAgainstDummy, randomToken, hashSessionToken } from './security.js';
 import { createPostgresPool, runMigrations, type DbPool } from './db.js';
 import { CardRepository, type StaffDashboardData, type StaffSearchCard, type StaffStats } from './repository.js';
 import { configurationStatus } from './config.js';
 import { EncryptedMfaSecretStore, verifyTotp } from './mfa.js';
 import { walletAdapter, ensureGoogleWalletClass } from './wallet.js';
-import { classifyError } from './http-error.js';
+import { classifyError, redactDetail } from './http-error.js';
 import { formatCardCode, normalizeCardCode } from './card-code.js';
 import { qrSvgDataUri } from './qr.js';
 import { vendorZxingResponse } from './vendor-assets.js';
@@ -180,7 +180,17 @@ async function syncWalletBalance(tenantId:string,card:{id:string;stampCount:numb
     // 'issued' = pass refreshed; 'not_configured' = Wallet disabled, nothing
     // can lag. Any other status is not a confirmed refresh.
     return result.status==='issued'||result.status==='not_configured'?'ok':'failed';
-  }catch(error){console.error(`wallet_refresh_failed code=${error instanceof Error?error.message:'GOOGLE_WALLET_REFRESH_UNAVAILABLE'}`);return 'failed'}
+  }catch(error){
+    // Redacted like every other server-side error detail: the wallet adapter
+    // message can carry Google response text, URLs or tokens. Stable internal
+    // codes (GOOGLE_WALLET_REFRESH_FAILED_400, …) are kept verbatim — they are
+    // enum-like, carry no payload, and are what operations needs.
+    const raw=error instanceof Error?error.message:'GOOGLE_WALLET_REFRESH_UNAVAILABLE';
+    const isCode=/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(raw)&&raw.length<=64;
+    const code=isCode?raw:(redactDetail(raw).slice(0,300)||'GOOGLE_WALLET_REFRESH_UNAVAILABLE');
+    console.error(`wallet_refresh_failed code=${code}`);
+    return 'failed';
+  }
 }
 /**
  * Staff-facing flash for a committed stamp/redeem: the success text stays, and
@@ -801,14 +811,25 @@ if(parts[0]==='api'&&!configured)throw new Error('CONFIGURATION_REQUIRED');
     // unauthenticated fetch cannot set. Rate-limited like the other public
     // card routes. The `?ts=` cache-buster is part of the URL (card revision,
     // monotonic across stamps AND redeems), so the PNG is immutable per URL.
+    // Hardening (2026-11-02): `?ts` is a CACHE KEY, never a data selector, and
+    // it is not trusted as-is. Only a `ts` equal to the card's current revision
+    // earns the immutable one-year cache; any other value (absent, stale from an
+    // old pass, arbitrary) still returns the correct PNG — never a 404, so old
+    // passes keep their raster — but only short-lived, which caps how many
+    // distinct URLs can be pushed through the CDN/function. The limiter is the
+    // route's own bucket keyed on client + card UUID (not the URL), so varying
+    // `ts` cannot mint fresh buckets either.
     if(parts[0]==='wallet'&&parts[1]==='grid'&&parts.length===3&&parts[2]?.endsWith('.png')&&req.method==='GET'){
-      if(!repository||!cardResolveLimiter.allow(clientIpKey(req)))throw new Error(!repository?'DATABASE_REQUIRED':'RATE_LIMITED');
       const cardId=parts[2].slice(0,-'.png'.length);
       if(!UUID_RE.test(cardId))throw new Error('CARD_NOT_FOUND');
+      if(!repository||!walletGridLimiter.allow(walletGridKey(req,cardId)))throw new Error(!repository?'DATABASE_REQUIRED':'RATE_LIMITED');
       const grid=await repository.gridContext(cardId);
       if(!grid)throw new Error('CARD_NOT_FOUND');
       const png=renderStampGridPng({stampCount:grid.stampCount,stampsRequired:grid.stampsRequired,primaryColor:grid.primaryColor??undefined,secondaryColor:grid.secondaryColor??undefined,rewardReady:grid.rewardIssued});
-      return new Response(new Uint8Array(png),{status:200,headers:{'Content-Type':'image/png','Cache-Control':'public, max-age=31536000, immutable','X-Content-Type-Options':'nosniff'}});
+      const ts=u.searchParams.get('ts');
+      const current=ts!==null&&ts!==''&&ts===String(grid.revision);
+      const cacheControl=current?'public, max-age=31536000, immutable':'public, max-age=60';
+      return new Response(new Uint8Array(png),{status:200,headers:{'Content-Type':'image/png','Cache-Control':cacheControl,'X-Content-Type-Options':'nosniff'}});
     }
     if(parts[0]==='card'&&parts.length===3&&req.method==='GET'){if(!repository||!cardResolveLimiter.allow(clientIpKey(req)))throw new Error(!repository?'DATABASE_REQUIRED':'RATE_LIMITED');const result=await repository.publicCard(parts[1],hashToken(parts[2]));if(!result)throw new Error('CARD_NOT_FOUND');const b: Branding=safeBranding(result.branding) ?? {cardTitle:'StempelPass',cardText:'',primaryColor:DEFAULT_PRIMARY_CARD_COLOR,secondaryColor:DEFAULT_SECONDARY_CARD_COLOR,version:1};const r: StampRule=result.rule ?? {id:'',tenantId:parts[1],name:'',stampsRequired:1,rewardTitle:'Prämie',rewardDescription:'',active:true,version:1};const esc=(v:unknown)=>String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[c]!));const progress=Math.min(100,Math.round((result.card.stampCount/Math.max(1,Number(r.stampsRequired||1)))*100));// Visible card code: same K-XXXXXX as the Google Wallet pass. The webcard is
     // already authenticated by the one-time card token in the URL; the code is a

@@ -104,7 +104,7 @@ const REDACTED = '<redacted>';
  * tokens. Anything recognized is replaced by <redacted>; the surrounding
  * wording stays readable for operations.
  */
-function redactDetail(value: string): string {
+export function redactDetail(value: string): string {
   let out = value
     // Connection strings / URLs with optional credentials: postgres://u:p@h/db
     .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/gi, REDACTED)
