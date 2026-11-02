@@ -696,6 +696,9 @@ const EXPECTED_STAMP_DATA = {
   card: { id: 'card-1', stampCount: 4, revision: 3 },
   reward: { id: 'reward-1', status: 'issued' },
   idempotencyKey: 'client-key-1',
+  // No Wallet credentials in these fixtures -> refresh() is a not_configured
+  // no-op, i.e. nothing lags behind: 'ok' (never a silent "unknown").
+  walletSync: 'ok',
 };
 
 test('stamp returns the minimal card/reward view, echoes the idempotency key and rotates the session', async () => {
@@ -768,7 +771,7 @@ test('redeem returns only rewardId and status and resets the card counter to 0',
     }));
     expect(res.status).toBe(200);
     const body = (await res.json()) as { data: unknown };
-    expect(body.data).toEqual({ rewardId: 'reward-1', status: 'redeemed' });
+    expect(body.data).toEqual({ rewardId: 'reward-1', status: 'redeemed', walletSync: 'ok' });
     expectNoInternalFields(body);
     // Owner fix 2026-09-13: the same transaction resets the card's stamp
     // counter so a new collection round starts (no endless rewards).
@@ -1511,11 +1514,54 @@ test('redeem route best-effort-syncs the wallet to the reset balance (0 stamps) 
     expect(res.status).toBe(200);
     const body = (await res.json()) as { request_id: string; data: unknown };
     // The API contract is unchanged: only rewardId + status cross the wire.
-    expect(body.data).toEqual({ rewardId: 'reward-1', status: 'redeemed' });
+    expect(body.data).toEqual({ rewardId: 'reward-1', status: 'redeemed', walletSync: 'ok' });
     // Wallet sync: exactly one refresh with the RESET balance (0).
     expect(refreshed).toHaveLength(1);
     expect(refreshed[0].card).toEqual({ id: 'card-1', stampCount: 0, revision: 3 });
   } finally { restore(); }
+});
+
+test('stamp route reports walletSync:failed when the pass refresh throws — the committed stamp still answers 200', async () => {
+  const logged: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  const adapter = {
+    async issue() { return { provider: 'google' as const, status: 'issued' as const, message: 'ok', artifact: 'a.b.c' }; },
+    async refresh() { throw new Error('GOOGLE_WALLET_REFRESH_FAILED_400'); },
+    async revoke() {},
+  };
+  const factory = (() => adapter) as unknown as typeof walletAdapter;
+  const pool = new FakePool([
+    ...sessionHandlers(validSession),
+    { match: contains('from stamp_events'), rows: [] }, // no replay
+    { match: contains('from cards where'), rows: [{ id: 'card-1', stampCount: 3, revision: 2, ruleId: RULE }] },
+    { match: contains('insert into stamp_events'), rows: [] },
+    { match: contains('update cards set stamp_count'), rows: [{ id: 'card-1', stampCount: 4, revision: 3 }] },
+    { match: contains('reward_title as "rewardTitle"'), rows: [{ stampsRequired: 5, rewardTitle: 'Prämie' }] },
+    { match: contains('from stamp_rules'), rows: [{ id: RULE, stamps_required: 1 }] },
+    { match: contains('insert into rewards'), rows: [{ id: 'reward-1', status: 'issued' }] },
+    { match: contains('from tenant_branding'), rows: [] },
+  ]);
+  const restore = withTestDependencies({ configured: true, pool, repository: new CardRepository(pool), walletFactory: factory });
+  try {
+    const res = await fetchHandler(new Request(`http://test.local/api/tenants/${TENANT}/cards/card-1/stamps`, {
+      method: 'POST',
+      headers: authedHeaders({ 'idempotency-key': 'client-key-1' }),
+      body: JSON.stringify({ quantity: 1 }),
+    }));
+    // The committed stamp is NOT rolled back and NOT turned into an error.
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: { card: unknown; reward: unknown; idempotencyKey?: string; walletSync: string } };
+    expect(body.data.walletSync).toBe('failed');
+    expect(body.data.card).toEqual({ id: 'card-1', stampCount: 4, revision: 3 });
+    expect(body.data.reward).toEqual({ id: 'reward-1', status: 'issued' });
+    expect(body.data.idempotencyKey).toBe('client-key-1');
+    // The operator-facing log line stays (error code only, no card identifiers).
+    const line = logged.find((entry) => entry.includes('wallet_refresh_failed'));
+    expect(line).toBeDefined();
+    expect(line).toContain('GOOGLE_WALLET_REFRESH_FAILED_400');
+    expect(line).not.toContain('card-1');
+  } finally { console.error = originalError; restore(); }
 });
 
 // ---------------------------------------------------------------------------
