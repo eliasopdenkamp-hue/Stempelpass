@@ -1,0 +1,88 @@
+name: health-check
+
+# Leichtgewichtige Fehlerüberwachung vor dem Pilot (2026-11-03).
+#
+# Fragt GET /health der Production-Deployment alle 15 Minuten ab und schlägt
+# fehl, sobald die Antwort nicht exakt {"status":"ready"} ist. GitHub schickt
+# bei fehlgeschlagenen Runs eine E-Mail an den Repo-Inhaber (bzw. an die
+# Person, die diese Datei zuletzt geändert hat) — kein Monitoring-SaaS, keine
+# zusätzlichen Kosten. Budget: ~96 Runs/Tag à ~10–20 s, also deutlich unter
+# 100 Actions-Minuten im Monat.
+#
+# Wichtig: /health antwortet IMMER mit HTTP 200 (Liveness). Der Status steckt
+# ausschließlich im JSON-Feld `status` (ready | not_ready) — deshalb prüft der
+# Job den Body, nicht nur den Statuscode. Siehe src/health.ts.
+#
+# Runbook im Alarmfall: HEALTHCHECK.md (Repo) bzw.
+# HEALTHCHECK_RUNBOOK_2026-11-03.md (Team-Share).
+#
+# Ziel-URL überschreibbar ohne Code-Änderung:
+#   Settings → Secrets and variables → Actions → Variables → HEALTH_URL
+
+on:
+  schedule:
+    # GitHub-Cron ist UTC und kann bei Last um einige Minuten verzögern.
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+# Der Job braucht keinerlei Repo-Rechte.
+permissions: {}
+
+# Kein paralleler Doppellauf, wenn eine Probe hängt.
+concurrency:
+  group: health-check
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: GET /health
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe production /health
+        env:
+          HEALTH_URL: ${{ vars.HEALTH_URL || 'https://project-ywbp8.vercel.app/health' }}
+        run: |
+          set -uo pipefail
+          url="$HEALTH_URL"
+          echo "Probe: $url"
+
+          last=""
+          for attempt in 1 2 3; do
+            # Body/Fehlerdatei VOR jedem Versuch löschen: ein fehlgeschlagener
+            # curl-Aufruf lässt sonst den Body des Vorversuchs stehen und der
+            # Check würde einen alten "ready"-Body melden.
+            rm -f /tmp/health.body /tmp/health.err
+            http=$(curl -sS --max-time 20 -o /tmp/health.body -w '%{http_code}' "$url" 2>/tmp/health.err) || http="000"
+            body=$(cat /tmp/health.body 2>/dev/null || true)
+            status=$(printf '%s' "$body" | jq -r 'if type == "object" then (.status // empty) else empty end' 2>/dev/null || true)
+
+            echo "Versuch ${attempt}/3: HTTP ${http}, status='${status:-<kein status>}'"
+            if [ "$http" = "200" ] && [ "$status" = "ready" ]; then
+              echo "OK: /health meldet ready."
+              exit 0
+            fi
+
+            last="HTTP ${http}, status '${status:-<kein status>}'"
+            if [ -s /tmp/health.err ]; then
+              last="$last, curl: $(head -c 200 /tmp/health.err)"
+            elif [ -n "$body" ]; then
+              last="$last, body: $(printf '%s' "$body" | head -c 200)"
+            fi
+
+            # Kurz warten: ein Kaltstart oder ein einzelner Netz-Hiccup soll
+            # nicht sofort einen Alarm auslösen.
+            if [ "$attempt" -lt 3 ]; then sleep 15; fi
+          done
+
+          echo "::error::/health ist nicht bereit (${last})"
+          {
+            echo "## Health-Check fehlgeschlagen"
+            echo ""
+            echo "- URL: \`${url}\`"
+            echo "- Befund: ${last}"
+            echo "- Zeitpunkt (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+            echo "Nächste Schritte: HEALTHCHECK.md im Repo (Abschnitt Alarmfall)."
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          exit 1

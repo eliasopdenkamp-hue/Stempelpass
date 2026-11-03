@@ -119,6 +119,10 @@ describe('query builders (read-only, anonymized)', () => {
     // migration 020: reset_user_password is the two-argument SECURITY DEFINER;
     // its identityArguments must be the compact 'text,text' form.
     expect(REQUIRED_FUNCTION_GRANTS.find(f => f.name === 'reset_user_password')?.identityArguments).toBe('text,text');
+    // migration 024: the Wallet raster resolver must be covered too — the
+    // public grid endpoint has no non-SECURITY-DEFINER fallback, so a missing
+    // EXECUTE grant is an anonymous 500, not a staff-visible error.
+    expect(REQUIRED_FUNCTION_GRANTS.find(f => f.name === 'card_grid_display')?.identityArguments).toBe('uuid');
     for (const [mode, queries] of [
       ['as-role', buildAsRoleQueries('public')],
       ['named-role', buildNamedRoleQueries('app_role_x', 'public')],
