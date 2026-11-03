@@ -149,6 +149,15 @@ export const REQUIRED_FUNCTION_GRANTS: readonly { name: string; identityArgument
   // Migration 020: the reset-confirm password write runs inside this SECURITY
   // DEFINER function (the runtime role holds users SELECT only, see above).
   { name: 'reset_user_password', identityArguments: 'text,text' },
+  // Migration 024: the unauthenticated Wallet raster endpoint
+  // (GET /wallet/grid/:cardUuid.png) reads its display data exclusively
+  // through this SECURITY DEFINER resolver — repository.ts has no fallback to
+  // a direct table read. A missing EXECUTE grant therefore breaks the raster
+  // for every card, and because the endpoint is public it would surface as an
+  // anonymous 500 rather than a staff-visible error. Added 2026-11-03: the
+  // grant existed in production but the matrix did not check it (the
+  // 2026-10-18 recheck note claimed coverage that the code never had).
+  { name: 'card_grid_display', identityArguments: 'uuid' },
 ];
 
 // ---------------------------------------------------------------------------
