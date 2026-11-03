@@ -13,8 +13,8 @@ name: health-check
 # ausschließlich im JSON-Feld `status` (ready | not_ready) — deshalb prüft der
 # Job den Body, nicht nur den Statuscode. Siehe src/health.ts.
 #
-# Runbook im Alarmfall: HEALTHCHECK_RUNBOOK_2026-11-03.md (Team-Share) bzw.
-# HEALTHCHECK.md im Repo.
+# Runbook im Alarmfall: HEALTHCHECK.md (Repo) bzw.
+# HEALTHCHECK_RUNBOOK_2026-11-03.md (Team-Share).
 #
 # Ziel-URL überschreibbar ohne Code-Änderung:
 #   Settings → Secrets and variables → Actions → Variables → HEALTH_URL
@@ -28,7 +28,7 @@ on:
 # Der Job braucht keinerlei Repo-Rechte.
 permissions: {}
 
-# Kein paralleler Doppellauf, wenn ein Probe hängt.
+# Kein paralleler Doppellauf, wenn eine Probe hängt.
 concurrency:
   group: health-check
   cancel-in-progress: false
@@ -55,23 +55,21 @@ jobs:
             rm -f /tmp/health.body /tmp/health.err
             http=$(curl -sS --max-time 20 -o /tmp/health.body -w '%{http_code}' "$url" 2>/tmp/health.err) || http="000"
             body=$(cat /tmp/health.body 2>/dev/null || true)
-            status=$(printf '%s' "$body" | python3 -c 'import json,sys
-try:
-    data = json.load(sys.stdin)
-    print(data.get("status", "") if isinstance(data, dict) else "")
-except Exception:
-    print("")')
+            status=$(printf '%s' "$body" | jq -r 'if type == "object" then (.status // empty) else empty end' 2>/dev/null || true)
+
             echo "Versuch ${attempt}/3: HTTP ${http}, status='${status:-<kein status>}'"
             if [ "$http" = "200" ] && [ "$status" = "ready" ]; then
               echo "OK: /health meldet ready."
               exit 0
             fi
+
             last="HTTP ${http}, status '${status:-<kein status>}'"
             if [ -s /tmp/health.err ]; then
               last="$last, curl: $(head -c 200 /tmp/health.err)"
             elif [ -n "$body" ]; then
               last="$last, body: $(printf '%s' "$body" | head -c 200)"
             fi
+
             # Kurz warten: ein Kaltstart oder ein einzelner Netz-Hiccup soll
             # nicht sofort einen Alarm auslösen.
             if [ "$attempt" -lt 3 ]; then sleep 15; fi
@@ -85,6 +83,6 @@ except Exception:
             echo "- Befund: ${last}"
             echo "- Zeitpunkt (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo ""
-            echo "Nächste Schritte: HEALTHCHECK.md im Repo (Abschnitt „Alarmfall“)."
+            echo "Nächste Schritte: HEALTHCHECK.md im Repo (Abschnitt Alarmfall)."
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
           exit 1
